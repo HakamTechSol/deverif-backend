@@ -65,10 +65,11 @@ export async function createUserWithOrganization(req, res) {
     if (orgExisting.length) {
       orgId = orgExisting[0].id;
     } else {
-      const v = organization.verified === "yes" ? "yes" : "no";
+      const orgLogoFile = req.files?.org_logo?.[0];
+      const orgLogoPath = orgLogoFile ? `uploads/organizations/${orgLogoFile.filename}` : null;
       const [orgRes] = await conn.query(
-        "INSERT INTO organizations (name, verified, logo, organization_type) VALUES (?, ?, ?, ?)",
-        [organization.name, v, organization.logo || null, organization.organization_type || null]
+        "INSERT INTO organizations (name, verified, logo, organization_type) VALUES (?, 'yes', ?, ?)",
+        [organization.name, orgLogoPath, organization.organization_type || null]
       );
       orgId = orgRes.insertId;
     }

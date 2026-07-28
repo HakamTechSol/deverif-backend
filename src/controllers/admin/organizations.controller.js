@@ -50,15 +50,14 @@ export async function assertOrganizationActive(orgId) {
 }
 
 export async function createOrganization(req, res) {
-  const { name, verified, organization_type } = req.body;
+  const { name, organization_type } = req.body;
   if (!name) throw new ApiError(400, "name is required");
 
-  const v = verified === "yes" ? "yes" : "no";
   const logoPath = req.file ? `uploads/organizations/${req.file.filename}` : null;
 
   const [result] = await pool.query(
-    "INSERT INTO organizations (name, verified, logo, organization_type) VALUES (?, ?, ?, ?)",
-    [name, v, logoPath, organization_type || null]
+    "INSERT INTO organizations (name, verified, logo, organization_type) VALUES (?, 'yes', ?, ?)",
+    [name, logoPath, organization_type || null]
   );
 
   const [rows] = await pool.query(`SELECT ${ORG_SELECT} FROM organizations WHERE id=?`, [result.insertId]);
@@ -67,7 +66,7 @@ export async function createOrganization(req, res) {
 
 export async function updateOrganization(req, res) {
   const { uuid } = req.params;
-  const { name, verified, organization_type } = req.body;
+  const { name, organization_type } = req.body;
   assertUuid(uuid, "Organization UUID");
 
   const [orgExists] = await pool.query("SELECT id FROM organizations WHERE uuid=?", [uuid]);
@@ -75,7 +74,6 @@ export async function updateOrganization(req, res) {
 
   const updates = {};
   if (name !== undefined) updates.name = name;
-  if (verified !== undefined) updates.verified = verified === "yes" ? "yes" : "no";
   if (organization_type !== undefined) updates.organization_type = organization_type;
   if (req.file) updates.logo = `uploads/organizations/${req.file.filename}`;
 
@@ -103,7 +101,7 @@ export async function deleteOrganization(req, res) {
 
 export async function setOrganizationSubscription(req, res) {
   const { uuid } = req.params;
-  const { plan } = req.body;
+  const { plan, amount } = req.body;
   assertUuid(uuid, "Organization UUID");
 
   if (!["monthly", "yearly"].includes(plan)) {
@@ -124,19 +122,19 @@ export async function setOrganizationSubscription(req, res) {
     [now, expiry, plan, orgId]
   );
 
-  // Record payment for audit trail — link to the org's first user
-  const [[firstUser]] = await pool.query(
-    "SELECT id FROM users WHERE organization=? ORDER BY created_at ASC LIMIT 1",
-    [orgId]
-  );
-  if (firstUser) {
-    const amount = plan === "yearly"
-      ? parseInt(process.env.PREMIUM_PLAN_AMOUNT || "5000", 10)
-      : parseInt(process.env.BASIC_PLAN_AMOUNT || "2500", 10);
-    await pool.query(
-      `INSERT INTO payment (user_id, amount, payment_method, transaction_reference, paid_at, purpose) VALUES (?, ?, 'manual', ?, NOW(), ?)`,
-      [firstUser.id, amount, `SUB-${plan.toUpperCase()}-${Date.now()}`, `Subscription: ${plan} for organization`]
+  // Record payment only if an amount was provided
+  const numericAmount = Number(amount);
+  if (numericAmount > 0) {
+    const [[firstUser]] = await pool.query(
+      "SELECT id FROM users WHERE organization=? ORDER BY created_at ASC LIMIT 1",
+      [orgId]
     );
+    if (firstUser) {
+      await pool.query(
+        `INSERT INTO payment (user_id, amount, payment_method, transaction_reference, paid_at, purpose) VALUES (?, ?, 'manual', ?, NOW(), ?)`,
+        [firstUser.id, numericAmount, `SUB-${plan.toUpperCase()}-${Date.now()}`, `Subscription: ${plan} for organization`]
+      );
+    }
   }
 
   const [rows] = await pool.query(`SELECT ${ORG_SELECT} FROM organizations WHERE uuid=?`, [uuid]);

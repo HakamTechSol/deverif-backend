@@ -42,12 +42,33 @@ export async function markAllRead(req, res) {
   return ok(res, {}, "All marked as read");
 }
 
+export async function markReadByReference(req, res) {
+  const { referenceId } = req.params;
+  if (!referenceId) return ok(res, {}, "No reference");
+
+  await pool.query(
+    "UPDATE notifications SET read_at=NOW() WHERE user_uuid=? AND reference_id=? AND read_at IS NULL",
+    [req.user.uuid, referenceId]
+  );
+  return ok(res, {}, "Marked as read");
+}
+
 export async function createNotificationForOrgUsers({ orgId, type, title, message, link, referenceId }) {
   if (!orgId) return;
   const [users] = await pool.query("SELECT uuid FROM users WHERE organization=? AND status='active'", [orgId]);
   if (!users.length) return;
 
   const values = users.map((u) => [u.uuid, type, title, message, link || null, referenceId || null]);
+  await pool.query(
+    "INSERT INTO notifications (user_uuid, type, title, message, link, reference_id) VALUES ?",
+    [values]
+  );
+}
+
+export async function createNotificationForUsers({ userIds, type, title, message, link, referenceId }) {
+  if (!userIds?.length) return;
+
+  const values = userIds.map((uuid) => [uuid, type, title, message, link || null, referenceId || null]);
   await pool.query(
     "INSERT INTO notifications (user_uuid, type, title, message, link, reference_id) VALUES ?",
     [values]

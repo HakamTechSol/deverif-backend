@@ -23,7 +23,7 @@ export async function adminLogin(req, res) {
   if (!email || !password) throw new ApiError(400, "Email and password are required");
 
   const [rows] = await pool.query(
-    "SELECT id, uuid, email, password, full_name, status FROM admin_profiles WHERE email=?",
+    "SELECT id, uuid, email, password, full_name, status, profile_image FROM admin_profiles WHERE email=?",
     [email]
   );
   if (!rows.length) throw new ApiError(401, "Invalid admin credentials");
@@ -43,7 +43,7 @@ export async function adminLogin(req, res) {
 
   res.cookie("dvarif_admin_refresh", refreshToken, getRefreshCookieOptions());
 
-  return ok(res, { token: accessToken, admin: { uuid: admin.uuid, email: admin.email, full_name: admin.full_name } }, "Admin login successful");
+  return ok(res, { token: accessToken, admin: { uuid: admin.uuid, email: admin.email, full_name: admin.full_name, profile_image: admin.profile_image } }, "Admin login successful");
 }
 
 export async function logoutAdmin(req, res) {

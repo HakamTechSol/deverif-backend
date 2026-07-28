@@ -34,7 +34,7 @@ export async function login(req, res) {
   if (!email || !password) throw new ApiError(400, "Email and password are required");
 
   const [adminRows] = await pool.query(
-    "SELECT id, uuid, email, password, full_name, status FROM admin_profiles WHERE email=?",
+    "SELECT id, uuid, email, password, full_name, status, profile_image FROM admin_profiles WHERE email=?",
     [email]
   );
 
@@ -56,12 +56,12 @@ export async function login(req, res) {
 
     return ok(res, {
       token: accessToken,
-      user: { uuid: admin.uuid, email: admin.email, full_name: admin.full_name, role: "admin" },
+      user: { uuid: admin.uuid, email: admin.email, full_name: admin.full_name, profile_image: admin.profile_image, role: "admin" },
     }, "Login successful");
   }
 
   const [userRows] = await pool.query(
-    "SELECT id, uuid, full_name, email, password, status FROM users WHERE email=?",
+    "SELECT id, uuid, full_name, email, password, status, profile_image FROM users WHERE email=?",
     [email]
   );
 
@@ -84,6 +84,6 @@ export async function login(req, res) {
 
   return ok(res, {
     token: accessToken,
-    user: { uuid: user.uuid, full_name: user.full_name, email: user.email, role: "user" },
+    user: { uuid: user.uuid, full_name: user.full_name, email: user.email, profile_image: user.profile_image, role: "user" },
   }, "Login successful");
 }

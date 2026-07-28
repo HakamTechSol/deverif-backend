@@ -33,7 +33,7 @@ export async function loginUser(req, res) {
   if (!email || !password) throw new ApiError(400, "Email and password are required");
 
   const [rows] = await pool.query(
-    "SELECT id, uuid, full_name, email, password, status FROM users WHERE email=?",
+    "SELECT id, uuid, full_name, email, password, status, profile_image FROM users WHERE email=?",
     [email]
   );
   if (!rows.length) throw new ApiError(401, "Invalid credentials");
@@ -53,7 +53,7 @@ export async function loginUser(req, res) {
 
   res.cookie("dvarif_refresh", refreshToken, getRefreshCookieOptions(!!rememberMe));
 
-  return ok(res, { token: accessToken, user: { uuid: user.uuid, full_name: user.full_name, email: user.email } }, "Login successful");
+  return ok(res, { token: accessToken, user: { uuid: user.uuid, full_name: user.full_name, email: user.email, profile_image: user.profile_image } }, "Login successful");
 }
 
 export async function forgotPassword(req, res) {

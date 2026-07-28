@@ -24,6 +24,14 @@ export async function userDashboardStats(req, res) {
     "SELECT COUNT(*) AS total FROM verification_requests WHERE user_id = ? AND status='verified'",
     [req.user.id]
   );
+  const [unverifiedReqsRows] = await pool.query(
+    "SELECT COUNT(*) AS total FROM verification_requests WHERE user_id = ? AND status='unverified'",
+    [req.user.id]
+  );
+  const [underReviewReqsRows] = await pool.query(
+    "SELECT COUNT(*) AS total FROM verification_requests WHERE user_id = ? AND status='under_review'",
+    [req.user.id]
+  );
 
   const [adminRequestsCountRows] = await pool.query(
     "SELECT COUNT(*) AS total FROM verification_requests WHERE user_id = ? AND issuing_organization_id IS NULL",
@@ -40,6 +48,8 @@ export async function userDashboardStats(req, res) {
     total_admin_requests: adminRequestsCountRows[0].total,
     verified_organizations: verifiedOrgsRows[0].total,
     verified_requests: verifiedReqsRows[0].total,
+    unverified_requests: unverifiedReqsRows[0].total,
+    under_review_requests: underReviewReqsRows[0].total,
     organizations_progress: totalOrgs > 0 ? Math.round((verifiedOrgsRows[0].total / totalOrgs) * 100) : 0,
     requests_progress: totalReqs > 0 ? Math.round((verifiedReqsRows[0].total / totalReqs) * 100) : 0,
     unmatched_progress: totalReqs > 0 ? Math.round(((totalReqs - adminRequestsCountRows[0].total) / totalReqs) * 100) : 100,
@@ -67,6 +77,12 @@ export async function adminDashboardStats(req, res) {
   const [verifiedReqsRows] = await pool.query(
     "SELECT COUNT(*) AS total FROM verification_requests WHERE status='verified'"
   );
+  const [unverifiedReqsRows] = await pool.query(
+    "SELECT COUNT(*) AS total FROM verification_requests WHERE status='unverified'"
+  );
+  const [underReviewReqsRows] = await pool.query(
+    "SELECT COUNT(*) AS total FROM verification_requests WHERE status='under_review'"
+  );
 
   const [adminRequestsCountRows] = await pool.query(
     "SELECT COUNT(*) AS total FROM verification_requests WHERE issuing_organization_id IS NULL"
@@ -85,6 +101,8 @@ export async function adminDashboardStats(req, res) {
     active_users: activeUsersRows[0].total,
     verified_organizations: verifiedOrgsRows[0].total,
     verified_requests: verifiedReqsRows[0].total,
+    unverified_requests: unverifiedReqsRows[0].total,
+    under_review_requests: underReviewReqsRows[0].total,
     users_progress: totalUsers > 0 ? Math.round((activeUsersRows[0].total / totalUsers) * 100) : 0,
     organizations_progress: totalOrgs > 0 ? Math.round((verifiedOrgsRows[0].total / totalOrgs) * 100) : 0,
     requests_progress: totalReqs > 0 ? Math.round((verifiedReqsRows[0].total / totalReqs) * 100) : 0,

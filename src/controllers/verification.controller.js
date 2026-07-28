@@ -3,8 +3,9 @@ import { pool } from "../config/db.js";
 import { created, ok } from "../utils/response.js";
 import { assertUuid } from "../utils/publicResponse.js";
 import { parsePagination, paginatedResponse } from "../utils/pagination.js";
-import { createNotificationForOrgUsers } from "./notification.controller.js";
+import { createNotificationForOrgUsers, createNotificationForUsers } from "./notification.controller.js";
 import { assertOrganizationActive } from "./admin/organizations.controller.js";
+import { resolveUnmatchedOrg } from "../utils/unmatchedOrg.js";
 import crypto from "crypto";
 import fs from "fs";
 
@@ -31,8 +32,9 @@ async function resolveOrganizationUuid(uuid, required = false) {
 }
 
 export async function createRequest(req, res) {
-  const { document_type, issuing_organization_uuid, priority,
-          other_organization_name, submission_remarks } = req.body;
+  const { document_type, issuing_organization_uuid,
+          other_organization_name, submission_remarks,
+          other_organization_email, other_organization_phone, other_organization_website } = req.body;
 
   if ("issuing_organization_id" in req.body) {
     throw new ApiError(400, "issuing_organization_uuid is required; integer IDs are not accepted");
@@ -59,11 +61,27 @@ export async function createRequest(req, res) {
     throw new ApiError(400, "submission_remarks must be 500 characters or fewer");
   }
 
-  const pri = priority === "urgent" ? "urgent" : "normal";
+  const otherEmail = other_organization_email ? String(other_organization_email).trim() : null;
+  const otherPhone = other_organization_phone ? String(other_organization_phone).trim() : null;
+  const otherWebsite = other_organization_website ? String(other_organization_website).trim() : null;
+
+  if (otherEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(otherEmail)) {
+    throw new ApiError(400, "other_organization_email must be a valid email address");
+  }
+  if (otherWebsite && otherWebsite.length > 500) {
+    throw new ApiError(400, "other_organization_website must be 500 characters or fewer");
+  }
+
   const docPath = `/uploads/documents/${req.file.filename}`;
   const fullPath = `./uploads/documents/${req.file.filename}`;
   const docFormat = docFormatFromMime(req.file.mimetype);
   const documentHash = generateFileHash(fullPath);
+
+  // Resolve unmatched organization if "Other" was selected
+  let unmatchedOrgId = null;
+  if (!orgId && otherOrgName) {
+    unmatchedOrgId = await resolveUnmatchedOrg(otherOrgName, otherEmail, otherPhone, otherWebsite);
+  }
 
   let autoVerify = false;
   if (orgId) {
@@ -82,21 +100,20 @@ export async function createRequest(req, res) {
 
   const [result] = await pool.query(
     `INSERT INTO verification_requests
-     (user_id, document_type, issuing_organization_id, status, priority, submitted_at,
+     (user_id, document_type, issuing_organization_id, unmatched_org_id, status, submitted_at,
       document_path, document_format, document_hash,
-      organization_conserned_for_future, other_organization_name, submission_remarks,
+      organization_conserned_for_future, submission_remarks,
       verification_method, verified_at, created_at)
-     VALUES (?, ?, ?, ?, ?, NOW(), ?, ?, ?, 'no', ?, ?, ?, ?, NOW())`,
+     VALUES (?, ?, ?, ?, ?, NOW(), ?, ?, ?, 'no', ?, ?, ?, NOW())`,
     [
       req.user.id,
       document_type,
       orgId,
+      unmatchedOrgId,
       autoVerify ? "verified" : "under_review",
-      pri,
       docPath,
       docFormat,
       documentHash,
-      otherOrgName,
       remarks,
       autoVerify ? "auto" : "manual",
       autoVerify ? new Date() : null
@@ -104,9 +121,11 @@ export async function createRequest(req, res) {
   );
 
   const [rows] = await pool.query(
-    `SELECT vr.*, o.uuid AS issuing_organization_uuid, o.name AS issuing_org_name
+    `SELECT vr.*, o.uuid AS issuing_organization_uuid, o.name AS issuing_org_name,
+            uo.uuid AS unmatched_org_uuid, uo.name AS unmatched_org_name
      FROM verification_requests vr
      LEFT JOIN organizations o ON o.id = vr.issuing_organization_id
+     LEFT JOIN unmatched_organizations uo ON uo.id = vr.unmatched_org_id
      WHERE vr.id=?`,
     [result.insertId]
   );
@@ -144,9 +163,13 @@ export async function mySentRequests(req, res) {
     params
   );
   const [rows] = await pool.query(
-    `SELECT vr.*, o.uuid AS issuing_organization_uuid, o.name AS issuing_org_name
+    `SELECT vr.*, o.uuid AS issuing_organization_uuid, o.name AS issuing_org_name,
+            uo.uuid AS unmatched_org_uuid, uo.name AS unmatched_org_name,
+            locker.full_name AS locked_by_name
      FROM verification_requests vr
      LEFT JOIN organizations o ON o.id = vr.issuing_organization_id
+     LEFT JOIN unmatched_organizations uo ON uo.id = vr.unmatched_org_id
+     LEFT JOIN users locker ON locker.id = vr.locked_by
      ${whereClause}
      ORDER BY vr.created_at DESC
      LIMIT ? OFFSET ?`,
@@ -161,7 +184,7 @@ export async function deleteMySentRequest(req, res) {
   assertUuid(uuid, "Request UUID");
 
   const [allRows] = await pool.query(
-    `SELECT id, status, user_id
+    `SELECT id, status, user_id, locked_by
      FROM verification_requests
      WHERE uuid=?`,
     [uuid]
@@ -170,8 +193,14 @@ export async function deleteMySentRequest(req, res) {
   if (!allRows.length) throw new ApiError(404, "Request not found");
   if (allRows[0].user_id !== req.user.id) throw new ApiError(403, "Forbidden");
 
-  if (["verified", "unverified"].includes(allRows[0].status)) {
+  if (allRows[0].status === "verified") {
+    throw new ApiError(403, "Verified requests cannot be deleted — they are a permanent record.");
+  }
+  if (allRows[0].status === "unverified") {
     throw new ApiError(409, "Finalized request cannot be deleted");
+  }
+  if (allRows[0].locked_by) {
+    throw new ApiError(403, "This request is locked and cannot be deleted.");
   }
 
   await pool.query("DELETE FROM verification_requests WHERE uuid=?", [uuid]);
@@ -194,8 +223,9 @@ export async function updateMySentRequest(req, res) {
     throw new ApiError(409, "Only under_review requests can be edited");
   }
 
-  const { document_type, issuing_organization_uuid, priority,
-          other_organization_name, submission_remarks } = req.body;
+  const { document_type, issuing_organization_uuid,
+          other_organization_name, submission_remarks,
+          other_organization_email, other_organization_phone, other_organization_website } = req.body;
 
   if (!document_type) throw new ApiError(400, "document_type is required");
 
@@ -213,7 +243,17 @@ export async function updateMySentRequest(req, res) {
     throw new ApiError(400, "submission_remarks must be 500 characters or fewer");
   }
 
-  const pri = priority === "urgent" ? "urgent" : "normal";
+  const otherEmail = other_organization_email ? String(other_organization_email).trim() : null;
+  const otherPhone = other_organization_phone ? String(other_organization_phone).trim() : null;
+  const otherWebsite = other_organization_website ? String(other_organization_website).trim() : null;
+
+  if (otherEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(otherEmail)) {
+    throw new ApiError(400, "other_organization_email must be a valid email address");
+  }
+  if (otherWebsite && otherWebsite.length > 500) {
+    throw new ApiError(400, "other_organization_website must be 500 characters or fewer");
+  }
+
   let docPath = allRows[0].document_path;
   let docFormat = allRows[0].document_format;
   let documentHash = allRows[0].document_hash;
@@ -224,19 +264,27 @@ export async function updateMySentRequest(req, res) {
     documentHash = generateFileHash(`./uploads/documents/${req.file.filename}`);
   }
 
+  // Resolve unmatched organization if "Other" was selected
+  let unmatchedOrgId = null;
+  if (!orgId && otherOrgName) {
+    unmatchedOrgId = await resolveUnmatchedOrg(otherOrgName, otherEmail, otherPhone, otherWebsite);
+  }
+
   await pool.query(
     `UPDATE verification_requests
-     SET document_type=?, issuing_organization_id=?, priority=?,
-         other_organization_name=?, submission_remarks=?,
+     SET document_type=?, issuing_organization_id=?, unmatched_org_id=?,
+         submission_remarks=?,
          document_path=?, document_format=?, document_hash=?
      WHERE uuid=?`,
-    [document_type, orgId, pri, otherOrgName, remarks, docPath, docFormat, documentHash, uuid]
+    [document_type, orgId, unmatchedOrgId, remarks, docPath, docFormat, documentHash, uuid]
   );
 
   const [rows] = await pool.query(
-    `SELECT vr.*, o.uuid AS issuing_organization_uuid, o.name AS issuing_org_name
+    `SELECT vr.*, o.uuid AS issuing_organization_uuid, o.name AS issuing_org_name,
+            uo.uuid AS unmatched_org_uuid, uo.name AS unmatched_org_name
      FROM verification_requests vr
      LEFT JOIN organizations o ON o.id = vr.issuing_organization_id
+     LEFT JOIN unmatched_organizations uo ON uo.id = vr.unmatched_org_id
      WHERE vr.uuid=?`,
     [uuid]
   );
@@ -273,11 +321,13 @@ export async function myInboxRequests(req, res) {
             requester.email AS requester_email,
             requester_org.uuid AS requester_organization_uuid,
             requester_org.name AS requester_organization,
-            issuing_org.uuid AS issuing_organization_uuid
+            issuing_org.uuid AS issuing_organization_uuid,
+            uo.uuid AS unmatched_org_uuid, uo.name AS unmatched_org_name
      FROM verification_requests vr
      JOIN users requester ON requester.id = vr.user_id
      LEFT JOIN organizations requester_org ON requester_org.id = requester.organization
      LEFT JOIN organizations issuing_org ON issuing_org.id = vr.issuing_organization_id
+     LEFT JOIN unmatched_organizations uo ON uo.id = vr.unmatched_org_id
      ${whereClause}
      ORDER BY vr.created_at DESC
      LIMIT ? OFFSET ?`,
@@ -301,7 +351,7 @@ export async function myInboxCount(req, res) {
 
 export async function verifyRequest(req, res) {
   const { uuid } = req.params;
-  const { status, verification_remarks, organization_conserned_for_future } = req.body;
+  const { status, verification_remarks } = req.body;
 
   assertUuid(uuid, "Request UUID");
   if (!["verified", "unverified"].includes(status)) throw new ApiError(400, "status must be verified or unverified");
@@ -318,23 +368,49 @@ export async function verifyRequest(req, res) {
   }
   if (["verified", "unverified"].includes(vr.status)) throw new ApiError(409, "Request already finalized");
 
-  const futureConcerned = status === "verified" && organization_conserned_for_future === "yes" ? "yes" : "no";
-
   await pool.query(
     `UPDATE verification_requests
      SET status=?, verified_at=NOW(), verified_by=?, verification_remarks=?,
-         organization_conserned_for_future=?, verification_method='portal'
+         verification_method='portal'
      WHERE uuid=?`,
-    [status, req.user.id, verification_remarks || null, futureConcerned, uuid]
+    [status, req.user.id, verification_remarks || null, uuid]
   );
 
   const [updated] = await pool.query(
-    `SELECT vr.*, o.uuid AS issuing_organization_uuid, o.name AS issuing_org_name
+    `SELECT vr.*, o.uuid AS issuing_organization_uuid, o.name AS issuing_org_name,
+            uo.uuid AS unmatched_org_uuid, uo.name AS unmatched_org_name
      FROM verification_requests vr
      LEFT JOIN organizations o ON o.id = vr.issuing_organization_id
+     LEFT JOIN unmatched_organizations uo ON uo.id = vr.unmatched_org_id
      WHERE vr.uuid=?`,
     [uuid]
   );
+
+  // Notify the requester
+  const [requester] = await pool.query(
+    `SELECT u.uuid, u.organization FROM users u WHERE u.id=?`,
+    [vr.user_id]
+  );
+  if (requester.length) {
+    const requesterUuid = requester[0].uuid;
+    const senderOrg = await pool.query("SELECT name FROM organizations WHERE id=?", [req.user.organization]);
+    const orgName = senderOrg.length ? senderOrg[0].name : "An organization";
+    const statusText = status === "verified" ? "Approved" : "Rejected";
+    try {
+      await createNotificationForUsers({
+        userIds: [requesterUuid],
+        type: "request_verified",
+        title: `Request ${statusText.toLowerCase()}`,
+        message: `Your "${vr.document_type}" request was ${statusText} by ${orgName}.`,
+        link: "/requests",
+        referenceId: uuid,
+      });
+    } catch (e) {
+      console.error("Failed to create requester notification:", e.message);
+    }
+  } else {
+    console.error(`Could not notify requester: user_id ${vr.user_id} not found`);
+  }
 
   return ok(res, { request: updated[0] }, "Request updated");
 }
