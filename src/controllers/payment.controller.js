@@ -107,9 +107,10 @@ export async function myPlan(req, res) {
   const planSummary = getPlanSummary(user);
 
   let orgSubscription = null;
+  let payments = [];
   if (req.user.organization) {
     const [[org]] = await pool.query(
-      `SELECT subscription_status, subscription_plan, subscription_expiry, subscription_start
+      `SELECT id, subscription_status, subscription_plan, subscription_expiry, subscription_start
        FROM organizations WHERE id=?`,
       [req.user.organization]
     );
@@ -125,9 +126,21 @@ export async function myPlan(req, res) {
         start: org.subscription_start,
       };
     }
+
+    const [paymentRows] = await pool.query(
+      `SELECT p.uuid, p.amount, p.payment_method, p.transaction_reference, p.paid_at, p.purpose,
+              u.uuid AS user_uuid, u.full_name, u.email
+       FROM payment p
+       JOIN users u ON u.id = p.user_id
+       WHERE u.organization = ?
+       ORDER BY p.paid_at DESC
+       LIMIT 50`,
+      [req.user.organization]
+    );
+    payments = paymentRows;
   }
 
-  return ok(res, { plan: planSummary, org_subscription: orgSubscription }, "My plan");
+  return ok(res, { plan: planSummary, org_subscription: orgSubscription, payments }, "My plan");
 }
 
 export async function paymentProviders(req, res) {

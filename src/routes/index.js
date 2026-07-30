@@ -13,11 +13,15 @@ import adminUsers from "./admin/users.routes.js";
 import adminOrganizations from "./admin/organizations.routes.js";
 import adminVerification from "./admin/verification.routes.js";
 import adminPayment from "./admin/payment.routes.js";
+import leadsRoutes from "./leads.routes.js";
+import adminLeads from "./admin/leads.routes.js";
 import dashboardRoutes from "./dashboard.routes.js";
 
 const router = Router();
 
 router.use("/", dashboardRoutes);
+
+router.use("/leads", leadsRoutes);
 
 // Unified login (determines admin vs user automatically)
 router.use("/auth", unifiedAuth);
@@ -38,5 +42,6 @@ router.use("/admin/users", adminUsers);
 router.use("/admin/organizations", adminOrganizations);
 router.use("/admin/verification-requests", adminVerification);
 router.use("/admin/payment", adminPayment);
+router.use("/admin/leads", adminLeads);
 
 export default router;

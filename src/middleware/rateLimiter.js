@@ -24,6 +24,22 @@ export const forgotPasswordLimiter = rateLimit({
   handler: handler("Too many password reset requests. Please try again after 1 hour."),
 });
 
+export const contactLeadLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: handler("Too many submissions. Please try again after 1 hour."),
+});
+
+export const accessRequestLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: handler("Too many requests. Please try again after 1 hour."),
+});
+
 export const createRequestLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
   max: 10,

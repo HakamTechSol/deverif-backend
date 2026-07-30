@@ -148,6 +148,8 @@ export async function createRequest(req, res) {
 export async function mySentRequests(req, res) {
   const { page, limit, offset } = parsePagination(req.query);
   const search = typeof req.query.search === "string" ? req.query.search.trim() : "";
+  const dateFrom = typeof req.query.dateFrom === "string" ? req.query.dateFrom.trim() : "";
+  const dateTo = typeof req.query.dateTo === "string" ? req.query.dateTo.trim() : "";
 
   let whereClause = "WHERE vr.user_id = ?";
   const params = [req.user.id];
@@ -156,6 +158,14 @@ export async function mySentRequests(req, res) {
     whereClause += ` AND (vr.document_type LIKE ? OR o.name LIKE ? OR vr.document_format LIKE ? OR vr.status LIKE ?)`;
     const like = `%${search}%`;
     params.push(like, like, like, like);
+  }
+  if (dateFrom) {
+    whereClause += ` AND vr.created_at >= ?`;
+    params.push(dateFrom);
+  }
+  if (dateTo) {
+    whereClause += ` AND vr.created_at <= ?`;
+    params.push(`${dateTo} 23:59:59`);
   }
 
   const [[{ total }]] = await pool.query(
@@ -297,6 +307,8 @@ export async function myInboxRequests(req, res) {
 
   const { page, limit, offset } = parsePagination(req.query);
   const search = typeof req.query.search === "string" ? req.query.search.trim() : "";
+  const dateFrom = typeof req.query.dateFrom === "string" ? req.query.dateFrom.trim() : "";
+  const dateTo = typeof req.query.dateTo === "string" ? req.query.dateTo.trim() : "";
 
   let whereClause = "WHERE vr.issuing_organization_id = ?";
   const params = [req.user.organization];
@@ -305,6 +317,14 @@ export async function myInboxRequests(req, res) {
     whereClause += ` AND (requester.full_name LIKE ? OR requester.email LIKE ? OR vr.document_type LIKE ? OR vr.status LIKE ? OR requester_org.name LIKE ?)`;
     const like = `%${search}%`;
     params.push(like, like, like, like, like);
+  }
+  if (dateFrom) {
+    whereClause += ` AND vr.created_at >= ?`;
+    params.push(dateFrom);
+  }
+  if (dateTo) {
+    whereClause += ` AND vr.created_at <= ?`;
+    params.push(`${dateTo} 23:59:59`);
   }
 
   const [[{ total }]] = await pool.query(

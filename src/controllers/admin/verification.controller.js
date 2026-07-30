@@ -23,6 +23,8 @@ export async function listAllRequests(req, res) {
   const { page, limit, offset } = parsePagination(req.query);
   const search = typeof req.query.search === "string" ? req.query.search.trim() : "";
   const statusFilter = typeof req.query.status === "string" ? req.query.status.trim() : "";
+  const dateFrom = typeof req.query.dateFrom === "string" ? req.query.dateFrom.trim() : "";
+  const dateTo = typeof req.query.dateTo === "string" ? req.query.dateTo.trim() : "";
 
   let whereClause = "";
   const params = [];
@@ -36,6 +38,14 @@ export async function listAllRequests(req, res) {
   if (statusFilter && ["under_review", "verified", "unverified"].includes(statusFilter)) {
     conditions.push(`vr.status = ?`);
     params.push(statusFilter);
+  }
+  if (dateFrom) {
+    conditions.push(`vr.created_at >= ?`);
+    params.push(dateFrom);
+  }
+  if (dateTo) {
+    conditions.push(`vr.created_at <= ?`);
+    params.push(`${dateTo} 23:59:59`);
   }
   whereClause = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
 
@@ -74,14 +84,28 @@ export async function deleteRequest(req, res) {
 export async function listNullOrganizationRequests(req, res) {
   const { page, limit, offset } = parsePagination(req.query);
   const search = typeof req.query.search === "string" ? req.query.search.trim() : "";
+  const dateFrom = typeof req.query.dateFrom === "string" ? req.query.dateFrom.trim() : "";
+  const dateTo = typeof req.query.dateTo === "string" ? req.query.dateTo.trim() : "";
 
   let whereClause = "";
   const params = [];
+  const conditions = [];
 
   if (search) {
-    whereClause = "WHERE uo.name LIKE ? OR uo.email LIKE ? OR uo.phone LIKE ?";
+    conditions.push("(uo.name LIKE ? OR uo.email LIKE ? OR uo.phone LIKE ?)");
     const like = `%${search}%`;
     params.push(like, like, like);
+  }
+  if (dateFrom) {
+    conditions.push("uo.created_at >= ?");
+    params.push(dateFrom);
+  }
+  if (dateTo) {
+    conditions.push("uo.created_at <= ?");
+    params.push(`${dateTo} 23:59:59`);
+  }
+  if (conditions.length) {
+    whereClause = `WHERE ${conditions.join(" AND ")}`;
   }
 
   const [[{ total }]] = await pool.query(
@@ -160,6 +184,15 @@ export async function adminVerifyUnmatchedRequest(req, res) {
          verification_remarks=?, verification_method='admin'
      WHERE uuid=?`,
     [status, verification_remarks || null, uuid]
+  );
+
+  // Update unmatched org status to contacted since admin has reviewed it
+  await pool.query(
+    `UPDATE unmatched_organizations uo
+     INNER JOIN verification_requests vr ON vr.unmatched_org_id = uo.id
+     SET uo.status='contacted'
+     WHERE vr.uuid=? AND uo.status='pending'`,
+    [uuid]
   );
 
   // Notify the submitter

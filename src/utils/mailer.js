@@ -165,6 +165,65 @@ export async function sendInviteEmail({ to, setLink, invitedByName }) {
   });
 }
 
+export async function sendLeadNotificationEmail({ type, data }) {
+  const transporter = getMailerTransport();
+  if (!transporter) {
+    console.error("SMTP not configured — skipping lead notification email");
+    return;
+  }
+
+  const from = process.env.SMTP_FROM || process.env.SMTP_USER;
+  const appName = process.env.APP_NAME || "Dvarif";
+
+  const isContact = type === "contact";
+  const subjectLine = isContact
+    ? `New Contact Form Submission from ${data.name}`
+    : `New Access Request from ${data.contact_name || data.organization_name}`;
+
+  const detailsHtml = Object.entries(data)
+    .filter(([, v]) => v != null && v !== "")
+    .map(([k, v]) => `<tr><td style="padding:4px 0;color:#888;font-size:13px;font-weight:600;text-transform:capitalize;vertical-align:top;white-space:nowrap;padding-right:12px;">${k.replace(/_/g, " ")}</td><td style="padding:4px 0;color:#333;font-size:13px;">${v}</td></tr>`)
+    .join("");
+
+  const bodyHtml = `
+    <tr><td style="padding:40px;">
+      <h2 style="margin:0 0 8px;color:#1a1a2e;font-size:20px;font-weight:600;">${subjectLine}</h2>
+      <p style="margin:0 0 20px;color:#555;font-size:15px;line-height:1.6;">
+        A new ${isContact ? "contact form" : "access request"} was submitted on the marketing website.
+      </p>
+      <table cellpadding="0" cellspacing="0" style="margin:0 0 24px;width:100%;">
+        ${detailsHtml}
+      </table>
+      <p style="margin:0;color:#888;font-size:13px;line-height:1.5;">
+        Review this lead in the admin panel.
+      </p>
+    </td></tr>`;
+
+  const text = [
+    subjectLine,
+    "",
+    `A new ${isContact ? "contact form" : "access request"} was submitted.`,
+    "",
+    ...Object.entries(data)
+      .filter(([, v]) => v != null && v !== "")
+      .map(([k, v]) => `${k.replace(/_/g, " ")}: ${v}`),
+    "",
+    "Review this lead in the admin panel.",
+  ].join("\n");
+
+  await transporter.sendMail({
+    from: `"${appName}" <${from}>`,
+    to: from,
+    subject: `${appName} — ${subjectLine}`,
+    text,
+    html: emailWrapper(bodyHtml),
+    headers: {
+      "X-Mailer": "Dvarif",
+      "List-Unsubscribe": `<mailto:${from}?subject=unsubscribe>`,
+    },
+  });
+}
+
 export async function sendExpiryReminderEmail({ orgName, type, daysLeft, hoursLeft }) {
   const transporter = getMailerTransport();
   if (!transporter) {
