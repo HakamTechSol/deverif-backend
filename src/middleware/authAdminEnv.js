@@ -22,7 +22,7 @@ export default async function authAdminEnv(req, res, next) {
     if (await isBlacklisted(token)) throw new ApiError(401, "Token has been revoked");
 
     const [rows] = await pool.query(
-      `SELECT id, uuid, email, full_name, phone, profile_image, status
+      `SELECT id, uuid, email, full_name, phone, profile_image, status, preferred_language
        FROM admin_profiles WHERE uuid=?`,
       [decoded.userId]
     );

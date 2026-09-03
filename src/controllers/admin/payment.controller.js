@@ -3,6 +3,7 @@ import { pool } from "../../config/db.js";
 import { ok, created } from "../../utils/response.js";
 import { assertUuid } from "../../utils/publicResponse.js";
 import { parsePagination, paginatedResponse } from "../../utils/pagination.js";
+import { logAudit, getActorFromReq } from "../../utils/auditLog.js";
 
 export async function listPayments(req, res) {
   const { page, limit, offset } = parsePagination(req.query);
@@ -77,5 +78,15 @@ export async function createPayment(req, res) {
      WHERE p.id=?`,
     [result.insertId]
   );
+
+  logAudit({
+    ...getActorFromReq(req),
+    action: "payment.create",
+    entityType: "payment",
+    entityId: rows[0].uuid,
+    details: { user_uuid, amount, payment_method: payment_method || "manual", purpose: purpose || null },
+    req,
+  });
+
   return created(res, { payment: rows[0] }, "Payment created");
 }

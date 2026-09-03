@@ -4,6 +4,9 @@ import { ok } from "../../utils/response.js";
 import { assertUuid } from "../../utils/publicResponse.js";
 import { parsePagination, paginatedResponse } from "../../utils/pagination.js";
 import { createNotificationForUsers } from "../notification.controller.js";
+import { logAudit, getActorFromReq } from "../../utils/auditLog.js";
+import { generateQrForRequest } from "../../utils/qrCertificate.js";
+import { runSlaChecks } from "../../utils/slaChecks.js";
 
 const REQUEST_SELECT = `SELECT vr.*,
         requester.uuid AS requester_uuid,
@@ -25,6 +28,9 @@ export async function listAllRequests(req, res) {
   const statusFilter = typeof req.query.status === "string" ? req.query.status.trim() : "";
   const dateFrom = typeof req.query.dateFrom === "string" ? req.query.dateFrom.trim() : "";
   const dateTo = typeof req.query.dateTo === "string" ? req.query.dateTo.trim() : "";
+
+  // Lazy SLA check on read (reminder + flag overdue requests)
+  runSlaChecks().catch(() => {});
 
   let whereClause = "";
   const params = [];
@@ -63,6 +69,111 @@ export async function listAllRequests(req, res) {
   return ok(res, paginatedResponse(rows, total, page, limit), "All verification requests");
 }
 
+export async function listSlaFlaggedRequests(req, res) {
+  // Ensure the lazy check has run so the flagged list is current
+  await runSlaChecks();
+
+  const { page, limit, offset } = parsePagination(req.query);
+  const search = typeof req.query.search === "string" ? req.query.search.trim() : "";
+
+  let whereClause =
+    "WHERE vr.status='under_review' AND vr.sla_flagged_at IS NOT NULL AND vr.issuing_organization_id IS NOT NULL";
+  const params = [];
+
+  if (search) {
+    whereClause += ` AND (requester.full_name LIKE ? OR requester.email LIKE ? OR vr.document_type LIKE ? OR issuing_org.name LIKE ? OR vr.uuid LIKE ?)`;
+    const like = `%${search}%`;
+    params.push(like, like, like, like, like);
+  }
+
+  const [[{ total }]] = await pool.query(
+    `SELECT COUNT(*) AS total FROM verification_requests vr
+     JOIN users requester ON requester.id = vr.user_id
+     LEFT JOIN organizations issuing_org ON issuing_org.id = vr.issuing_organization_id
+     ${whereClause}`,
+    params
+  );
+  const [rows] = await pool.query(
+    `${REQUEST_SELECT} ${whereClause} ORDER BY vr.sla_flagged_at DESC LIMIT ? OFFSET ?`,
+    [...params, limit, offset]
+  );
+
+  return ok(res, paginatedResponse(rows, total, page, limit), "Unresponsive requests");
+}
+
+export async function adminActOnSlaRequest(req, res) {
+  const { uuid } = req.params;
+  const { status, verification_remarks } = req.body;
+
+  assertUuid(uuid, "Request UUID");
+  if (!["verified", "unverified"].includes(status)) {
+    throw new ApiError(400, "status must be verified or unverified");
+  }
+
+  const [rows] = await pool.query(
+    "SELECT * FROM verification_requests WHERE uuid=?",
+    [uuid]
+  );
+  if (!rows.length) throw new ApiError(404, "Request not found");
+
+  const vr = rows[0];
+  if (["verified", "unverified"].includes(vr.status)) {
+    throw new ApiError(409, "Request already finalized");
+  }
+  if (vr.issuing_organization_id === null) {
+    throw new ApiError(400, "This request has no registered organization — use the Unmatched Orgs flow");
+  }
+
+  await pool.query(
+    `UPDATE verification_requests
+     SET status=?, verified_at=NOW(), verified_by=?,
+         verification_remarks=?, verification_method='admin_sla'
+     WHERE uuid=?`,
+    [status, req.admin.id, verification_remarks || null, uuid]
+  );
+
+  const [updated] = await pool.query(
+    `${REQUEST_SELECT} WHERE vr.uuid=?`,
+    [uuid]
+  );
+
+  if (status === "verified") {
+    await generateQrForRequest(updated[0]);
+  }
+
+  // Notify the original submitter
+  const [requester] = await pool.query(
+    "SELECT uuid FROM users WHERE id=?",
+    [vr.user_id]
+  );
+  const statusText = status === "verified" ? "Approved" : "Rejected";
+  if (requester.length) {
+    try {
+      await createNotificationForUsers({
+        userIds: [requester[0].uuid],
+        type: "request_verified",
+        title: `Request ${statusText.toLowerCase()}`,
+        message: `Your "${vr.document_type}" request was ${statusText} by Dvarif Admin (unresponsive organization).`,
+        link: "/requests",
+        referenceId: uuid,
+      });
+    } catch (e) {
+      console.error("Failed to create requester notification:", e.message);
+    }
+  }
+
+  logAudit({
+    ...getActorFromReq(req),
+    action: status === "verified" ? "request.verify" : "request.reject",
+    entityType: "verification_request",
+    entityId: uuid,
+    details: { status, method: "admin_sla" },
+    req,
+  });
+
+  return ok(res, { request: updated[0] }, "Request updated");
+}
+
 export async function deleteRequest(req, res) {
   const { uuid } = req.params;
   assertUuid(uuid, "Request UUID");
@@ -78,6 +189,16 @@ export async function deleteRequest(req, res) {
   }
 
   await pool.query("DELETE FROM verification_requests WHERE uuid=?", [uuid]);
+
+  logAudit({
+    ...getActorFromReq(req),
+    action: "request.delete",
+    entityType: "verification_request",
+    entityId: uuid,
+    details: { status: exists[0].status },
+    req,
+  });
+
   return ok(res, {}, "Verification request deleted");
 }
 
@@ -224,6 +345,19 @@ export async function adminVerifyUnmatchedRequest(req, res) {
     [uuid]
   );
 
+  if (status === "verified") {
+    await generateQrForRequest(updated[0]);
+  }
+
+  logAudit({
+    ...getActorFromReq(req),
+    action: status === "verified" ? "request.verify" : "request.reject",
+    entityType: "verification_request",
+    entityId: uuid,
+    details: { status, method: "admin" },
+    req,
+  });
+
   return ok(res, { request: updated[0] }, "Request updated");
 }
 
@@ -258,11 +392,31 @@ export async function acceptNullOrganizationRequest(req, res) {
     [assignedOrgId, verification_remarks || null, unmatchedOrg.id]
   );
 
+  // Generate a QR certificate for each newly-verified request
+  const [affectedRequests] = await pool.query(
+    `SELECT id, uuid, issuing_organization_id, verified_at
+     FROM verification_requests
+     WHERE unmatched_org_id=? AND status='verified' AND qr_token IS NULL`,
+    [unmatchedOrg.id]
+  );
+  for (const requestRow of affectedRequests) {
+    await generateQrForRequest(requestRow);
+  }
+
   // Mark the unmatched org as converted
   await pool.query(
     "UPDATE unmatched_organizations SET status='converted' WHERE id=?",
     [unmatchedOrg.id]
   );
+
+  logAudit({
+    ...getActorFromReq(req),
+    action: "unmatched_org.assign",
+    entityType: "unmatched_organization",
+    entityId: uuid,
+    details: { organization_uuid: issuing_organization_uuid },
+    req,
+  });
 
   return ok(res, { unmatched_org: { uuid, name: unmatchedOrg.name, status: "converted" } }, "Unmatched organization assigned");
 }
@@ -298,6 +452,14 @@ export async function lockRequest(req, res) {
     [uuid]
   );
 
+  logAudit({
+    ...getActorFromReq(req),
+    action: "request.lock",
+    entityType: "verification_request",
+    entityId: uuid,
+    req,
+  });
+
   return ok(res, { request: updated[0] }, `Request locked by ${lockerName || "team member"}`);
 }
 
@@ -324,6 +486,14 @@ export async function unlockRequest(req, res) {
     `${REQUEST_SELECT} WHERE vr.uuid=?`,
     [uuid]
   );
+
+  logAudit({
+    ...getActorFromReq(req),
+    action: "request.unlock",
+    entityType: "verification_request",
+    entityId: uuid,
+    req,
+  });
 
   return ok(res, { request: updated[0] }, "Request unlocked");
 }

@@ -3,6 +3,7 @@ import ApiError from "../utils/ApiError.js";
 import { pool } from "../config/db.js";
 import { ok } from "../utils/response.js";
 import { sendPasswordResetEmail } from "../utils/mailer.js";
+import { firstFrontendUrl } from "../utils/frontendUrl.js";
 import { signAccessToken } from "../utils/jwt.js";
 import {
   validatePasswordPolicy,
@@ -33,7 +34,7 @@ export async function loginUser(req, res) {
   if (!email || !password) throw new ApiError(400, "Email and password are required");
 
   const [rows] = await pool.query(
-    "SELECT id, uuid, full_name, email, password, status, profile_image FROM users WHERE email=?",
+    "SELECT id, uuid, full_name, email, password, status, profile_image, organization, org_role, feature_access, preferred_language FROM users WHERE email=?",
     [email]
   );
   if (!rows.length) throw new ApiError(401, "Invalid credentials");
@@ -41,10 +42,19 @@ export async function loginUser(req, res) {
   const user = rows[0];
   if (user.status !== "active") throw new ApiError(403, "User inactive");
 
+  // NEW: Check if the linked employee record is inactive and the user is a platform user.
+  const [employees] = await pool.query(
+    `SELECT is_platform_user, status FROM employees WHERE linked_user_uuid = ?`,
+    [user.id]
+  );
+  if (employees.length && employees[0].is_platform_user === 'yes' && employees[0].status === 'inactive') {
+    throw new ApiError(403, "Your account has been deactivated. Contact your organization admin.");
+  }
+
   const match = await comparePassword(password, user.password);
   if (!match) throw new ApiError(401, "Invalid credentials");
 
-  const accessToken = signAccessToken({ type: "user", userId: user.uuid, role: "user" });
+  const accessToken = signAccessToken({ type: "user", userId: user.uuid, role: "user", organization: user.organization, org_role: user.org_role });
   const refreshToken = signRefreshToken({ type: "user", userId: user.uuid, role: "user" }, !!rememberMe);
 
   const decoded = JSON.parse(Buffer.from(refreshToken.split(".")[1], "base64url").toString());
@@ -53,7 +63,7 @@ export async function loginUser(req, res) {
 
   res.cookie("dvarif_refresh", refreshToken, getRefreshCookieOptions(!!rememberMe));
 
-  return ok(res, { token: accessToken, user: { uuid: user.uuid, full_name: user.full_name, email: user.email, profile_image: user.profile_image } }, "Login successful");
+  return ok(res, { token: accessToken, user: { uuid: user.uuid, full_name: user.full_name, email: user.email, profile_image: user.profile_image, organization: user.organization, org_role: user.org_role, feature_access: user.feature_access, preferred_language: user.preferred_language || "en" } }, "Login successful");
 }
 
 export async function forgotPassword(req, res) {
@@ -61,7 +71,7 @@ export async function forgotPassword(req, res) {
   if (!email) throw new ApiError(400, "Email is required");
 
   const [rows] = await pool.query(
-    "SELECT id, uuid, email, status FROM users WHERE email=?",
+    "SELECT id, uuid, email, status, preferred_language FROM users WHERE email=?",
     [email]
   );
 
@@ -87,11 +97,11 @@ export async function forgotPassword(req, res) {
     [user.uuid, tokenHash, expiresIn]
   );
 
-  const frontendResetBase = process.env.FRONTEND_RESET_URL || "http://localhost:5173/reset-password";
+  const frontendResetBase = firstFrontendUrl(process.env.FRONTEND_RESET_URL, "http://localhost:5173/reset-password");
   const resetLink = `${frontendResetBase}?token=${encodeURIComponent(rawToken)}`;
 
   try {
-    await sendPasswordResetEmail({ to: user.email, resetLink });
+    await sendPasswordResetEmail({ to: user.email, resetLink, lang: user.preferred_language || "en" });
   } catch (e) {
     throw new ApiError(500, e.message || "Failed to send password reset email");
   }

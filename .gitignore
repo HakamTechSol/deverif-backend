@@ -1,4 +1,26 @@
-﻿.env
+﻿# Environment
+.env
+.env.*.local
+.env.production
+.env.staging
+
+# Dependencies
 node_modules
+
+# Runtime / uploads
 uploads
+tmp/
+
+# Logs
 *.log
+logs/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Misc
+coverage/
+.cache/
+*.pid

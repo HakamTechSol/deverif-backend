@@ -14,6 +14,7 @@ import {
   verifyRequest,
   listOrganizations
 } from "../controllers/verification.controller.js";
+import { downloadCertificate } from "../controllers/certificate.controller.js";
 
 const router = Router();
 
@@ -25,5 +26,6 @@ router.delete("/my/sent/:uuid", authUser, asyncHandler(deleteMySentRequest));
 router.get("/my/inbox", authUser, asyncHandler(myInboxRequests));
 router.get("/my/inbox/count", authUser, asyncHandler(myInboxCount));
 router.patch("/:uuid/verify", authUser, asyncHandler(verifyRequest));
+router.get("/:uuid/certificate", authUser, asyncHandler(downloadCertificate));
 
 export default router;

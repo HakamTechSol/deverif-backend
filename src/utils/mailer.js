@@ -1,5 +1,25 @@
 import nodemailer from "nodemailer";
 
+// TEMP-DEBUG (remove after production SMTP diagnosis):
+console.log(
+  `[smtp-debug] transport config at module load: host=${process.env.SMTP_HOST || "(unset)"} port=${process.env.SMTP_PORT || "(unset)"} secure=${process.env.SMTP_SECURE ?? "(unset)"} user=${
+    process.env.SMTP_USER ? process.env.SMTP_USER.replace(/^(.).*(@.*)$/, "$1***$2") : "(unset)"
+  } pass_len=${(process.env.SMTP_PASS || "").trim().length} pass_raw_len=${(process.env.SMTP_PASS || "").length}`
+);
+
+function dumpSmtpError(label, err) {
+  // TEMP-DEBUG (remove after diagnosis): full raw error incl. non-enumerable props
+  const raw = {};
+  for (const k of Object.getOwnPropertyNames(err)) {
+    try {
+      raw[k] = err[k];
+    } catch {
+      raw[k] = "<unavailable>";
+    }
+  }
+  console.error(`[smtp-debug] RAW Nodemailer error (${label}):`, JSON.stringify(raw, null, 2));
+}
+
 function toBool(value, fallback = false) {
   if (value === undefined || value === null || value === "") return fallback;
   const normalized = String(value).toLowerCase().trim();
@@ -22,9 +42,125 @@ export function getMailerTransport() {
   });
 }
 
-function emailWrapper(bodyHtml) {
+/**
+ * Recipient-facing email copy in the recipient's preferred language.
+ * Layout is shared; only the wording changes. English is the default.
+ */
+function emailTexts(lang) {
+  const ur = lang === "ur";
+  return {
+    // Shared
+    footerTagline: ur
+      ? "Dvarif — دستاویز کی تصدیق کا پلیٹ فارم"
+      : "Dvarif — Document Verification Platform",
+    footerAuto: ur
+      ? "یہ ایک خودکار پیغام ہے، براہِ کرم جواب نہ دیں۔"
+      : "This is an automated message, please do not reply.",
+
+    // Password reset
+    resetSubject: ur ? "اپنا پاس ورڈ تبدیل کریں" : "Reset Your Password",
+    resetHeading: ur ? "اپنا پاس ورڈ تبدیل کریں" : "Reset your password",
+    resetBody: (appName) =>
+      ur
+        ? `ہمیں آپ کے ${appName} اکاؤنٹ کا پاس ورڈ تبدیل کرنے کی درخواست موصول ہوئی۔`
+        : `We received a request to reset the password for your ${appName} account.`,
+    resetLinkLine: (expiry) =>
+      ur
+        ? `نیا پاس ورڈ منتخب کرنے کے لیے نیچے دیے گئے بٹن پر کلک کریں۔ یہ لنک <strong>${expiry}</strong> میں ختم ہو جائے گا۔`
+        : `Click the button below to choose a new password. This link expires in <strong>${expiry}</strong>.`,
+    resetButton: ur ? "پاس ورڈ تبدیل کریں" : "Reset Password",
+    resetIgnore: ur
+      ? "اگر آپ نے یہ درخواست نہیں بھیجی تو اس ای میل کو نظر انداز کریں۔ آپ کا پاس ورڈ تبدیل نہیں ہو گا۔"
+      : "If you did not request this, you can safely ignore this email. Your password will remain unchanged.",
+    resetTextTitle: ur ? "اپنا پاس ورڈ تبدیل کریں" : "Reset your password",
+    resetTextLink: (expiry) =>
+      ur
+        ? `نیا پاس ورڈ منتخب کرنے کے لیے نیچے دیے گئے لنک پر کلک کریں (${expiry} تک درست):`
+        : `Click the link below to choose a new password (valid for ${expiry}):`,
+    resetTextIgnore: ur
+      ? "اگر آپ نے یہ درخواست نہیں بھیجی تو اس ای میل کو نظر انداز کریں۔"
+      : "If you did not request this, you can safely ignore this email.",
+
+    // OTP login
+    otpSubject: ur ? "آپ کا لاگ ان کوڈ" : "Your Dvarif login code",
+    otpHeading: ur ? "آپ کا لاگ ان کوڈ" : "Your login code",
+    otpBody: ur
+      ? "سائن ان مکمل کرنے کے لیے نیچے دیا گیا کوڈ استعمال کریں۔ یہ کوڈ <strong>5 منٹ</strong> میں ختم ہو جائے گا۔"
+      : "Use the code below to complete your sign-in. This code expires in <strong>5 minutes</strong>.",
+    otpIgnore: ur
+      ? "اگر آپ نے یہ کوڈ نہیں مانگا تو اس ای میل کو نظر انداز کریں۔"
+      : "If you did not request this code, you can safely ignore this email.",
+    otpTextCode: (otp) =>
+      ur ? `آپ کا Dvarif لاگ ان کوڈ ہے: ${otp}` : `Your Dvarif login code is: ${otp}`,
+    otpTextExpiry: ur
+      ? "یہ کوڈ 5 منٹ میں ختم ہو جائے گا۔"
+      : "This code expires in 5 minutes.",
+    otpTextIgnore: ur
+      ? "اگر آپ نے یہ کوڈ نہیں مانگا تو اس ای میل کو نظر انداز کریں۔"
+      : "If you did not request this code, you can safely ignore this email.",
+
+    // Invite
+    inviteSubject: ur ? "آپ کو مدعو کیا گیا ہے" : "You're Invited to Join",
+    inviteHeading: ur ? "آپ کو مدعو کیا گیا ہے!" : "You're invited!",
+    inviteIntro: (name, appName) =>
+      ur
+        ? `${name ? `<strong>${name}</strong> نے آپ کو` : "آپ کو"} ${appName} دستاویز کی تصدیق کے نیٹ ورک میں شامل ہونے کی دعوت دی ہے۔ آپ کا اکاؤنٹ بن چکا ہے — آپ کو صرف اپنا پاس ورڈ سیٹ کرنا ہے۔`
+        : `${name ? `<strong>${name}</strong> has invited you` : "You have been invited"} to join the ${appName} document verification network. Your account has been created &mdash; all you need to do is set your password.`,
+    inviteButton: ur ? "پاس ورڈ سیٹ کریں" : "Set Your Password",
+    inviteExpiry: (hours) =>
+      ur
+        ? `یہ لنک <strong>${hours} گھنٹے</strong> میں ختم ہو جائے گا۔`
+        : `This link expires in <strong>${hours} hours</strong>.`,
+    inviteIgnore: ur
+      ? "اگر آپ کو اس دعوت کی توقع نہیں تھی تو آپ اس ای میل کو نظر انداز کر سکتے ہیں۔"
+      : "If you did not expect this invitation, you can safely ignore this email.",
+    inviteTextTitle: (appName) =>
+      ur ? `آپ کو ${appName} میں شامل ہونے کی دعوت دی گئی ہے!` : `You're invited to join ${appName}!`,
+    inviteTextIntro: (name, appName) =>
+      ur
+        ? `${name ? `${name} نے` : "کسی نے"} آپ کو ${appName} دستاویز کی تصدیق کے نیٹ ورک میں شامل ہونے کی دعوت دی ہے۔`
+        : `${name ? `${name} has` : "Someone has"} invited you to join the ${appName} document verification network.`,
+    inviteTextCreated: ur
+      ? "آپ کا اکاؤنٹ بن چکا ہے — آپ کو صرف اپنا پاس ورڈ سیٹ کرنا ہے۔"
+      : "Your account has been created — all you need to do is set your password.",
+    inviteTextLink: (hours) =>
+      ur
+        ? `اپنا پاس ورڈ سیٹ کرنے کے لیے نیچے دیے گئے لنک پر کلک کریں (${hours} گھنٹوں میں ختم ہو جائے گا):`
+        : `Click the link below to set your password (expires in ${hours} hours):`,
+    inviteTextIgnore: ur
+      ? "اگر آپ کو اس دعوت کی توقع نہیں تھی تو آپ اس ای میل کو نظر انداز کر سکتے ہیں۔"
+      : "If you did not expect this invitation, you can safely ignore this email.",
+
+    // SLA reminder
+    slaBadge: ur ? "تصدیق کی یاد دہانی" : "Verification Reminder",
+    slaHeading: ur ? "ایک دستاویز آپ کے جائزے کا انتظار کر رہی ہے" : "A document is waiting for your review",
+    slaWaiting: (orgName) =>
+      ur
+        ? `<strong>${orgName}</strong> کے پاس ایک زیر التوا تصدیقی درخواست ہے جو <strong>2+ دنوں</strong> سے انتظار میں ہے۔`
+        : `<strong>${orgName}</strong> has a pending verification request that has been waiting for <strong>2+ days</strong>.`,
+    slaDocType: ur ? "دستاویز کی قسم:" : "Document type:",
+    slaAction: ur
+      ? "براہِ کرم Dvarif پورٹل میں لاگ ان ہو کر درخواست کا جائزہ لیں۔ اگر یہ 3+ دنوں تک زیر جواب رہی تو اسے Dvarif سپورٹ ٹیم کے پاس بھیج دیا جا سکتا ہے۔"
+      : "Please log in to the Dvarif portal and review the request. If it stays unanswered for 3+ days, it may be escalated to the Dvarif support team for review.",
+    slaSubject: (orgName) =>
+      ur
+        ? `${orgName} کے لیے زیر التوا تصدیقی درخواست`
+        : `Pending verification request for ${orgName}`,
+    slaTextWaiting: (orgName) =>
+      ur
+        ? `${orgName} کے پاس ایک زیر التوا تصدیقی درخواست ہے جو 2+ دنوں سے انتظار میں ہے۔`
+        : `${orgName} has a pending verification request that has been waiting for 2+ days.`,
+    slaTextDocType: ur ? "دستاویز کی قسم:" : "Document type:",
+    slaTextAction: ur
+      ? "براہِ کرم Dvarif پورٹل میں لاگ ان ہو کر درخواست کا جائزہ لیں۔"
+      : "Please log in to the Dvarif portal and review the request.",
+  };
+}
+
+function emailWrapper(bodyHtml, lang) {
+  const T = emailTexts(lang);
   return `<!DOCTYPE html>
-<html lang="en">
+<html lang="${lang === "ur" ? "ur" : "en"}">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"></head>
 <body style="margin:0;padding:0;background-color:#f4f5f7;font-family:Arial,Helvetica,sans-serif;-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%;">
   <table width="100%" cellpadding="0" cellspacing="0" style="background-color:#f4f5f7;padding:40px 0;">
@@ -37,10 +173,10 @@ function emailWrapper(bodyHtml) {
         <tr><td style="background-color:#f9fafb;padding:20px 40px;border-top:1px solid #eee;">
           <table width="100%" cellpadding="0" cellspacing="0">
             <tr><td style="text-align:center;">
-              <span style="color:#999;font-size:12px;">Dvarif &mdash; Document Verification Platform</span>
+              <span style="color:#999;font-size:12px;">${T.footerTagline}</span>
             </td></tr>
             <tr><td style="padding-top:8px;text-align:center;">
-              <span style="color:#bbb;font-size:11px;">This is an automated message, please do not reply.</span>
+              <span style="color:#bbb;font-size:11px;">${T.footerAuto}</span>
             </td></tr>
           </table>
         </td></tr>
@@ -51,7 +187,7 @@ function emailWrapper(bodyHtml) {
 </html>`;
 }
 
-export async function sendPasswordResetEmail({ to, resetLink }) {
+export async function sendPasswordResetEmail({ to, resetLink, lang = "en" }) {
   const transporter = getMailerTransport();
   if (!transporter) {
     throw new Error("SMTP is not configured. Please set SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS");
@@ -60,46 +196,100 @@ export async function sendPasswordResetEmail({ to, resetLink }) {
   const from = process.env.SMTP_FROM || process.env.SMTP_USER;
   const appName = process.env.APP_NAME || "Dvarif";
   const expiry = process.env.RESET_PASSWORD_EXPIRES_IN || "15m";
+  const T = emailTexts(lang);
 
   const bodyHtml = `
     <tr><td style="padding:40px;">
-      <h2 style="margin:0 0 8px;color:#1a1a2e;font-size:20px;font-weight:600;">Reset your password</h2>
+      <h2 style="margin:0 0 8px;color:#1a1a2e;font-size:20px;font-weight:600;">${T.resetHeading}</h2>
       <p style="margin:0 0 20px;color:#555;font-size:15px;line-height:1.6;">
-        We received a request to reset the password for your ${appName} account.
+        ${T.resetBody(appName)}
       </p>
       <p style="margin:0 0 20px;color:#555;font-size:15px;line-height:1.6;">
-        Click the button below to choose a new password. This link expires in <strong>${expiry}</strong>.
+        ${T.resetLinkLine(expiry)}
       </p>
       <table cellpadding="0" cellspacing="0" style="margin:0 0 24px;">
         <tr><td>
           <a href="${resetLink}" target="_blank" rel="noopener noreferrer"
              style="display:inline-block;background-color:#1a1a2e;color:#ffffff;font-size:15px;font-weight:600;text-decoration:none;padding:14px 32px;border-radius:6px;">
-            Reset Password
+            ${T.resetButton}
           </a>
         </td></tr>
       </table>
       <p style="margin:0 0 8px;color:#888;font-size:13px;line-height:1.5;">
-        If you did not request this, you can safely ignore this email. Your password will remain unchanged.
+        ${T.resetIgnore}
       </p>
     </td></tr>`;
 
   const text = [
-    `Reset your password`,
+    T.resetTextTitle,
     ``,
-    `We received a request to reset the password for your ${appName} account.`,
+    T.resetBody(appName).replace(/<[^>]+>/g, ""),
     ``,
-    `Click the link below to choose a new password (valid for ${expiry}):`,
+    T.resetTextLink(expiry).replace(/<[^>]+>/g, ""),
     resetLink,
     ``,
-    `If you did not request this, you can safely ignore this email.`,
+    T.resetTextIgnore,
+  ].join("\n");
+
+  try {
+    const info = await transporter.sendMail({
+      from: `"${appName}" <${from}>`,
+      to,
+      subject: `${appName} — ${T.resetSubject}`,
+      text,
+      html: emailWrapper(bodyHtml, lang),
+      headers: {
+        "X-Mailer": "Dvarif",
+        "List-Unsubscribe": `<mailto:${from}?subject=unsubscribe>`,
+      },
+    });
+    // TEMP-DEBUG (remove after diagnosis):
+    console.log(`[smtp-debug] reset email ACCEPTED by SMTP server: response="${info.response}" messageId=${info.messageId} accepted=${JSON.stringify(info.accepted)} rejected=${JSON.stringify(info.rejected)}`);
+    return info;
+  } catch (err) {
+    dumpSmtpError("sendPasswordResetEmail", err);
+    throw err;
+  }
+}
+
+export async function sendLoginOtpEmail({ to, otp, lang = "en" }) {
+  const transporter = getMailerTransport();
+  if (!transporter) {
+    throw new Error("SMTP is not configured. Please set SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS");
+  }
+
+  const from = process.env.SMTP_FROM || process.env.SMTP_USER;
+  const appName = process.env.APP_NAME || "Dvarif";
+  const T = emailTexts(lang);
+
+  const bodyHtml = `
+    <tr><td style="padding:40px;">
+      <h2 style="margin:0 0 8px;color:#1a1a2e;font-size:20px;font-weight:600;">${T.otpHeading}</h2>
+      <p style="margin:0 0 20px;color:#555;font-size:15px;line-height:1.6;">
+        ${T.otpBody}
+      </p>
+      <div style="margin:0 0 24px;background-color:#f4f4f5;border-radius:8px;padding:20px 0;text-align:center;">
+        <span style="font-size:32px;font-weight:700;letter-spacing:8px;color:#1a1a2e;font-family:monospace;">${otp}</span>
+      </div>
+      <p style="margin:0 0 8px;color:#888;font-size:13px;line-height:1.5;">
+        ${T.otpIgnore}
+      </p>
+    </td></tr>`;
+
+  const text = [
+    T.otpTextCode(otp),
+    ``,
+    T.otpTextExpiry,
+    ``,
+    T.otpTextIgnore,
   ].join("\n");
 
   await transporter.sendMail({
     from: `"${appName}" <${from}>`,
     to,
-    subject: `${appName} — Reset Your Password`,
+    subject: T.otpSubject,
     text,
-    html: emailWrapper(bodyHtml),
+    html: emailWrapper(bodyHtml, lang),
     headers: {
       "X-Mailer": "Dvarif",
       "List-Unsubscribe": `<mailto:${from}?subject=unsubscribe>`,
@@ -107,7 +297,7 @@ export async function sendPasswordResetEmail({ to, resetLink }) {
   });
 }
 
-export async function sendInviteEmail({ to, setLink, invitedByName }) {
+export async function sendInviteEmail({ to, setLink, invitedByName, lang = "en" }) {
   const transporter = getMailerTransport();
   if (!transporter) {
     throw new Error("SMTP is not configured. Please set SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS");
@@ -116,48 +306,48 @@ export async function sendInviteEmail({ to, setLink, invitedByName }) {
   const from = process.env.SMTP_FROM || process.env.SMTP_USER;
   const appName = process.env.APP_NAME || "Dvarif";
   const expiryHours = process.env.INVITE_EXPIRES_IN_HOURS || "72";
+  const T = emailTexts(lang);
 
   const bodyHtml = `
     <tr><td style="padding:40px;">
-      <h2 style="margin:0 0 8px;color:#1a1a2e;font-size:20px;font-weight:600;">You're invited!</h2>
+      <h2 style="margin:0 0 8px;color:#1a1a2e;font-size:20px;font-weight:600;">${T.inviteHeading}</h2>
       <p style="margin:0 0 20px;color:#555;font-size:15px;line-height:1.6;">
-        ${invitedByName ? `<strong>${invitedByName}</strong> has invited you` : 'You have been invited'} to join the ${appName} document verification network.
-        Your account has been created &mdash; all you need to do is set your password.
+        ${T.inviteIntro(invitedByName, appName)}
       </p>
       <table cellpadding="0" cellspacing="0" style="margin:0 0 24px;">
         <tr><td>
           <a href="${setLink}" target="_blank" rel="noopener noreferrer"
              style="display:inline-block;background-color:#1a1a2e;color:#ffffff;font-size:15px;font-weight:600;text-decoration:none;padding:14px 32px;border-radius:6px;">
-            Set Your Password
+            ${T.inviteButton}
           </a>
         </td></tr>
       </table>
       <p style="margin:0 0 20px;color:#555;font-size:15px;line-height:1.6;">
-        This link expires in <strong>${expiryHours} hours</strong>.
+        ${T.inviteExpiry(expiryHours)}
       </p>
       <p style="margin:0;color:#888;font-size:13px;line-height:1.5;">
-        If you did not expect this invitation, you can safely ignore this email.
+        ${T.inviteIgnore}
       </p>
     </td></tr>`;
 
   const text = [
-    `You're invited to join ${appName}!`,
+    T.inviteTextTitle(appName),
     ``,
-    `${invitedByName ? `${invitedByName} has` : 'Someone has'} invited you to join the ${appName} document verification network.`,
-    `Your account has been created — all you need to do is set your password.`,
+    T.inviteTextIntro(invitedByName, appName).replace(/<[^>]+>/g, ""),
+    T.inviteTextCreated,
     ``,
-    `Click the link below to set your password (expires in ${expiryHours} hours):`,
+    T.inviteTextLink(expiryHours),
     setLink,
     ``,
-    `If you did not expect this invitation, you can safely ignore this email.`,
+    T.inviteTextIgnore,
   ].join("\n");
 
   await transporter.sendMail({
     from: `"${appName}" <${from}>`,
     to,
-    subject: `${appName} — You're Invited to Join`,
+    subject: `${appName} — ${T.inviteSubject}`,
     text,
-    html: emailWrapper(bodyHtml),
+    html: emailWrapper(bodyHtml, lang),
     headers: {
       "X-Mailer": "Dvarif",
       "List-Unsubscribe": `<mailto:${from}?subject=unsubscribe>`,
@@ -272,6 +462,56 @@ export async function sendExpiryReminderEmail({ orgName, type, daysLeft, hoursLe
     subject: `${subjectPrefix} ${appName} — Subscription Expiring for ${orgName}`,
     text,
     html: emailWrapper(bodyHtml),
+    headers: {
+      "X-Mailer": "Dvarif",
+      "List-Unsubscribe": `<mailto:${from}?subject=unsubscribe>`,
+    },
+  });
+}
+
+export async function sendSlaReminderEmail({ to, orgName, documentType, lang = "en" }) {
+  const transporter = getMailerTransport();
+  if (!transporter) {
+    console.error("SMTP not configured — skipping SLA reminder email");
+    return;
+  }
+
+  const from = process.env.SMTP_FROM || process.env.SMTP_USER;
+  const appName = process.env.APP_NAME || "Dvarif";
+  const T = emailTexts(lang);
+
+  const bodyHtml = `
+    <tr><td style="padding:40px;">
+      <div style="margin:0 0 20px;display:inline-block;background-color:#d9770610;border:1px solid #d9770630;border-radius:6px;padding:8px 16px;">
+        <span style="color:#d97706;font-size:13px;font-weight:600;">⏳ ${T.slaBadge}</span>
+      </div>
+      <h2 style="margin:0 0 8px;color:#1a1a2e;font-size:20px;font-weight:600;">${T.slaHeading}</h2>
+      <p style="margin:0 0 16px;color:#555;font-size:15px;line-height:1.6;">
+        ${T.slaWaiting(orgName)}
+      </p>
+      <p style="margin:0 0 16px;color:#555;font-size:15px;line-height:1.6;">
+        ${T.slaDocType} <strong>${documentType || "—"}</strong>
+      </p>
+      <p style="margin:0 0 8px;color:#888;font-size:13px;line-height:1.5;">
+        ${T.slaAction}
+      </p>
+    </td></tr>`;
+
+  const text = [
+    T.slaHeading,
+    ``,
+    T.slaTextWaiting(orgName),
+    `${T.slaTextDocType} ${documentType || "—"}`,
+    ``,
+    T.slaTextAction,
+  ].join("\n");
+
+  await transporter.sendMail({
+    from: `"${appName}" <${from}>`,
+    to,
+    subject: `${appName} — ${T.slaSubject(orgName)}`,
+    text,
+    html: emailWrapper(bodyHtml, lang),
     headers: {
       "X-Mailer": "Dvarif",
       "List-Unsubscribe": `<mailto:${from}?subject=unsubscribe>`,

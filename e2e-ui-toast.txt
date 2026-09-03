@@ -1,0 +1,5 @@
+login -> http://localhost:8080/dashboard ✅
+dialog opened: ✅
+toast visible: ✅ "Employee added successfully"
+modal auto-closed: ✅
+list refreshed WITHOUT reload: ✅

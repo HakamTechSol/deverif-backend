@@ -6,14 +6,21 @@ import { assertUuid } from "../../utils/publicResponse.js";
 import { hashPassword, validatePasswordPolicy } from "../../utils/password.js";
 import { parsePagination, paginatedResponse } from "../../utils/pagination.js";
 import { sendInviteEmail } from "../../utils/mailer.js";
+import { firstFrontendUrl } from "../../utils/frontendUrl.js";
+import { logAudit, getActorFromReq } from "../../utils/auditLog.js";
 
 const USER_SELECT = `SELECT u.id, u.uuid, u.full_name, u.email, u.phone, u.cnic, u.status,
-        u.subscription_plan, u.subscription_expiry, u.profile_image,
+        u.org_role, u.subscription_plan, u.subscription_expiry, u.profile_image,
         u.is_verified, u.created_at,
         o.uuid AS organization_uuid,
-        o.name AS organization_name
+        o.name AS organization_name,
+        e.uuid AS employee_uuid,
+        e.designation,
+        e.department,
+        e.is_platform_user
  FROM users u
- LEFT JOIN organizations o ON o.id = u.organization`;
+ LEFT JOIN organizations o ON o.id = u.organization
+ LEFT JOIN employees e ON e.linked_user_uuid = u.uuid`;
 
 async function resolveOrganizationUuid(uuid) {
   if (!uuid) return null;
@@ -27,11 +34,11 @@ export async function listUsers(req, res) {
   const { page, limit, offset } = parsePagination(req.query);
   const search = typeof req.query.search === "string" ? req.query.search.trim() : "";
 
-  let whereClause = "";
+  let whereClause = "WHERE u.deleted_at IS NULL";
   const params = [];
 
   if (search) {
-    whereClause = `WHERE u.full_name LIKE ? OR u.email LIKE ? OR u.phone LIKE ? OR u.cnic LIKE ? OR o.name LIKE ?`;
+    whereClause += ` AND (u.full_name LIKE ? OR u.email LIKE ? OR u.phone LIKE ? OR u.cnic LIKE ? OR o.name LIKE ?)`;
     const like = `%${search}%`;
     params.push(like, like, like, like, like);
   }
@@ -64,12 +71,23 @@ export async function createUserWithOrganization(req, res) {
     const [orgExisting] = await conn.query("SELECT id FROM organizations WHERE name=?", [organization.name]);
     if (orgExisting.length) {
       orgId = orgExisting[0].id;
+      const [existingAdmin] = await conn.query(
+        "SELECT id FROM users WHERE organization=? AND org_role='org_admin'",
+        [orgId]
+      );
+      if (existingAdmin.length) {
+        throw new ApiError(409, "This organization already has an Org Admin. Only one Org Admin per organization is allowed.");
+      }
     } else {
       const orgLogoFile = req.files?.org_logo?.[0];
       const orgLogoPath = orgLogoFile ? `uploads/organizations/${orgLogoFile.filename}` : null;
+      const businessEmail = organization.business_email ? String(organization.business_email).trim() : null;
+      if (businessEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(businessEmail)) {
+        throw new ApiError(400, "organization.business_email must be a valid email address");
+      }
       const [orgRes] = await conn.query(
-        "INSERT INTO organizations (name, verified, logo, organization_type) VALUES (?, 'yes', ?, ?)",
-        [organization.name, orgLogoPath, organization.organization_type || null]
+        "INSERT INTO organizations (name, verified, logo, organization_type, business_email) VALUES (?, 'yes', ?, ?, ?)",
+        [organization.name, orgLogoPath, organization.organization_type || null, businessEmail]
       );
       orgId = orgRes.insertId;
     }
@@ -81,9 +99,9 @@ export async function createUserWithOrganization(req, res) {
 
     const [userRes] = await conn.query(
       `INSERT INTO users
-       (full_name, email, phone, password, cnic, status,
+       (full_name, email, phone, password, cnic, status, org_role,
         subscription_plan, subscription_expiry, organization, profile_image, is_verified, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
+       VALUES (?, ?, ?, ?, ?, ?, 'org_admin', ?, ?, ?, ?, ?, NOW())`,
       [user.full_name, user.email, user.phone || null, dummyHash, user.cnic, "inactive", plan,
         user.subscription_expiry || null, orgId, profileImagePath, isVerified]
     );
@@ -102,7 +120,7 @@ export async function createUserWithOrganization(req, res) {
 
     const [createdUser] = await pool.query(`${USER_SELECT} WHERE u.id=?`, [userRes.insertId]);
 
-    const setLinkBase = process.env.FRONTEND_SET_PASSWORD_URL || "http://localhost:8080/set-password";
+    const setLinkBase = firstFrontendUrl(process.env.FRONTEND_SET_PASSWORD_URL, "http://localhost:8080/set-password");
     const setLink = `${setLinkBase}?token=${encodeURIComponent(rawToken)}`;
 
     let emailSent = false;
@@ -117,6 +135,16 @@ export async function createUserWithOrganization(req, res) {
 
     const payload = { user: createdUser[0] };
     if (!emailSent) payload._email_warning = `Invite email failed: ${emailError}. The user can be re-invited from the Users list.`;
+
+    logAudit({
+      ...getActorFromReq(req),
+      action: "user.create",
+      entityType: "user",
+      entityId: createdUser[0].uuid,
+      details: { email: createdUser[0].email, organization: createdUser[0].organization_name },
+      req,
+    });
+
     return created(res, payload, emailSent ? "User created. Invite email sent." : "User created but invite email failed. Use Resend Invite to retry.");
   } catch (err) {
     await conn.rollback();
@@ -165,6 +193,16 @@ export async function updateUser(req, res) {
   await pool.query(`UPDATE users SET ${updateFields.join(", ")} WHERE uuid=?`, updateValues);
 
   const [updatedUser] = await pool.query(`${USER_SELECT} WHERE u.uuid=?`, [uuid]);
+
+  logAudit({
+    ...getActorFromReq(req),
+    action: "user.update",
+    entityType: "user",
+    entityId: uuid,
+    details: { fields: Object.keys(req.body || {}) },
+    req,
+  });
+
   return ok(res, { user: updatedUser[0] }, "User updated successfully");
 }
 
@@ -172,10 +210,22 @@ export async function deleteUser(req, res) {
   const { uuid } = req.params;
   assertUuid(uuid, "User UUID");
 
-  const [userExists] = await pool.query("SELECT id FROM users WHERE uuid=?", [uuid]);
+  const [userExists] = await pool.query(
+    "SELECT id FROM users WHERE uuid=? AND deleted_at IS NULL",
+    [uuid]
+  );
   if (!userExists.length) throw new ApiError(404, "User not found");
 
-  await pool.query("DELETE FROM users WHERE uuid=?", [uuid]);
+  await pool.query("UPDATE users SET deleted_at = NOW() WHERE uuid=? AND deleted_at IS NULL", [uuid]);
+
+  logAudit({
+    ...getActorFromReq(req),
+    action: "user.delete",
+    entityType: "user",
+    entityId: uuid,
+    req,
+  });
+
   return ok(res, {}, "User deleted successfully");
 }
 
@@ -203,7 +253,7 @@ export async function resendInvite(req, res) {
     [user.uuid, tokenHash, expiresInHours]
   );
 
-  const setLinkBase = process.env.FRONTEND_SET_PASSWORD_URL || "http://localhost:8080/set-password";
+  const setLinkBase = firstFrontendUrl(process.env.FRONTEND_SET_PASSWORD_URL, "http://localhost:8080/set-password");
   const setLink = `${setLinkBase}?token=${encodeURIComponent(rawToken)}`;
 
   try {
@@ -211,6 +261,15 @@ export async function resendInvite(req, res) {
   } catch (e) {
     throw new ApiError(500, e.message || "Failed to send invite email");
   }
+
+  logAudit({
+    ...getActorFromReq(req),
+    action: "user.invite_resend",
+    entityType: "user",
+    entityId: user.uuid,
+    details: { email: user.email },
+    req,
+  });
 
   return ok(res, {}, "Invite resent successfully");
 }

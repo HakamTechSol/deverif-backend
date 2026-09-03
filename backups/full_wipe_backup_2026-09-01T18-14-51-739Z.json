@@ -1,0 +1,503 @@
+{
+  "access_requests": [],
+  "admin_password_reset_tokens": [],
+  "admin_profiles": [
+    {
+      "id": 2,
+      "uuid": "b16014ca-9bc5-11f1-a28a-9840bb468dc0",
+      "email": "hunainhaidre78822@gmail.com",
+      "password": "$2a$12$5zDpM8Gz7KMDrYr0n5QHC.qVdBohUycOo.SlmsxHGiTm7soRfgV4G",
+      "full_name": "Platform Admin",
+      "phone": "",
+      "profile_image": "uploads/profiles/profile_1787141397465.png",
+      "status": "active",
+      "preferred_language": "en",
+      "created_at": "2026-08-19T12:01:21.000Z"
+    }
+  ],
+  "attendance_records": [],
+  "audit_logs": [],
+  "contact_leads": [],
+  "custom_plan_requests": [],
+  "daily_request_usage": [],
+  "departments": [],
+  "designations": [],
+  "employees": [],
+  "employee_documents": [],
+  "employee_leave_allocations": [],
+  "employee_salary_components": [],
+  "employee_salary_history": [],
+  "invite_tokens": [],
+  "lead_status_history": [],
+  "leave_balances": [],
+  "leave_requests": [],
+  "leave_types": [],
+  "login_history": [],
+  "login_otps": [],
+  "notifications": [],
+  "organizations": [
+    {
+      "id": 1,
+      "uuid": "5427d589-a3bb-11f1-b2ad-9840bb468dc0",
+      "name": "HakamTechSol",
+      "verified": "yes",
+      "logo": "uploads/organizations/org_1788016039104_720404052.jfif",
+      "created_at": "2026-08-29T15:07:19.000Z",
+      "organization_type": "software_house",
+      "subscription_status": "active",
+      "subscription_start": "2026-09-01T15:31:43.000Z",
+      "subscription_expiry": "2026-10-01T15:31:43.000Z",
+      "subscription_plan": "",
+      "subscription_plan_id": 1,
+      "reminder_2d_sent": "no",
+      "reminder_2h_sent": "no",
+      "business_email": null,
+      "allowed_ip_addresses": null,
+      "deleted_at": null
+    }
+  ],
+  "password_reset_tokens": [],
+  "payment": [],
+  "refresh_tokens": [],
+  "salary_components": [],
+  "salary_records": [],
+  "schema_migrations": [
+    {
+      "id": 1,
+      "filename": "20260718_add_request_extra_fields.sql",
+      "checksum": "5dae8ac24474248b16ec41a616fc9ab4",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 2,
+      "filename": "20260718_create_admin_profiles.sql",
+      "checksum": "a9a26c342d6ea53e4e2213190ad5b11c",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 3,
+      "filename": "20260718_create_password_reset_tokens.sql",
+      "checksum": "4ce3cf9680d99e759a32d0f42145a6df",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 4,
+      "filename": "20260718_create_refresh_tokens.sql",
+      "checksum": "c11aad863ce4c39b80f58eb8ca9081fa",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 5,
+      "filename": "20260718_create_token_blacklist.sql",
+      "checksum": "58f453df9dd51f3227867da5ef304449",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 6,
+      "filename": "20260719_add_admin_profiles_status_created_at.sql",
+      "checksum": "6703a72f1475471c8462e24a9d2c67ac",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 7,
+      "filename": "20260719_add_document_hash_index_and_fix_enum.sql",
+      "checksum": "f18d40cd546b23fe07602529b54b6099",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 8,
+      "filename": "20260719_add_organizations_uuid.sql",
+      "checksum": "221547cb30854f6c597d346d6926d44c",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 9,
+      "filename": "20260719_add_payment_uuid.sql",
+      "checksum": "7a47c56f2721a4a70ae74401dbf1265a",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 10,
+      "filename": "20260719_add_users_uuid.sql",
+      "checksum": "f8d8dc317b8cf7ff5dc486741353b418",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 11,
+      "filename": "20260719_add_verification_requests_uuid.sql",
+      "checksum": "328ed30ca164a9dfc5abb1e3749a2152",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 12,
+      "filename": "20260721_add_org_subscription.sql",
+      "checksum": "0aae06a0e04aacba40dded55d9fd9f06",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 13,
+      "filename": "20260721_add_reminder_flags.sql",
+      "checksum": "1daeb627c5b0f042bffd5af9a8a6eed4",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 14,
+      "filename": "20260721_create_invite_tokens.sql",
+      "checksum": "a4200a199c0d7c1df4130a5a35acdac7",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 15,
+      "filename": "20260721_create_notifications.sql",
+      "checksum": "b899e0245732ed75f68b0084143f8020",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 16,
+      "filename": "20260724_add_other_org_contact_fields.sql",
+      "checksum": "3193b9254dfafdd8cc0d0a1f51571eb7",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 17,
+      "filename": "20260725_add_unmatched_org_id_to_vr.sql",
+      "checksum": "a2b3ccd94a2a69085d0fe9898933e3d9",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 18,
+      "filename": "20260725_backfill_unmatched_organizations.sql",
+      "checksum": "dd657d60fac8fffd0295a88358b7b200",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 19,
+      "filename": "20260725_create_unmatched_organizations.sql",
+      "checksum": "c7e4d45970338b45f9db472b498e4d90",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 20,
+      "filename": "20260725_drop_old_other_org_columns.sql",
+      "checksum": "bd04bd84773b4d984e90f0cd4ef897ae",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 21,
+      "filename": "20260726_add_lock_fields_to_verification_requests.sql",
+      "checksum": "f3ced981adca0ea2822783f6f90a48bc",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 22,
+      "filename": "20260729_create_access_requests.sql",
+      "checksum": "defb1135e95347c25eab8b17518607d6",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 23,
+      "filename": "20260729_create_contact_leads.sql",
+      "checksum": "63989b61da8349efc8459977851e3ae3",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 24,
+      "filename": "20260819_add_org_role.sql",
+      "checksum": "9c8fe7d7bac6e55126320fb3c5916728",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 25,
+      "filename": "20260819_add_qr_certificate.sql",
+      "checksum": "f50adf4d0959a57041337cc1e835f8ab",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 26,
+      "filename": "20260819_add_sla_columns.sql",
+      "checksum": "0ebef804490d0d8cd91b6def8f5cf1d6",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 27,
+      "filename": "20260819_create_audit_logs.sql",
+      "checksum": "2704eb6e2643ac884839f78d72f023f7",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 28,
+      "filename": "20260819_create_employees.sql",
+      "checksum": "0a2ccf3ceda2c295fe1ebdccf0a5cc24",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 29,
+      "filename": "20260819_create_login_otps_and_login_history.sql",
+      "checksum": "921576f553a734d5aca0ca15e0748abc",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 30,
+      "filename": "20260819_create_request_templates.sql",
+      "checksum": "3c216031c2afff43c3333beea1980f60",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 31,
+      "filename": "20260820_add_attendance.sql",
+      "checksum": "ac926a9c4dd341ec99a98498abe4751c",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 32,
+      "filename": "20260820_add_preferred_language.sql",
+      "checksum": "c5f98ad248031a4e75e23806f2dce11d",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 33,
+      "filename": "20260820_create_leave_tables.sql",
+      "checksum": "f84697fa2cbd57b0c493abccea852c87",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 34,
+      "filename": "20260820_create_salary_records.sql",
+      "checksum": "afb41cdd31738918adb419e0efee13cf",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 35,
+      "filename": "20260821_audit_fixes.sql",
+      "checksum": "92534df20020cac90bdb3baa965d7d2e",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 36,
+      "filename": "20260821_drop_fk_vr_verified_by.sql",
+      "checksum": "c4d10f950ae1f7061c54eb6ab19cb123",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 37,
+      "filename": "20260823_manual_attendance.sql",
+      "checksum": "13dfdfa05103080c7ae7195af7c2a424",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 38,
+      "filename": "20260824_org_admin_only.sql",
+      "checksum": "ed8ebd2dd4cf7a3a677190cca0bb9b07",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 39,
+      "filename": "20260825_employee_fields_and_meta.sql",
+      "checksum": "021aa19c2aa5091d9d9b4e0af01c11d4",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 40,
+      "filename": "20260829_soft_delete_users_orgs.sql",
+      "checksum": "04745cedbe56104782428aacf7a93ea2",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 41,
+      "filename": "20260830_add_sub_admin_role.sql",
+      "checksum": "5fdac3511eafd7cfeb972e9ebf688ee2",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 42,
+      "filename": "20260830_create_admin_password_reset_tokens.sql",
+      "checksum": "fd953bb502bf3927befca45991b49da8",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 43,
+      "filename": "20260830_create_employee_salary_history.sql",
+      "checksum": "d8657b6da4caa46f5c88b2facb88e197",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 44,
+      "filename": "20260830_create_salary_components.sql",
+      "checksum": "4777ed817787a3947078a2bc3e63d9f7",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 45,
+      "filename": "20260830_drop_request_templates.sql",
+      "checksum": "07b33d4ec4f8fd0faa8d4bce1b39ee1d",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 46,
+      "filename": "20260830_employee_documents_file_size_uploaded_at.sql",
+      "checksum": "50daf2518673b3afb912738d4be3403b",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 47,
+      "filename": "20260831_create_employee_leave_allocations.sql",
+      "checksum": "5dbaa5a5ee6ea74a0dabafc998a995b9",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 48,
+      "filename": "20260831_org_role_3_tier.sql",
+      "checksum": "c3836a89002121719c1c127e615e49af",
+      "applied_at": "2026-08-31T12:04:17.000Z"
+    },
+    {
+      "id": 49,
+      "filename": "20260831_create_support_tickets.sql",
+      "checksum": "87c89bbf740cf209724444aab9e9749f",
+      "applied_at": "2026-08-31T12:04:18.000Z"
+    },
+    {
+      "id": 50,
+      "filename": "20260901_daily_request_quota.sql",
+      "checksum": "6b0ce691dc24f6051dc40d129f2a5226",
+      "applied_at": "2026-08-31T12:30:03.000Z"
+    },
+    {
+      "id": 51,
+      "filename": "20260901b_add_daily_usage_total.sql",
+      "checksum": "44a00cdcc4d8fe0e8655a96d1106f60f",
+      "applied_at": "2026-08-31T12:36:21.000Z"
+    },
+    {
+      "id": 52,
+      "filename": "20260902_public_plans.sql",
+      "checksum": "2449caea306c1b44e46a05ddb8540cda",
+      "applied_at": "2026-08-31T12:55:20.000Z"
+    },
+    {
+      "id": 53,
+      "filename": "20260903_org_salary_components_status.sql",
+      "checksum": "40992e4397c6f7d2d61eb4d9479d5986",
+      "applied_at": "2026-08-31T13:24:02.000Z"
+    },
+    {
+      "id": 54,
+      "filename": "20260904_self_subscription_requests.sql",
+      "checksum": "c4174c06c7a9e1260a8cb475af5753f8",
+      "applied_at": "2026-09-01T12:53:55.000Z"
+    },
+    {
+      "id": 55,
+      "filename": "20260906_create_employee_salary_components.sql",
+      "checksum": "0d507f2677a9d8ae082d60e54499a900",
+      "applied_at": "2026-09-01T12:53:55.000Z"
+    },
+    {
+      "id": 56,
+      "filename": "20260907_create_subscription_checkouts.sql",
+      "checksum": "e232ee57ba47249247bc46ea488bc279",
+      "applied_at": "2026-09-01T14:26:07.000Z"
+    }
+  ],
+  "self_subscription_requests": [],
+  "subscription_checkouts": [],
+  "subscription_plans": [
+    {
+      "id": 1,
+      "uuid": "9a5f5000-0001-4000-8000-10000000000a",
+      "name": "Plan A",
+      "monthly_price": "10000.00",
+      "daily_request_quota": 10,
+      "description": null,
+      "features": null,
+      "billing_period": "monthly",
+      "is_public": 1,
+      "is_custom": 0,
+      "created_at": "2026-08-31T12:30:03.000Z",
+      "updated_at": "2026-08-31T12:55:20.000Z"
+    },
+    {
+      "id": 2,
+      "uuid": "9a5f5000-0001-4000-8000-10000000000b",
+      "name": "Plan B",
+      "monthly_price": "30000.00",
+      "daily_request_quota": 100,
+      "description": null,
+      "features": null,
+      "billing_period": "monthly",
+      "is_public": 1,
+      "is_custom": 0,
+      "created_at": "2026-08-31T12:30:03.000Z",
+      "updated_at": "2026-08-31T12:55:20.000Z"
+    },
+    {
+      "id": 3,
+      "uuid": "5c19a785-a538-11f1-a2a7-9840bb468dc0",
+      "name": "Custom Plan — HakamTechSol",
+      "monthly_price": "40000.00",
+      "daily_request_quota": 17,
+      "description": null,
+      "features": null,
+      "billing_period": "monthly",
+      "is_public": 0,
+      "is_custom": 1,
+      "created_at": "2026-08-31T12:34:50.000Z",
+      "updated_at": "2026-08-31T12:34:50.000Z"
+    },
+    {
+      "id": 5,
+      "uuid": "6e466758-a53d-11f1-a2a7-9840bb468dc0",
+      "name": "Odio itaque et deser",
+      "monthly_price": "14000000.00",
+      "daily_request_quota": 1,
+      "description": "Deleniti dolor dolor",
+      "features": "[\"Omnis ad et soluta d\"]",
+      "billing_period": "monthly",
+      "is_public": 0,
+      "is_custom": 0,
+      "created_at": "2026-08-31T13:11:08.000Z",
+      "updated_at": "2026-08-31T14:39:13.000Z"
+    },
+    {
+      "id": 6,
+      "uuid": "0a6a7e12-a549-11f1-a2a7-9840bb468dc0",
+      "name": "Quo tenetur ullamco",
+      "monthly_price": "96.00",
+      "daily_request_quota": 31,
+      "description": "Consequatur eos sit",
+      "features": "[\"Aute deserunt in sit\"]",
+      "billing_period": "monthly",
+      "is_public": 0,
+      "is_custom": 0,
+      "created_at": "2026-08-31T14:34:15.000Z",
+      "updated_at": "2026-08-31T17:50:47.000Z"
+    }
+  ],
+  "support_tickets": [],
+  "support_ticket_replies": [],
+  "token_blacklist": [],
+  "unmatched_organizations": [],
+  "users": [
+    {
+      "id": 1,
+      "uuid": "548c8395-a3bb-11f1-b2ad-9840bb468dc0",
+      "full_name": "SYED HUNAIN HAIDER ZAIDI",
+      "email": "officeworks3244@gmail.com",
+      "phone": "03182484396",
+      "password": "$2b$12$jzzKuF5qGxjDF/qeaHfSFOD0x54q5nWFzl7FoUM2/YZ5lZus8Rvum",
+      "cnic": "42501-6252622-6",
+      "status": "active",
+      "org_role": "org_admin",
+      "preferred_language": "en",
+      "subscription_plan": "free",
+      "subscription_expiry": null,
+      "organization": 1,
+      "profile_image": null,
+      "is_verified": "no",
+      "created_at": "2026-08-29T10:07:19.000Z",
+      "feature_access": null,
+      "deleted_at": null
+    }
+  ],
+  "verification_requests": []
+}

@@ -5,9 +5,16 @@ import { assertUuid } from "../utils/publicResponse.js";
 import { parsePagination, paginatedResponse } from "../utils/pagination.js";
 import { createNotificationForOrgUsers, createNotificationForUsers } from "./notification.controller.js";
 import { assertOrganizationActive } from "./admin/organizations.controller.js";
+import { enforceRequestQuota } from "../utils/requestQuota.js";
 import { resolveUnmatchedOrg } from "../utils/unmatchedOrg.js";
+import { logAudit, getActorFromReq } from "../utils/auditLog.js";
+import { generateQrForRequest } from "../utils/qrCertificate.js";
+import { runSlaChecks } from "../utils/slaChecks.js";
 import crypto from "crypto";
 import fs from "fs";
+import path from "path";
+import { DOCS_DIR } from "../config/uploadPaths.js";
+import { requirePermission } from "../utils/permissions.js";
 
 function docFormatFromMime(m) {
   if (m === "application/pdf") return "pdf";
@@ -32,6 +39,7 @@ async function resolveOrganizationUuid(uuid, required = false) {
 }
 
 export async function createRequest(req, res) {
+  requirePermission(req.user, "generate_request");
   const { document_type, issuing_organization_uuid,
           other_organization_name, submission_remarks,
           other_organization_email, other_organization_phone, other_organization_website } = req.body;
@@ -43,7 +51,7 @@ export async function createRequest(req, res) {
   if (!req.file) throw new ApiError(400, "document file is required");
 
   if (req.user.organization) {
-    await assertOrganizationActive(req.user.organization);
+    await enforceRequestQuota(req.user.organization);
   }
 
   const orgId = await resolveOrganizationUuid(issuing_organization_uuid || null);
@@ -73,7 +81,7 @@ export async function createRequest(req, res) {
   }
 
   const docPath = `/uploads/documents/${req.file.filename}`;
-  const fullPath = `./uploads/documents/${req.file.filename}`;
+  const fullPath = path.join(DOCS_DIR, req.file.filename);
   const docFormat = docFormatFromMime(req.file.mimetype);
   const documentHash = generateFileHash(fullPath);
 
@@ -130,6 +138,11 @@ export async function createRequest(req, res) {
     [result.insertId]
   );
 
+  // Auto-verified requests also get a public QR certificate
+  if (autoVerify) {
+    await generateQrForRequest(rows[0]);
+  }
+
   if (orgId && !autoVerify) {
     const senderName = req.user.full_name || "Someone";
     createNotificationForOrgUsers({
@@ -141,6 +154,15 @@ export async function createRequest(req, res) {
       referenceId: rows[0].uuid,
     }).catch((e) => console.error("Failed to create notification:", e.message));
   }
+
+  logAudit({
+    ...getActorFromReq(req),
+    action: "request.create",
+    entityType: "verification_request",
+    entityId: rows[0].uuid,
+    details: { document_type, status: rows[0].status },
+    req,
+  });
 
   return created(res, { request: rows[0] }, "Request created");
 }
@@ -193,6 +215,11 @@ export async function deleteMySentRequest(req, res) {
   const { uuid } = req.params;
   assertUuid(uuid, "Request UUID");
 
+  // TODO: re-enable when org admins are allowed to delete requests.
+  // if (req.user.org_role === "org_admin" || req.user.org_role === "sub_admin") {
+  //   throw new ApiError(403, "Organization admins cannot delete verification requests.");
+  // }
+
   const [allRows] = await pool.query(
     `SELECT id, status, user_id, locked_by
      FROM verification_requests
@@ -214,6 +241,16 @@ export async function deleteMySentRequest(req, res) {
   }
 
   await pool.query("DELETE FROM verification_requests WHERE uuid=?", [uuid]);
+
+  logAudit({
+    ...getActorFromReq(req),
+    action: "request.delete",
+    entityType: "verification_request",
+    entityId: uuid,
+    details: { status: allRows[0].status },
+    req,
+  });
+
   return ok(res, {}, "Sent request deleted");
 }
 
@@ -271,7 +308,7 @@ export async function updateMySentRequest(req, res) {
   if (req.file) {
     docPath = `/uploads/documents/${req.file.filename}`;
     docFormat = docFormatFromMime(req.file.mimetype);
-    documentHash = generateFileHash(`./uploads/documents/${req.file.filename}`);
+    documentHash = generateFileHash(path.join(DOCS_DIR, req.file.filename));
   }
 
   // Resolve unmatched organization if "Other" was selected
@@ -286,7 +323,8 @@ export async function updateMySentRequest(req, res) {
          submission_remarks=?,
          document_path=?, document_format=?, document_hash=?
      WHERE uuid=?`,
-    [document_type, orgId, unmatchedOrgId, remarks, docPath, docFormat, documentHash, uuid]
+    [document_type, orgId, unmatchedOrgId, remarks,
+      docPath, docFormat, documentHash, uuid]
   );
 
   const [rows] = await pool.query(
@@ -299,11 +337,23 @@ export async function updateMySentRequest(req, res) {
     [uuid]
   );
 
+  logAudit({
+    ...getActorFromReq(req),
+    action: "request.update",
+    entityType: "verification_request",
+    entityId: uuid,
+    req,
+  });
+
   return ok(res, { request: rows[0] }, "Request updated");
 }
 
 export async function myInboxRequests(req, res) {
+  requirePermission(req.user, "approve_request");
   if (!req.user.organization) throw new ApiError(400, "User has no organization");
+
+  // Lazy SLA check on read (reminder + flag overdue requests)
+  runSlaChecks().catch(() => {});
 
   const { page, limit, offset } = parsePagination(req.query);
   const search = typeof req.query.search === "string" ? req.query.search.trim() : "";
@@ -342,12 +392,16 @@ export async function myInboxRequests(req, res) {
             requester_org.uuid AS requester_organization_uuid,
             requester_org.name AS requester_organization,
             issuing_org.uuid AS issuing_organization_uuid,
-            uo.uuid AS unmatched_org_uuid, uo.name AS unmatched_org_name
+            uo.uuid AS unmatched_org_uuid, uo.name AS unmatched_org_name,
+            verifier.uuid AS verified_by_uuid,
+            verifier.full_name AS verified_by_name,
+            verifier.email AS verified_by_email
      FROM verification_requests vr
      JOIN users requester ON requester.id = vr.user_id
      LEFT JOIN organizations requester_org ON requester_org.id = requester.organization
      LEFT JOIN organizations issuing_org ON issuing_org.id = vr.issuing_organization_id
      LEFT JOIN unmatched_organizations uo ON uo.id = vr.unmatched_org_id
+     LEFT JOIN users verifier ON verifier.id = vr.verified_by
      ${whereClause}
      ORDER BY vr.created_at DESC
      LIMIT ? OFFSET ?`,
@@ -358,7 +412,11 @@ export async function myInboxRequests(req, res) {
 }
 
 export async function myInboxCount(req, res) {
+  requirePermission(req.user, "approve_request");
   if (!req.user.organization) return ok(res, { count: 0 }, "Inbox count");
+
+  // Lazy SLA check on read
+  runSlaChecks().catch(() => {});
 
   const [[{ count }]] = await pool.query(
     `SELECT COUNT(*) AS count FROM verification_requests
@@ -373,6 +431,7 @@ export async function verifyRequest(req, res) {
   const { uuid } = req.params;
   const { status, verification_remarks } = req.body;
 
+  requirePermission(req.user, "approve_request");
   assertUuid(uuid, "Request UUID");
   if (!["verified", "unverified"].includes(status)) throw new ApiError(400, "status must be verified or unverified");
   if (!req.user.organization) throw new ApiError(400, "User has no organization");
@@ -406,6 +465,11 @@ export async function verifyRequest(req, res) {
     [uuid]
   );
 
+  // Verified requests get a tamper-evident public QR certificate
+  if (status === "verified") {
+    await generateQrForRequest(updated[0]);
+  }
+
   // Notify the requester
   const [requester] = await pool.query(
     `SELECT u.uuid, u.organization FROM users u WHERE u.id=?`,
@@ -414,7 +478,7 @@ export async function verifyRequest(req, res) {
   if (requester.length) {
     const requesterUuid = requester[0].uuid;
     const senderOrg = await pool.query("SELECT name FROM organizations WHERE id=?", [req.user.organization]);
-    const orgName = senderOrg.length ? senderOrg[0].name : "An organization";
+    const orgName = senderOrg[0].length ? senderOrg[0][0].name : "An organization";
     const statusText = status === "verified" ? "Approved" : "Rejected";
     try {
       await createNotificationForUsers({
@@ -431,6 +495,15 @@ export async function verifyRequest(req, res) {
   } else {
     console.error(`Could not notify requester: user_id ${vr.user_id} not found`);
   }
+
+  logAudit({
+    ...getActorFromReq(req),
+    action: status === "verified" ? "request.verify" : "request.reject",
+    entityType: "verification_request",
+    entityId: uuid,
+    details: { status, method: "portal" },
+    req,
+  });
 
   return ok(res, { request: updated[0] }, "Request updated");
 }

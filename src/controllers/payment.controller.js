@@ -3,6 +3,7 @@ import { pool } from "../config/db.js";
 import { ok } from "../utils/response.js";
 import { getPlanSummary } from "../utils/plan.js";
 import { calculatePlanExpiry, getPurchasablePlan, getPurchasablePlans } from "../utils/paymentPlans.js";
+import { getOrgQuotaStatus } from "../utils/requestQuota.js";
 import {
   buildProviderCheckout,
   getEnabledProviders,
@@ -97,34 +98,57 @@ async function finalizeSuccessfulPayment(callbackResult) {
 
 export async function myPlan(req, res) {
   const [rows] = await pool.query(
-    `SELECT id, subscription_plan, subscription_expiry
+    `SELECT id, uuid, subscription_plan, subscription_expiry, organization
      FROM users
      WHERE id=?`,
     [req.user.id]
   );
 
   const user = rows[0] || req.user;
-  const planSummary = getPlanSummary(user);
+
+  // Resolve the organization from the freshest DB row and fall back to the
+  // (possibly stale) JWT claim, so a user whose org changed still sees the
+  // correct quota and subscription.
+  const organizationId =
+    user?.organization != null ? user.organization : req.user?.organization;
 
   let orgSubscription = null;
+  let quotaStatus = null;
   let payments = [];
-  if (req.user.organization) {
+  if (organizationId) {
     const [[org]] = await pool.query(
-      `SELECT id, subscription_status, subscription_plan, subscription_expiry, subscription_start
-       FROM organizations WHERE id=?`,
-      [req.user.organization]
+      `SELECT o.id, o.subscription_status, o.subscription_plan, o.subscription_expiry, o.subscription_start,
+              o.subscription_plan_id, sp.name AS plan_name, sp.monthly_price, sp.daily_request_quota,
+              sp.description, sp.features
+       FROM organizations o
+       LEFT JOIN subscription_plans sp ON sp.id = o.subscription_plan_id
+       WHERE o.id=?`,
+      [organizationId]
     );
     if (org) {
       if (org.subscription_status === "active" && org.subscription_expiry && new Date(org.subscription_expiry) < new Date()) {
         org.subscription_status = "expired";
         await pool.query("UPDATE organizations SET subscription_status='expired' WHERE id=?", [org.id]);
       }
+      let features = [];
+      if (org.features) {
+        try {
+          const parsed = JSON.parse(org.features);
+          if (Array.isArray(parsed)) features = parsed;
+        } catch { /* ignore malformed features */ }
+      }
       orgSubscription = {
         status: org.subscription_status,
         plan: org.subscription_plan,
+        plan_name: org.plan_name || null,
+        monthly_price: org.monthly_price != null ? Number(org.monthly_price) : null,
+        daily_request_quota: org.daily_request_quota != null ? Number(org.daily_request_quota) : null,
+        description: org.description || null,
+        features,
         expiry: org.subscription_expiry,
         start: org.subscription_start,
       };
+      quotaStatus = await getOrgQuotaStatus(org.id);
     }
 
     const [paymentRows] = await pool.query(
@@ -135,12 +159,21 @@ export async function myPlan(req, res) {
        WHERE u.organization = ?
        ORDER BY p.paid_at DESC
        LIMIT 50`,
-      [req.user.organization]
+      [organizationId]
     );
     payments = paymentRows;
   }
 
-  return ok(res, { plan: planSummary, org_subscription: orgSubscription, payments }, "My plan");
+  // Build the plan summary from the org subscription (source of truth for
+  // quota/billing), falling back to the user-level fields for orgless users.
+  const planSummary = getPlanSummary(user, orgSubscription);
+
+  return ok(res, {
+    plan: planSummary,
+    org_subscription: orgSubscription,
+    quota_status: quotaStatus,
+    payments,
+  }, "My plan");
 }
 
 export async function paymentProviders(req, res) {

@@ -21,8 +21,19 @@ export default async function authUser(req, res, next) {
 
     if (await isBlacklisted(token)) throw new ApiError(401, "Token has been revoked");
 
+    // NEW: Check if the linked employee record is inactive and the user is a platform user.
+    // This blocks login for platform users whose employee status has been set to 'inactive',
+    // even if the users table status is still 'active'.
+    const [employees] = await pool.query(
+      `SELECT is_platform_user, status FROM employees WHERE linked_user_uuid = ?`,
+      [decoded.userId]
+    );
+    if (employees.length && employees[0].is_platform_user === 'yes' && employees[0].status === 'inactive') {
+      throw new ApiError(403, "Your account has been deactivated. Contact your organization admin.");
+    }
+
     const [rows] = await pool.query(
-      `SELECT id, uuid, full_name, email, phone, cnic, status,
+      `SELECT id, uuid, full_name, email, phone, cnic, status, org_role, feature_access,
               subscription_plan, subscription_expiry, organization,
               profile_image, is_verified, created_at
        FROM users WHERE uuid=?`,

@@ -72,9 +72,22 @@ describe("IDOR Protection — deleteMySentRequest", () => {
     expect(res.status).toHaveBeenCalledWith(200);
   });
 
-  it("returns 409 when request is already finalized", async () => {
+  it("returns 403 when a verified request cannot be deleted", async () => {
     pool.query.mockResolvedValueOnce([[{
       id: 100, status: "verified", user_id: USER_A_ID,
+    }]]);
+
+    const req = mockReq({ params: { uuid: REQUEST_UUID }, user: { id: USER_A_ID } });
+    const res = mockRes();
+
+    await expect(deleteMySentRequest(req, res)).rejects.toThrow(
+      expect.objectContaining({ statusCode: 403 })
+    );
+  });
+
+  it("returns 409 when request is already finalized (unverified)", async () => {
+    pool.query.mockResolvedValueOnce([[{
+      id: 100, status: "unverified", user_id: USER_A_ID,
     }]]);
 
     const req = mockReq({ params: { uuid: REQUEST_UUID }, user: { id: USER_A_ID } });
@@ -96,11 +109,17 @@ describe("IDOR Protection — deleteMySentRequest", () => {
 });
 
 describe("IDOR Protection — verifyRequest", () => {
+  // verifyRequest calls assertOrganizationActive(orgId) first — every test
+  // that reaches the request lookup needs this mock queued before others.
+  const ORG_ACTIVE = [[{ subscription_status: "active", subscription_expiry: null }]];
+
   it("returns 403 when User A (org A) tries to verify a request addressed to org B", async () => {
-    pool.query.mockResolvedValueOnce([[{
-      id: 100, uuid: REQUEST_UUID, status: "under_review",
-      issuing_organization_id: ORG_B_ID, user_id: USER_B_ID,
-    }]]);
+    pool.query
+      .mockResolvedValueOnce(ORG_ACTIVE)
+      .mockResolvedValueOnce([[{
+        id: 100, uuid: REQUEST_UUID, status: "under_review",
+        issuing_organization_id: ORG_B_ID, user_id: USER_B_ID,
+      }]]);
 
     const req = mockReq({
       params: { uuid: REQUEST_UUID },
@@ -115,7 +134,9 @@ describe("IDOR Protection — verifyRequest", () => {
   });
 
   it("returns 404 when the request UUID does not exist", async () => {
-    pool.query.mockResolvedValueOnce([[]]);
+    pool.query
+      .mockResolvedValueOnce(ORG_ACTIVE)
+      .mockResolvedValueOnce([[]]);
 
     const req = mockReq({
       params: { uuid: NONEXISTENT_UUID },
@@ -131,15 +152,19 @@ describe("IDOR Protection — verifyRequest", () => {
 
   it("returns 200 when a user from the issuing org verifies the request", async () => {
     pool.query
+      .mockResolvedValueOnce(ORG_ACTIVE) // assertOrganizationActive
       .mockResolvedValueOnce([[{
         id: 100, uuid: REQUEST_UUID, status: "under_review",
         issuing_organization_id: ORG_B_ID, user_id: USER_B_ID,
       }]])
-      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ affectedRows: 1 }]) // UPDATE verification_requests
       .mockResolvedValueOnce([[{
         id: 100, uuid: REQUEST_UUID, status: "verified",
         issuing_organization_id: ORG_B_ID, user_id: USER_B_ID,
-      }]]);
+      }]]) // SELECT updated request
+      // QR generation is skipped (no QR_SIGNING_SECRET in test env)
+      .mockResolvedValueOnce([[{ uuid: USER_B_UUID, organization: ORG_B_ID }]]) // requester lookup
+      .mockResolvedValueOnce([[{ name: "Org B" }]]); // sender org name
 
     const req = mockReq({
       params: { uuid: REQUEST_UUID },
@@ -166,10 +191,12 @@ describe("IDOR Protection — verifyRequest", () => {
   });
 
   it("returns 409 when request is already finalized", async () => {
-    pool.query.mockResolvedValueOnce([[{
-      id: 100, uuid: REQUEST_UUID, status: "verified",
-      issuing_organization_id: ORG_A_ID, user_id: USER_A_ID,
-    }]]);
+    pool.query
+      .mockResolvedValueOnce(ORG_ACTIVE)
+      .mockResolvedValueOnce([[{
+        id: 100, uuid: REQUEST_UUID, status: "verified",
+        issuing_organization_id: ORG_A_ID, user_id: USER_A_ID,
+      }]]);
 
     const req = mockReq({
       params: { uuid: REQUEST_UUID },

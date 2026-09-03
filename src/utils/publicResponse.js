@@ -1,5 +1,8 @@
 const UUID_V4_OR_COMPATIBLE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const INTERNAL_ID_KEYS = new Set(["id", "user_id", "issuing_organization_id", "verified_by"]);
+// NOTE: "id" is intentionally NOT stripped — numeric ids are required by
+// clients (leave_types edit/delete, notification mark-read). Only internal
+// FK columns without a uuid equivalent are hidden.
+const INTERNAL_ID_KEYS = new Set(["user_id", "issuing_organization_id", "verified_by"]);
 
 export function isUuid(value) {
   return typeof value === "string" && UUID_V4_OR_COMPATIBLE.test(value);

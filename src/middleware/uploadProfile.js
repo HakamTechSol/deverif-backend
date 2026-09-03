@@ -1,16 +1,9 @@
 import multer from "multer";
 import path from "path";
-import fs from "fs";
-
-const baseDir = process.env.UPLOAD_DIR || "uploads";
-const profileDir = path.join(baseDir, "profiles");
-
-if (!fs.existsSync(profileDir)) {
-  fs.mkdirSync(profileDir, { recursive: true });
-}
+import { PROFILES_DIR } from "../config/uploadPaths.js";
 
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, profileDir),
+  destination: (req, file, cb) => cb(null, PROFILES_DIR),
   filename: (req, file, cb) => {
     const ext = path.extname(file.originalname).toLowerCase();
     cb(null, `profile_${Date.now()}${ext}`);

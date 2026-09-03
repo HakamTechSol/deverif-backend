@@ -7,8 +7,13 @@ import path from "path";
 import routes from "./routes/index.js";
 import notFound from "./middleware/notFound.js";
 import errorHandler from "./middleware/errorHandler.js";
+import { UPLOAD_ROOT, DOCS_DIR, ensureUploadDirs } from "./config/uploadPaths.js";
 
 const app = express();
+
+ensureUploadDirs();
+
+app.set("trust proxy", 1);
 
 // Important: allow cross-origin images
 app.use(
@@ -40,12 +45,20 @@ app.use(
 );
 
 app.use(cookieParser());
-app.use(express.json({ limit: "2mb" }));
+app.use(
+  express.json({
+    limit: "2mb",
+    verify: (req, res, buf) => {
+      req.rawBody = buf;
+    },
+  })
+);
 app.use(express.urlencoded({ extended: true }));
 app.use(morgan("dev"));
 
 // Static uploads
-app.use("/uploads", express.static(path.resolve("uploads")));
+app.use("/uploads", express.static(UPLOAD_ROOT));
+app.use("/documents", express.static(DOCS_DIR));
 
 // Public assets (logos for emails etc.)
 app.use("/public", express.static(path.resolve("public")));

@@ -8,7 +8,7 @@ import {
   createUserWithOrganization,
   updateUser,
   deleteUser,
-  resendInvite
+  resendInvite,
 } from "../../controllers/admin/users.controller.js";
 
 const router = Router();

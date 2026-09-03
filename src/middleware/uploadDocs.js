@@ -1,14 +1,9 @@
 import multer from "multer";
 import path from "path";
-import fs from "fs";
-
-const baseDir = process.env.UPLOAD_DIR || "uploads";
-const docsDir = path.join(baseDir, "documents");
-
-if (!fs.existsSync(docsDir)) fs.mkdirSync(docsDir, { recursive: true });
+import { DOCS_DIR } from "../config/uploadPaths.js";
 
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, docsDir),
+  destination: (req, file, cb) => cb(null, DOCS_DIR),
   filename: (req, file, cb) => {
     const ext = path.extname(file.originalname).toLowerCase();
     cb(null, `doc_${Date.now()}_${Math.round(Math.random() * 1e9)}${ext}`);
@@ -16,10 +11,26 @@ const storage = multer.diskStorage({
 });
 
 function fileFilter(req, file, cb) {
-  // As per your schema: pdf, jpeg
-  const allowed = ["application/pdf", "image/jpeg"];
-  if (!allowed.includes(file.mimetype)) return cb(new Error("Only PDF or JPEG allowed"));
-  cb(null, true);
+  const allowedMime = [
+    "application/pdf",
+    "image/jpeg", "image/png", "image/webp", "image/gif", "image/bmp",
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.ms-excel",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "text/plain", "text/csv",
+    "application/zip",
+  ];
+  const allowedExt = [
+    ".pdf", ".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp",
+    ".doc", ".docx", ".xls", ".xlsx", ".txt", ".csv", ".zip",
+  ];
+  const ext = path.extname(file.originalname || "").toLowerCase();
+  // Accept by extension (reliable) or by a known mime; allow empty mime if ext matches.
+  if (allowedExt.includes(ext) || (file.mimetype && allowedMime.includes(file.mimetype))) {
+    return cb(null, true);
+  }
+  cb(new Error("Unsupported file type. Allowed: PDF, images, Word, Excel, TXT, CSV, ZIP"));
 }
 
 export const uploadDocs = multer({

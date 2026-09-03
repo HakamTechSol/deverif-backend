@@ -59,7 +59,9 @@ describe("createRequest — other_organization_name validation", () => {
 
   it("succeeds when no org is selected but other_organization_name is provided", async () => {
     pool.query
-      .mockResolvedValueOnce([{ insertId: 2 }])
+      .mockResolvedValueOnce([[]]) // resolveUnmatchedOrg: no existing org
+      .mockResolvedValueOnce([{ insertId: 2 }]) // resolveUnmatchedOrg: insert
+      .mockResolvedValueOnce([{ insertId: 2 }]) // createRequest: insert request
       .mockResolvedValueOnce([[{ id: 2, issuing_organization_id: null, other_organization_name: "Acme Corp", submission_remarks: null }]]);
 
     const req = makeReq({
@@ -74,7 +76,9 @@ describe("createRequest — other_organization_name validation", () => {
     const insertCall = pool.query.mock.calls.find(([sql]) =>
       typeof sql === "string" && sql.includes("INSERT INTO verification_requests")
     );
-    expect(insertCall[1]).toContain("Acme Corp");
+    // other_organization_name is normalized into an unmatched_organizations
+    // row; the request references it by id (param index 3).
+    expect(insertCall[1][3]).toBe(2);
   });
 
   it("rejects when no org is selected and other_organization_name is missing", async () => {
@@ -109,7 +113,9 @@ describe("createRequest — other_organization_name validation", () => {
 
   it("trims whitespace from other_organization_name before validation", async () => {
     pool.query
-      .mockResolvedValueOnce([{ insertId: 3 }])
+      .mockResolvedValueOnce([[]]) // resolveUnmatchedOrg: no existing org
+      .mockResolvedValueOnce([{ insertId: 3 }]) // resolveUnmatchedOrg: insert
+      .mockResolvedValueOnce([{ insertId: 3 }]) // createRequest: insert request
       .mockResolvedValueOnce([[{ id: 3, issuing_organization_id: null, other_organization_name: "Trimmed Org", submission_remarks: null }]]);
 
     const req = makeReq({
@@ -124,7 +130,8 @@ describe("createRequest — other_organization_name validation", () => {
     const insertCall = pool.query.mock.calls.find(([sql]) =>
       typeof sql === "string" && sql.includes("INSERT INTO verification_requests")
     );
-    expect(insertCall[1]).toContain("Trimmed Org");
+    // Name is trimmed before the unmatched_organizations lookup (id at param index 3)
+    expect(insertCall[1][3]).toBe(3);
   });
 });
 

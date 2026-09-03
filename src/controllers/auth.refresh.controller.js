@@ -31,7 +31,7 @@ export async function refreshAccessToken(req, res) {
   const refreshTokenValue = req.cookies?.dvarif_refresh || req.cookies?.dvarif_admin_refresh;
 
   if (!refreshTokenValue) {
-    throw new ApiError(401, "Refresh token not found. Please log in again.");
+    throw new ApiError(401, "Please sign in again.");
   }
 
   const isUserRefresh = !!req.cookies?.dvarif_refresh;
@@ -43,12 +43,12 @@ export async function refreshAccessToken(req, res) {
     decoded = verifyRefreshJWT(refreshTokenValue);
   } catch {
     res.clearCookie(cookieName, { path: "/api/v1" });
-    throw new ApiError(401, "Invalid or expired refresh token. Please log in again.");
+    throw new ApiError(401, "Please sign in again.");
   }
 
   if (decoded.type !== type || decoded.role !== type) {
-    res.clearCookie(cookieName, { path: "/api/v1" });
-    throw new ApiError(401, "Invalid refresh token type");
+res.clearCookie(cookieName, { path: "/api/v1" });
+    throw new ApiError(401, "Please sign in again.");
   }
 
   const dbRecord = await verifyRefreshToken({ token: refreshTokenValue, type });
@@ -61,7 +61,7 @@ export async function refreshAccessToken(req, res) {
 
   if (type === "user") {
     const [rows] = await pool.query(
-      "SELECT id, uuid, status FROM users WHERE uuid=?",
+      "SELECT id, uuid, status, organization, org_role FROM users WHERE uuid=?",
       [decoded.userId]
     );
     if (!rows.length || rows[0].status !== "active") {
@@ -70,7 +70,7 @@ export async function refreshAccessToken(req, res) {
 
     const rememberMe = (decoded.exp - decoded.iat) > 8 * 24 * 60 * 60;
 
-    const newAccessToken = signAccessToken({ type: "user", userId: decoded.userId, role: "user" });
+    const newAccessToken = signAccessToken({ type: "user", userId: decoded.userId, role: "user", organization: rows[0].organization, org_role: rows[0].org_role });
     const newRefreshToken = signRefreshToken({ type: "user", userId: decoded.userId, role: "user" }, rememberMe);
 
     const refreshDecoded = JSON.parse(Buffer.from(newRefreshToken.split(".")[1], "base64url").toString());
