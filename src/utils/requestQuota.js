@@ -50,15 +50,20 @@ export async function getOrgQuotaStatus(orgId) {
   const plan = await getOrgPlan(orgId);
   const used = Number(usage?.requests_used ?? 0);
   const totalRequests = Number(usage?.total_requests ?? 0);
-  const totalAllowance = FREE_DAILY_REQUESTS + plan.quota;
+  // While the organization has an ACTIVE subscription the free daily request is
+  // disabled and only the paid plan quota applies. The FREE request only works
+  // when there is no active subscription (inactive/expired/free).
+  const planQuota = plan.quota;
+  const freeDaily = planQuota > 0 ? 0 : FREE_DAILY_REQUESTS;
+  const totalAllowance = planQuota + freeDaily;
   return {
     date: today,
-    free_daily_requests: FREE_DAILY_REQUESTS,
-    plan_quota: plan.quota,
+    free_daily_requests: freeDaily,
+    plan_quota: planQuota,
     total_allowance: totalAllowance,
     requests_used: used,          // paid requests consumed today
     total_requests: totalRequests,
-    requests_remaining: Math.max(0, plan.quota - used),
+    requests_remaining: Math.max(0, totalAllowance - totalRequests),
     plan: {
       uuid: plan.plan_uuid,
       name: plan.plan_name,
@@ -69,8 +74,12 @@ export async function getOrgQuotaStatus(orgId) {
 
 /**
  * Enforce the daily request quota for an organization and, if allowed,
- * atomically consume one PAID quota slot (the very first request of the day is
- * always the FREE request and does not consume a slot).
+ * atomically consume one request slot.
+ *
+ * While the organization has an ACTIVE subscription, the free daily request is
+ * DISABLED — every request consumes a paid slot from the plan's daily quota.
+ * When there is NO active subscription (inactive/expired/free), the org gets the
+ * 1 FREE request/day and nothing else.
  *
  * Throw ApiError(429, ...) with a clear message when the limit is reached.
  * Returns { is_free, requests_used, quota, allowed }.
@@ -91,9 +100,10 @@ export async function enforceRequestQuota(orgId) {
        FOR UPDATE`,
       [orgId]
     );
-    // Paid quota applies only while the subscription is ACTIVE; otherwise the
-    // org still gets its 1 FREE request/day (quota = 0).
-    const quota = org?.subscription_status === "active" ? Number(org?.quota ?? 0) : 0;
+    // Paid quota applies only while the subscription is ACTIVE; otherwise there
+    // is no paid quota and only the 1 FREE request/day remains.
+    const isActive = org?.subscription_status === "active";
+    const quota = isActive ? Number(org?.quota ?? 0) : 0;
 
     // Ensure today's usage bucket exists (created on first request of the day).
     await connection.query(
@@ -110,7 +120,22 @@ export async function enforceRequestQuota(orgId) {
     const used = Number(usage?.requests_used ?? 0);
     const totalRequests = Number(usage?.total_requests ?? 0);
 
-    // Very first request of the day -> always allowed (FREE), no quota consumed.
+    if (isActive) {
+      // No free request. Every request consumes a paid slot up to the plan quota.
+      if (used < quota) {
+        await connection.query(
+          `UPDATE daily_request_usage SET requests_used = requests_used + 1, total_requests = total_requests + 1
+           WHERE organization_id=? AND date=?`,
+          [orgId, today]
+        );
+        await connection.commit();
+        return { allowed: true, is_free: false, requests_used: used + 1, total_requests: totalRequests + 1, quota, remaining: quota - used - 1 };
+      }
+      await connection.rollback();
+      throw new ApiError(429, "You have used all your requests for today. Please upgrade your plan or try again tomorrow.");
+    }
+
+    // No active subscription -> only the 1 FREE request per day.
     if (totalRequests === 0) {
       await connection.query(
         `UPDATE daily_request_usage SET total_requests = 1
@@ -118,27 +143,11 @@ export async function enforceRequestQuota(orgId) {
         [orgId, today]
       );
       await connection.commit();
-      return { allowed: true, is_free: true, requests_used: 0, total_requests: 1, quota, remaining: quota };
-    }
-
-    // Subsequent request -> consume a PAID slot up to the plan's daily quota.
-    if (used < quota) {
-      await connection.query(
-        `UPDATE daily_request_usage SET requests_used = requests_used + 1, total_requests = total_requests + 1
-         WHERE organization_id=? AND date=?`,
-        [orgId, today]
-      );
-      await connection.commit();
-      return { allowed: true, is_free: false, requests_used: used + 1, total_requests: totalRequests + 1, quota, remaining: quota - used - 1 };
+      return { allowed: true, is_free: true, requests_used: 0, total_requests: 1, quota: 0, remaining: 0 };
     }
 
     await connection.rollback();
-    // For orgs with no paid quota (inactive/no subscription), the limit reached
-    // means their 1 FREE daily request is already used — give a clear message.
-    const message = quota === 0
-      ? "Daily free request used. Upgrade your plan or wait until tomorrow."
-      : "You have used all your requests for today. Please upgrade your plan or try again tomorrow.";
-    throw new ApiError(429, message);
+    throw new ApiError(429, "Daily free request used. Upgrade your plan or wait until tomorrow.");
   } catch (error) {
     await connection.rollback();
     throw error;

@@ -5,6 +5,11 @@ import { assertUuid } from "../../utils/publicResponse.js";
 import { parsePagination, paginatedResponse } from "../../utils/pagination.js";
 import { logAudit, getActorFromReq } from "../../utils/auditLog.js";
 
+// Gateway-sourced transactions (e.g. Safepay self-service checkouts) live in
+// the Self-subscriptions tab; Payment History shows ONLY admin-recorded/manual
+// payments, so gateway records are always excluded here.
+const GATEWAY_PAYMENT_METHODS = ["safepay"];
+
 export async function listPayments(req, res) {
   const { page, limit, offset } = parsePagination(req.query);
   const search = typeof req.query.search === "string" ? req.query.search.trim() : "";
@@ -16,6 +21,10 @@ export async function listPayments(req, res) {
   const params = [];
 
   const conditions = [];
+  if (GATEWAY_PAYMENT_METHODS.length) {
+    conditions.push(`p.payment_method NOT IN (${GATEWAY_PAYMENT_METHODS.map(() => "?").join(", ")})`);
+    params.push(...GATEWAY_PAYMENT_METHODS);
+  }
   if (search) {
     conditions.push(`(u.full_name LIKE ? OR u.email LIKE ? OR p.transaction_reference LIKE ? OR p.purpose LIKE ?)`);
     const like = `%${search}%`;
@@ -62,13 +71,13 @@ export async function createPayment(req, res) {
   if (!user_uuid || amount === undefined) throw new ApiError(400, "user_uuid and amount are required");
   assertUuid(user_uuid, "User UUID");
 
-  const [users] = await pool.query("SELECT id FROM users WHERE uuid=?", [user_uuid]);
+  const [users] = await pool.query("SELECT id, organization FROM users WHERE uuid=?", [user_uuid]);
   if (!users.length) throw new ApiError(404, "User not found");
 
   const [result] = await pool.query(
-    `INSERT INTO payment (user_id, amount, payment_method, transaction_reference, paid_at, purpose)
-     VALUES (?, ?, ?, ?, NOW(), ?)`,
-    [users[0].id, amount, payment_method || "manual", transaction_reference || null, purpose || null]
+    `INSERT INTO payment (user_id, organization_id, amount, payment_method, transaction_reference, paid_at, purpose)
+     VALUES (?, ?, ?, ?, ?, NOW(), ?)`,
+    [users[0].id, users[0].organization, amount, payment_method || "manual", transaction_reference || null, purpose || null]
   );
 
   const [rows] = await pool.query(

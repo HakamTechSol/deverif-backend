@@ -8,11 +8,17 @@ import {
   updateOrganization,
   deleteOrganization,
   setOrganizationSubscription,
-  cancelOrganizationSubscription
+  cancelOrganizationSubscription,
+  listOrganizationTypes,
+  createOrganizationType,
+  deleteOrganizationType
 } from "../../controllers/admin/organizations.controller.js";
 
 const router = Router();
 
+router.get("/organization-types", authAdminEnv, asyncHandler(listOrganizationTypes));
+router.post("/organization-types", authAdminEnv, asyncHandler(createOrganizationType));
+router.delete("/organization-types/:id", authAdminEnv, asyncHandler(deleteOrganizationType));
 router.get("/", authAdminEnv, asyncHandler(listOrganizations));
 router.post("/", authAdminEnv, uploadOrganizationLogo.single("logo"), asyncHandler(createOrganization));
 router.put("/:uuid", authAdminEnv, uploadOrganizationLogo.single("logo"), asyncHandler(updateOrganization));

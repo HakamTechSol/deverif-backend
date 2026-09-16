@@ -7,7 +7,6 @@ import {
   listUsers,
   createUserWithOrganization,
   updateUser,
-  deleteUser,
   resendInvite,
 } from "../../controllers/admin/users.controller.js";
 
@@ -19,7 +18,6 @@ router.post("/", authAdminEnv, uploadUserFiles.fields([
   { name: "org_logo", maxCount: 1 },
 ]), asyncHandler(createUserWithOrganization));
 router.put("/:uuid", authAdminEnv, asyncHandler(updateUser));
-router.delete("/:uuid", authAdminEnv, asyncHandler(deleteUser));
 router.post("/:uuid/resend-invite", authAdminEnv, asyncHandler(resendInvite));
 
 export default router;

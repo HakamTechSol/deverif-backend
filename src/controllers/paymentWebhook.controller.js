@@ -133,6 +133,7 @@ export async function handlePaymentWebhook(req, res) {
           .slice(0, 10)}).`,
         link: "/payments",
         referenceId: checkout.uuid,
+        orgRoles: ["org_admin"],
       }).catch(() => {});
     }
 

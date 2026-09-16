@@ -51,7 +51,7 @@ export async function downloadCertificate(req, res) {
     requesterName: vr.requester_name,
   });
 
-  const filename = `dvarif-certificate-${vr.uuid.slice(0, 8)}.pdf`;
+  const filename = `dverif-certificate-${vr.uuid.slice(0, 8)}.pdf`;
   res.setHeader("Content-Type", "application/pdf");
   res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
   res.send(pdf);

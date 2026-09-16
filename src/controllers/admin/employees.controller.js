@@ -11,7 +11,7 @@ import { logAudit, getActorFromReq } from "../../utils/auditLog.js";
 import { STAFF_ROLES, assertRole } from "../../utils/roles.js";
 
 const EMPLOYEE_SELECT = `SELECT e.id, e.uuid, e.organization_id, e.full_name, e.email, e.phone,
-        e.cnic, e.designation, e.department, e.status, e.is_platform_user,
+        e.cnic, dg.name AS designation, dp.name AS department, e.status, e.is_platform_user,
         e.linked_user_uuid, e.added_by_uuid, e.promoted_by_uuid, e.promoted_at,
         e.joining_date, e.emergency_contact,
         e.created_at,
@@ -22,6 +22,7 @@ const EMPLOYEE_SELECT = `SELECT e.id, e.uuid, e.organization_id, e.full_name, e.
         u.email AS linked_user_email,
         u.status AS linked_user_status,
         u.org_role AS linked_user_role,
+        u.profile_image AS linked_user_profile_image,
         it.expires_at AS invite_expires_at,
         it.used_at AS invite_used_at,
         it.created_at AS invite_sent_at,
@@ -31,6 +32,8 @@ const EMPLOYEE_SELECT = `SELECT e.id, e.uuid, e.organization_id, e.full_name, e.
           ORDER BY h.effective_from DESC LIMIT 1) AS current_salary
  FROM employees e
  LEFT JOIN organizations o ON o.id = e.organization_id
+ LEFT JOIN designations dg ON dg.id = e.designation_id
+ LEFT JOIN departments dp ON dp.id = e.department_id
  LEFT JOIN admin_profiles au ON au.uuid = e.added_by_uuid
  LEFT JOIN users au2 ON au2.uuid = e.added_by_uuid
  LEFT JOIN admin_profiles pu ON pu.uuid = e.promoted_by_uuid
@@ -59,6 +62,21 @@ async function resolveOrganizationId(organizationUuid) {
 }
 
 const ALLOWED_EMPLOYEE_STATUS = ["active", "inactive", "resigned", "terminated"];
+
+/** Resolve an org-scoped designation/department row by name, creating it if missing. */
+async function resolveMetaId(conn, orgId, table, name) {
+  if (!name) return null;
+  const [rows] = await conn.query(
+    `SELECT id FROM ${table} WHERE organization_id=? AND name=?`,
+    [orgId, name]
+  );
+  if (rows.length) return rows[0].id;
+  const [r] = await conn.query(
+    `INSERT INTO ${table} (uuid, organization_id, name) VALUES (UUID(), ?, ?)`,
+    [orgId, name]
+  );
+  return r.insertId;
+}
 
 function normalizeEmployeePayload(body) {
   const { full_name, email, phone, cnic, designation, department, status, joining_date, emergency_contact, current_salary } = body;
@@ -135,13 +153,15 @@ export async function createEmployee(req, res) {
   try {
     await conn.beginTransaction();
 
+    const designationId = await resolveMetaId(conn, orgId, "designations", data.designation);
+    const departmentId = await resolveMetaId(conn, orgId, "departments", data.department);
     const [res2] = await conn.query(
       `INSERT INTO employees
-       (uuid, organization_id, full_name, email, phone, cnic, designation, department, status,
+       (uuid, organization_id, full_name, email, phone, cnic, designation_id, department_id, status,
         joining_date, emergency_contact,
         is_platform_user, linked_user_uuid, added_by_uuid, promoted_by_uuid, promoted_at, created_at)
        VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'no', NULL, ?, NULL, NULL, NOW())`,
-      [orgId, data.full_name, data.email, data.phone, data.cnic, data.designation, data.department,
+      [orgId, data.full_name, data.email, data.phone, data.cnic, designationId, departmentId,
         data.status, data.joining_date, data.emergency_contact, addedByUuid]
     );
     const [[createdEmployee]] = await conn.query("SELECT uuid FROM employees WHERE id=?", [res2.insertId]);
@@ -149,12 +169,14 @@ export async function createEmployee(req, res) {
 
     // Requirement 2: capture the employee's starting salary as the first
     // employee_salary_history row (active period) at creation time.
+    // created_by is intentionally NULL: this is an automatic/system row created
+    // as a side-effect of employee creation, not a tracked admin action.
     const effFrom = data.joining_date || new Date().toISOString().slice(0, 10);
     await conn.query(
       `INSERT INTO employee_salary_history
-         (uuid, employee_uuid, year, basic_salary, effective_from, effective_to, created_by, created_at)
-       VALUES (UUID(), ?, ?, ?, ?, NULL, ?, NOW())`,
-      [createdEmployeeUuid, Number(effFrom.slice(0, 4)), data.current_salary, effFrom, addedByUuid]
+         (uuid, employee_uuid, year, basic_salary, effective_from, effective_to, created_at)
+       VALUES (UUID(), ?, ?, ?, ?, NULL, NOW())`,
+      [createdEmployeeUuid, Number(effFrom.slice(0, 4)), data.current_salary, effFrom]
     );
 
     if (wantsPlatformUser) {
@@ -168,8 +190,8 @@ export async function createEmployee(req, res) {
       const [userRes] = await conn.query(
         `INSERT INTO users
          (full_name, email, phone, password, cnic, status, org_role, feature_access,
-          subscription_plan, subscription_expiry, organization, profile_image, is_verified, created_at)
-         VALUES (?, ?, ?, ?, ?, 'inactive', ?, NULL, 'free', NULL, ?, NULL, 'no', NOW())`,
+          organization, profile_image, is_verified, created_at)
+         VALUES (?, ?, ?, ?, ?, 'inactive', ?, NULL, ?, NULL, 'no', NOW())`,
         [data.full_name, data.email, data.phone || null, dummyHash, data.cnic, orgRole, orgId]
       );
       const [[newUser]] = await conn.query("SELECT uuid FROM users WHERE id=?", [userRes.insertId]);
@@ -327,7 +349,7 @@ export async function listEmployees(req, res) {
   }
 
   if (search) {
-    conditions.push("(e.full_name LIKE ? OR e.email LIKE ? OR e.phone LIKE ? OR e.cnic LIKE ? OR e.designation LIKE ? OR e.department LIKE ? OR o.name LIKE ?)");
+    conditions.push("(e.full_name LIKE ? OR e.email LIKE ? OR e.phone LIKE ? OR e.cnic LIKE ? OR dg.name LIKE ? OR dp.name LIKE ? OR o.name LIKE ?)");
     const like = `%${search}%`;
     params.push(like, like, like, like, like, like, like);
   }
@@ -335,7 +357,11 @@ export async function listEmployees(req, res) {
   const whereClause = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
 
   const [[{ total }]] = await pool.query(
-    `SELECT COUNT(*) AS total FROM employees e LEFT JOIN organizations o ON o.id = e.organization_id ${whereClause}`,
+    `SELECT COUNT(*) AS total FROM employees e
+     LEFT JOIN organizations o ON o.id = e.organization_id
+     LEFT JOIN designations dg ON dg.id = e.designation_id
+     LEFT JOIN departments dp ON dp.id = e.department_id
+     ${whereClause}`,
     params
   );
   const [rows] = await pool.query(
@@ -376,27 +402,58 @@ export async function updateEmployee(req, res) {
     throw new ApiError(403, "You can only manage employees within your organization");
   }
 
-  const data = normalizeEmployeePayload(req.body);
-  const { organization_uuid, ...rest } = req.body;
-  const allowed = { full_name: data.full_name, email: data.email, phone: data.phone, cnic: data.cnic, designation: data.designation, department: data.department, status: data.status, joining_date: data.joining_date, emergency_contact: data.emergency_contact };
-
-  if (data.email) {
-    const [dupeEmp] = await pool.query(
-      "SELECT uuid FROM employees WHERE email=? AND uuid<>?",
-      [data.email, uuid]
-    );
-    if (dupeEmp.length) throw new ApiError(409, "An employee with this email already exists");
-  }
-  const [dupeCnic] = await pool.query("SELECT uuid FROM employees WHERE cnic=? AND uuid<>?", [data.cnic, uuid]);
-  if (dupeCnic.length) throw new ApiError(409, "An employee with this CNIC already exists");
+  const { full_name, email, phone, cnic, designation, department, status, joining_date, emergency_contact, organization_uuid } = req.body;
 
   const updateFields = [];
   const updateValues = [];
-  for (const [field, value] of Object.entries(allowed)) {
-    updateFields.push(`${field} = ?`);
-    updateValues.push(value);
-  }
 
+  if (full_name !== undefined && String(full_name).trim() !== "") {
+    updateFields.push("full_name = ?");
+    updateValues.push(String(full_name).trim());
+  }
+  if (email !== undefined) {
+    const trimmed = email ? String(email).trim() : null;
+    if (trimmed && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed)) throw new ApiError(400, "email is invalid");
+    const [dupeEmp] = await pool.query("SELECT uuid FROM employees WHERE email=? AND uuid<>?", [trimmed, uuid]);
+    if (dupeEmp.length) throw new ApiError(409, "An employee with this email already exists");
+    updateFields.push("email = ?");
+    updateValues.push(trimmed);
+  }
+  if (phone !== undefined) {
+    updateFields.push("phone = ?");
+    updateValues.push(phone ? String(phone).trim() : null);
+  }
+  if (cnic !== undefined) {
+    const trimmed = String(cnic).trim();
+    if (trimmed) {
+      const [dupeCnic] = await pool.query("SELECT uuid FROM employees WHERE cnic=? AND uuid<>?", [trimmed, uuid]);
+      if (dupeCnic.length) throw new ApiError(409, "An employee with this CNIC already exists");
+    }
+    updateFields.push("cnic = ?");
+    updateValues.push(trimmed);
+  }
+  if (designation !== undefined) {
+    const designationId = await resolveMetaId(pool, emp.organization_id, "designations", designation ? String(designation).trim() : null);
+    updateFields.push("designation_id = ?");
+    updateValues.push(designationId);
+  }
+  if (department !== undefined) {
+    const departmentId = await resolveMetaId(pool, emp.organization_id, "departments", department ? String(department).trim() : null);
+    updateFields.push("department_id = ?");
+    updateValues.push(departmentId);
+  }
+  if (status !== undefined) {
+    updateFields.push("status = ?");
+    updateValues.push(ALLOWED_EMPLOYEE_STATUS.includes(status) ? status : "active");
+  }
+  if (joining_date !== undefined) {
+    updateFields.push("joining_date = ?");
+    updateValues.push(joining_date ? String(joining_date).trim() : null);
+  }
+  if (emergency_contact !== undefined) {
+    updateFields.push("emergency_contact = ?");
+    updateValues.push(emergency_contact ? String(emergency_contact).trim() : null);
+  }
   if (organization_uuid !== undefined) {
     if (scope.scoped) throw new ApiError(403, "Cannot change the organization of an employee in your scope");
     const newOrgId = await resolveOrganizationId(organization_uuid);

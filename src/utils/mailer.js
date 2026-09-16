@@ -1,4 +1,5 @@
 import nodemailer from "nodemailer";
+import { pool } from "../config/db.js";
 
 // TEMP-DEBUG (remove after production SMTP diagnosis):
 console.log(
@@ -51,8 +52,8 @@ function emailTexts(lang) {
   return {
     // Shared
     footerTagline: ur
-      ? "Dvarif — دستاویز کی تصدیق کا پلیٹ فارم"
-      : "Dvarif — Document Verification Platform",
+      ? "Dverif — دستاویز کی تصدیق کا پلیٹ فارم"
+      : "Dverif — Document Verification Platform",
     footerAuto: ur
       ? "یہ ایک خودکار پیغام ہے، براہِ کرم جواب نہ دیں۔"
       : "This is an automated message, please do not reply.",
@@ -82,7 +83,7 @@ function emailTexts(lang) {
       : "If you did not request this, you can safely ignore this email.",
 
     // OTP login
-    otpSubject: ur ? "آپ کا لاگ ان کوڈ" : "Your Dvarif login code",
+    otpSubject: ur ? "آپ کا لاگ ان کوڈ" : "Your Dverif login code",
     otpHeading: ur ? "آپ کا لاگ ان کوڈ" : "Your login code",
     otpBody: ur
       ? "سائن ان مکمل کرنے کے لیے نیچے دیا گیا کوڈ استعمال کریں۔ یہ کوڈ <strong>5 منٹ</strong> میں ختم ہو جائے گا۔"
@@ -91,7 +92,7 @@ function emailTexts(lang) {
       ? "اگر آپ نے یہ کوڈ نہیں مانگا تو اس ای میل کو نظر انداز کریں۔"
       : "If you did not request this code, you can safely ignore this email.",
     otpTextCode: (otp) =>
-      ur ? `آپ کا Dvarif لاگ ان کوڈ ہے: ${otp}` : `Your Dvarif login code is: ${otp}`,
+      ur ? `آپ کا Dverif لاگ ان کوڈ ہے: ${otp}` : `Your Dverif login code is: ${otp}`,
     otpTextExpiry: ur
       ? "یہ کوڈ 5 منٹ میں ختم ہو جائے گا۔"
       : "This code expires in 5 minutes.",
@@ -136,24 +137,47 @@ function emailTexts(lang) {
     slaHeading: ur ? "ایک دستاویز آپ کے جائزے کا انتظار کر رہی ہے" : "A document is waiting for your review",
     slaWaiting: (orgName) =>
       ur
-        ? `<strong>${orgName}</strong> کے پاس ایک زیر التوا تصدیقی درخواست ہے جو <strong>2+ دنوں</strong> سے انتظار میں ہے۔`
-        : `<strong>${orgName}</strong> has a pending verification request that has been waiting for <strong>2+ days</strong>.`,
+        ? `<strong>${orgName}</strong> کے پاس ایک زیر التوا تصدیقی درخواست ہے جو <strong>3+ دنوں</strong> سے انتظار میں ہے۔`
+        : `<strong>${orgName}</strong> has a pending verification request that has been waiting for <strong>3+ days</strong>.`,
     slaDocType: ur ? "دستاویز کی قسم:" : "Document type:",
     slaAction: ur
-      ? "براہِ کرم Dvarif پورٹل میں لاگ ان ہو کر درخواست کا جائزہ لیں۔ اگر یہ 3+ دنوں تک زیر جواب رہی تو اسے Dvarif سپورٹ ٹیم کے پاس بھیج دیا جا سکتا ہے۔"
-      : "Please log in to the Dvarif portal and review the request. If it stays unanswered for 3+ days, it may be escalated to the Dvarif support team for review.",
+      ? "براہِ کرم Dverif پورٹل میں لاگ ان ہو کر درخواست کا جائزہ لیں۔ اگر یہ 3+ دنوں تک زیر جواب رہی تو اسے Dverif سپورٹ ٹیم کے پاس بھیج دیا جا سکتا ہے۔"
+      : "Please log in to the Dverif portal and review the request. If it stays unanswered for 3+ days, it may be escalated to the Dverif support team for review.",
     slaSubject: (orgName) =>
       ur
         ? `${orgName} کے لیے زیر التوا تصدیقی درخواست`
         : `Pending verification request for ${orgName}`,
     slaTextWaiting: (orgName) =>
       ur
-        ? `${orgName} کے پاس ایک زیر التوا تصدیقی درخواست ہے جو 2+ دنوں سے انتظار میں ہے۔`
-        : `${orgName} has a pending verification request that has been waiting for 2+ days.`,
+        ? `${orgName} کے پاس ایک زیر التوا تصدیقی درخواست ہے جو 3+ دنوں سے انتظار میں ہے۔`
+        : `${orgName} has a pending verification request that has been waiting for 3+ days.`,
     slaTextDocType: ur ? "دستاویز کی قسم:" : "Document type:",
     slaTextAction: ur
-      ? "براہِ کرم Dvarif پورٹل میں لاگ ان ہو کر درخواست کا جائزہ لیں۔"
-      : "Please log in to the Dvarif portal and review the request.",
+      ? "براہِ کرم Dverif پورٹل میں لاگ ان ہو کر درخواست کا جائزہ لیں۔"
+      : "Please log in to the Dverif portal and review the request.",
+
+    // Document verified
+    verifiedSubject: ur
+      ? "آپ کی دستاویز کی تصدیق ہو گئی ہے"
+      : "Your document has been verified",
+    verifiedHeading: ur
+      ? "دستاویز تصدیق شدہ ✅"
+      : "Document Verified ✅",
+    verifiedBody: (docType) =>
+      ur
+        ? `آپ کی درخواست (<strong>${docType || "دستاویز"}</strong>) کامیابی سے تصدیق کر دی گئی ہے۔ آپ اپنے پورٹل پر جا کر تصدیق شدہ ریکارڈ اور سرٹیفکیٹ دیکھ سکتے ہیں۔`
+        : `Your request (<strong>${docType || "document"}</strong>) has been successfully verified. You can view the verified record and certificate on the portal.`,
+    verifiedCheck: ur
+      ? "اپنے پورٹل میں لاگ ان ہو کر تفصیلات ضرور دیکھ لیں۔"
+      : "Please log in to your portal to review the details.",
+    verifiedButton: ur ? "پورٹل پر دیکھیں" : "View on Portal",
+    verifiedTextBody: (docType) =>
+      ur
+        ? `آپ کی درخواست (${docType || "دستاویز"}) کامیابی سے تصدیق کر دی گئی ہے۔`
+        : `Your request (${docType || "document"}) has been successfully verified.`,
+    verifiedTextCheck: ur
+      ? "اپنے پورٹل پر جا کر تصدیق شدہ تفصیلات دیکھیں:"
+      : "Check the verified details on your portal:",
   };
 }
 
@@ -167,7 +191,7 @@ function emailWrapper(bodyHtml, lang) {
     <tr><td align="center">
       <table width="480" cellpadding="0" cellspacing="0" style="background-color:#ffffff;border-radius:8px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
         <tr><td style="background-color:#1a1a2e;padding:28px 40px;text-align:center;">
-          <span style="color:#ffffff;font-size:22px;font-weight:700;letter-spacing:0.5px;">Dvarif</span>
+          <span style="color:#ffffff;font-size:22px;font-weight:700;letter-spacing:0.5px;">Dverif</span>
         </td></tr>
         ${bodyHtml}
         <tr><td style="background-color:#f9fafb;padding:20px 40px;border-top:1px solid #eee;">
@@ -194,7 +218,7 @@ export async function sendPasswordResetEmail({ to, resetLink, lang = "en" }) {
   }
 
   const from = process.env.SMTP_FROM || process.env.SMTP_USER;
-  const appName = process.env.APP_NAME || "Dvarif";
+  const appName = process.env.APP_NAME || "Dverif";
   const expiry = process.env.RESET_PASSWORD_EXPIRES_IN || "15m";
   const T = emailTexts(lang);
 
@@ -239,7 +263,7 @@ export async function sendPasswordResetEmail({ to, resetLink, lang = "en" }) {
       text,
       html: emailWrapper(bodyHtml, lang),
       headers: {
-        "X-Mailer": "Dvarif",
+        "X-Mailer": "Dverif",
         "List-Unsubscribe": `<mailto:${from}?subject=unsubscribe>`,
       },
     });
@@ -259,7 +283,7 @@ export async function sendLoginOtpEmail({ to, otp, lang = "en" }) {
   }
 
   const from = process.env.SMTP_FROM || process.env.SMTP_USER;
-  const appName = process.env.APP_NAME || "Dvarif";
+  const appName = process.env.APP_NAME || "Dverif";
   const T = emailTexts(lang);
 
   const bodyHtml = `
@@ -291,7 +315,7 @@ export async function sendLoginOtpEmail({ to, otp, lang = "en" }) {
     text,
     html: emailWrapper(bodyHtml, lang),
     headers: {
-      "X-Mailer": "Dvarif",
+      "X-Mailer": "Dverif",
       "List-Unsubscribe": `<mailto:${from}?subject=unsubscribe>`,
     },
   });
@@ -304,7 +328,7 @@ export async function sendInviteEmail({ to, setLink, invitedByName, lang = "en" 
   }
 
   const from = process.env.SMTP_FROM || process.env.SMTP_USER;
-  const appName = process.env.APP_NAME || "Dvarif";
+  const appName = process.env.APP_NAME || "Dverif";
   const expiryHours = process.env.INVITE_EXPIRES_IN_HOURS || "72";
   const T = emailTexts(lang);
 
@@ -349,10 +373,105 @@ export async function sendInviteEmail({ to, setLink, invitedByName, lang = "en" 
     text,
     html: emailWrapper(bodyHtml, lang),
     headers: {
-      "X-Mailer": "Dvarif",
+      "X-Mailer": "Dverif",
       "List-Unsubscribe": `<mailto:${from}?subject=unsubscribe>`,
     },
   });
+}
+
+export async function sendVerificationResultEmail({ to, documentType, portalLink, lang = "en" }) {
+  const transporter = getMailerTransport();
+  if (!transporter) {
+    console.error("SMTP not configured — skipping verification result email");
+    return;
+  }
+
+  const from = process.env.SMTP_FROM || process.env.SMTP_USER;
+  const appName = process.env.APP_NAME || "Dverif";
+  const T = emailTexts(lang);
+
+  const bodyHtml = `
+    <tr><td style="padding:40px;">
+      <div style="margin:0 0 20px;display:inline-block;background-color:#16a34a10;border:1px solid #16a34a30;border-radius:6px;padding:8px 16px;">
+        <span style="color:#16a34a;font-size:13px;font-weight:600;">✓ ${T.verifiedHeading}</span>
+      </div>
+      <h2 style="margin:0 0 8px;color:#1a1a2e;font-size:20px;font-weight:600;">${T.verifiedHeading}</h2>
+      <p style="margin:0 0 16px;color:#555;font-size:15px;line-height:1.6;">
+        ${T.verifiedBody(documentType)}
+      </p>
+      <p style="margin:0 0 24px;color:#555;font-size:15px;line-height:1.6;">
+        ${T.verifiedCheck}
+      </p>
+      <table cellpadding="0" cellspacing="0" style="margin:0 0 24px;">
+        <tr><td>
+          <a href="${portalLink}" target="_blank" rel="noopener noreferrer"
+             style="display:inline-block;background-color:#16a34a;color:#ffffff;font-size:15px;font-weight:600;text-decoration:none;padding:14px 32px;border-radius:6px;">
+            ${T.verifiedButton}
+          </a>
+        </td></tr>
+      </table>
+    </td></tr>`;
+
+  const text = [
+    T.verifiedHeading,
+    ``,
+    T.verifiedTextBody(documentType),
+    ``,
+    T.verifiedTextCheck,
+    portalLink,
+  ].join("\n");
+
+  await transporter.sendMail({
+    from: `"${appName}" <${from}>`,
+    to,
+    subject: `${appName} — ${T.verifiedSubject}`,
+    text,
+    html: emailWrapper(bodyHtml, lang),
+    headers: {
+      "X-Mailer": "Dverif",
+      "List-Unsubscribe": `<mailto:${from}?subject=unsubscribe>`,
+    },
+  });
+}
+
+// Sends the verification-result email to the organization the request CAME FROM:
+// the org's business email plus all active org admins. If two addresses are the
+// same (e.g. business_email == admin email), the email is sent only once.
+export async function sendVerificationResultEmailToOrg({ orgId, documentType, portalLink }) {
+  if (!orgId) return 0;
+  const [orgRows] = await pool.query(
+    "SELECT business_email FROM organizations WHERE id=?",
+    [orgId]
+  );
+  const org = orgRows[0];
+
+  const [admins] = await pool.query(
+    `SELECT email, preferred_language FROM users
+     WHERE organization=? AND org_role='org_admin' AND deleted_at IS NULL AND status='active'`,
+    [orgId]
+  );
+
+  const recipients = new Map();
+  if (org?.business_email) {
+    const key = String(org.business_email).trim().toLowerCase();
+    if (key) recipients.set(key, { email: org.business_email.trim(), lang: "en" });
+  }
+  for (const a of admins) {
+    const key = a.email ? String(a.email).trim().toLowerCase() : "";
+    if (!key || recipients.has(key)) continue;
+    recipients.set(key, { email: a.email.trim(), lang: a.preferred_language === "ur" ? "ur" : "en" });
+  }
+
+  let sent = 0;
+  for (const { email, lang } of recipients.values()) {
+    try {
+      await sendVerificationResultEmail({ to: email, documentType, portalLink, lang });
+      sent += 1;
+    } catch (e) {
+      console.error(`Failed to send verification result email to ${email}:`, e.message);
+    }
+  }
+  return sent;
 }
 
 export async function sendLeadNotificationEmail({ type, data }) {
@@ -363,7 +482,13 @@ export async function sendLeadNotificationEmail({ type, data }) {
   }
 
   const from = process.env.SMTP_FROM || process.env.SMTP_USER;
-  const appName = process.env.APP_NAME || "Dvarif";
+  const appName = process.env.APP_NAME || "Dverif";
+
+  const recipientsEnv = (process.env.LEAD_NOTIFICATION_RECIPIENTS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const recipients = recipientsEnv.length ? recipientsEnv : ["dverif26@gmail.com", "contact@dverif.com"];
 
   const isContact = type === "contact";
   const subjectLine = isContact
@@ -403,18 +528,18 @@ export async function sendLeadNotificationEmail({ type, data }) {
 
   await transporter.sendMail({
     from: `"${appName}" <${from}>`,
-    to: from,
+    to: recipients,
     subject: `${appName} — ${subjectLine}`,
     text,
     html: emailWrapper(bodyHtml),
     headers: {
-      "X-Mailer": "Dvarif",
+      "X-Mailer": "Dverif",
       "List-Unsubscribe": `<mailto:${from}?subject=unsubscribe>`,
     },
   });
 }
 
-export async function sendExpiryReminderEmail({ orgName, type, daysLeft, hoursLeft }) {
+export async function sendExpiryReminderEmail({ to, orgName, type, daysLeft, hoursLeft }) {
   const transporter = getMailerTransport();
   if (!transporter) {
     console.error("SMTP not configured — skipping expiry reminder email");
@@ -422,9 +547,10 @@ export async function sendExpiryReminderEmail({ orgName, type, daysLeft, hoursLe
   }
 
   const from = process.env.SMTP_FROM || process.env.SMTP_USER;
-  const appName = process.env.APP_NAME || "Dvarif";
+  const appName = process.env.APP_NAME || "Dverif";
 
   const isUrgent = type === "2h";
+  const recipients = Array.isArray(to) ? to : [to || from];
   const timeText = isUrgent ? `${hoursLeft} hour(s)` : `${daysLeft} day(s)`;
   const subjectPrefix = isUrgent ? "URGENT:" : "";
   const accentColor = isUrgent ? "#dc2626" : "#d97706";
@@ -458,12 +584,12 @@ export async function sendExpiryReminderEmail({ orgName, type, daysLeft, hoursLe
 
   await transporter.sendMail({
     from: `"${appName}" <${from}>`,
-    to: from,
+    to: recipients.join(", "),
     subject: `${subjectPrefix} ${appName} — Subscription Expiring for ${orgName}`,
     text,
     html: emailWrapper(bodyHtml),
     headers: {
-      "X-Mailer": "Dvarif",
+      "X-Mailer": "Dverif",
       "List-Unsubscribe": `<mailto:${from}?subject=unsubscribe>`,
     },
   });
@@ -477,7 +603,7 @@ export async function sendSlaReminderEmail({ to, orgName, documentType, lang = "
   }
 
   const from = process.env.SMTP_FROM || process.env.SMTP_USER;
-  const appName = process.env.APP_NAME || "Dvarif";
+  const appName = process.env.APP_NAME || "Dverif";
   const T = emailTexts(lang);
 
   const bodyHtml = `
@@ -513,7 +639,7 @@ export async function sendSlaReminderEmail({ to, orgName, documentType, lang = "
     text,
     html: emailWrapper(bodyHtml, lang),
     headers: {
-      "X-Mailer": "Dvarif",
+      "X-Mailer": "Dverif",
       "List-Unsubscribe": `<mailto:${from}?subject=unsubscribe>`,
     },
   });

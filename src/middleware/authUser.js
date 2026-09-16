@@ -34,14 +34,16 @@ export default async function authUser(req, res, next) {
 
     const [rows] = await pool.query(
       `SELECT id, uuid, full_name, email, phone, cnic, status, org_role, feature_access,
-              subscription_plan, subscription_expiry, organization,
+              organization,
               profile_image, is_verified, created_at
        FROM users WHERE uuid=?`,
       [decoded.userId]
     );
 
     if (!rows.length) throw new ApiError(401, "Unauthorized");
-    if (rows[0].status !== "active") throw new ApiError(403, "User inactive");
+    if (rows[0].status !== "active") {
+      throw new ApiError(403, "Your account has been deactivated by admin");
+    }
 
     req.user = rows[0];
     next();

@@ -1,6 +1,7 @@
 import { pool } from "../config/db.js";
 import { ok } from "../utils/response.js";
 import { parsePagination, paginatedResponse } from "../utils/pagination.js";
+import { hasPermission } from "../utils/permissions.js";
 
 export async function listNotifications(req, res) {
   const { page, limit, offset } = parsePagination(req.query);
@@ -53,9 +54,21 @@ export async function markReadByReference(req, res) {
   return ok(res, {}, "Marked as read");
 }
 
-export async function createNotificationForOrgUsers({ orgId, type, title, message, link, referenceId }) {
+export async function createNotificationForOrgUsers({ orgId, type, title, message, link, referenceId, excludeUserId, orgRoles, requirePermission }) {
   if (!orgId) return;
-  const [users] = await pool.query("SELECT uuid FROM users WHERE organization=? AND status='active'", [orgId]);
+  let query = "SELECT uuid, org_role, feature_access FROM users WHERE organization=? AND status='active'";
+  const params = [orgId];
+  if (excludeUserId) {
+    query += " AND id!=?";
+    params.push(excludeUserId);
+  }
+  let users = await pool.query(query, params).then(([r]) => r);
+  if (orgRoles?.length) {
+    users = users.filter((u) => orgRoles.includes(u.org_role));
+  }
+  if (requirePermission) {
+    users = users.filter((u) => hasPermission(u, requirePermission));
+  }
   if (!users.length) return;
 
   const values = users.map((u) => [u.uuid, type, title, message, link || null, referenceId || null]);

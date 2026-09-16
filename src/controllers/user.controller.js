@@ -5,8 +5,8 @@ import { ok } from "../utils/response.js";
 export async function getMe(req, res) {
   const [rows] = await pool.query(
     `SELECT u.id, u.uuid, u.full_name, u.email, u.phone, u.cnic,
-            u.status, u.org_role, u.feature_access, u.preferred_language, u.subscription_plan, u.subscription_expiry,
-            u.profile_image, u.is_verified, u.created_at,
+u.status, u.org_role, u.feature_access, u.preferred_language,
+             u.profile_image, u.is_verified, u.created_at,
             o.uuid AS organization_uuid,
             o.name AS organization_name,
             o.logo AS organization_logo
@@ -39,8 +39,8 @@ export async function updateMe(req, res) {
 
   const [rows] = await pool.query(
     `SELECT u.id, u.uuid, u.full_name, u.email, u.phone, u.cnic,
-            u.status, u.org_role, u.preferred_language, u.subscription_plan, u.subscription_expiry,
-            u.profile_image, u.is_verified, u.created_at,
+u.status, u.org_role, u.preferred_language,
+             u.profile_image, u.is_verified, u.created_at,
             o.uuid AS organization_uuid,
             o.name AS organization_name
      FROM users u

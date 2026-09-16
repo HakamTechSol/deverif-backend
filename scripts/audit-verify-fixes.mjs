@@ -12,8 +12,8 @@ const LEAVE_TYPE_ID = parseInt(process.argv[5], 10);
 const sign = (payload) =>
   jwt.sign(payload, process.env.JWT_SECRET, {
     expiresIn: "30m",
-    issuer: process.env.JWT_ISSUER || "dvarif-api",
-    audience: process.env.JWT_AUDIENCE || "dvarif-client",
+    issuer: process.env.JWT_ISSUER || "dverif-api",
+    audience: process.env.JWT_AUDIENCE || "dverif-client",
   });
 
 const adminToken = sign({ type: "admin", userId: ADMIN_UUID, role: "admin", email: "admin@test.local" });

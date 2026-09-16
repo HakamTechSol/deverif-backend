@@ -10,17 +10,23 @@ import { firstFrontendUrl } from "../../utils/frontendUrl.js";
 import { logAudit, getActorFromReq } from "../../utils/auditLog.js";
 
 const USER_SELECT = `SELECT u.id, u.uuid, u.full_name, u.email, u.phone, u.cnic, u.status,
-        u.org_role, u.subscription_plan, u.subscription_expiry, u.profile_image,
+        u.org_role, u.profile_image,
         u.is_verified, u.created_at,
         o.uuid AS organization_uuid,
         o.name AS organization_name,
+        o.logo AS organization_logo,
+        EXISTS (
+          SELECT 1 FROM invite_tokens it WHERE it.user_uuid = u.uuid AND it.used_at IS NULL
+        ) AS invitation_pending,
         e.uuid AS employee_uuid,
-        e.designation,
-        e.department,
+        dg.name AS designation,
+        dp.name AS department,
         e.is_platform_user
  FROM users u
  LEFT JOIN organizations o ON o.id = u.organization
- LEFT JOIN employees e ON e.linked_user_uuid = u.uuid`;
+ LEFT JOIN employees e ON e.linked_user_uuid = u.uuid
+ LEFT JOIN designations dg ON dg.id = e.designation_id
+ LEFT JOIN departments dp ON dp.id = e.department_id`;
 
 async function resolveOrganizationUuid(uuid) {
   if (!uuid) return null;
@@ -34,7 +40,7 @@ export async function listUsers(req, res) {
   const { page, limit, offset } = parsePagination(req.query);
   const search = typeof req.query.search === "string" ? req.query.search.trim() : "";
 
-  let whereClause = "WHERE u.deleted_at IS NULL";
+  let whereClause = "WHERE u.deleted_at IS NULL AND u.org_role = 'org_admin'";
   const params = [];
 
   if (search) {
@@ -59,8 +65,8 @@ export async function createUserWithOrganization(req, res) {
   }
 
   if (!organization?.name) throw new ApiError(400, "organization.name is required");
-  if (!user?.full_name || !user?.email || !user?.cnic) {
-    throw new ApiError(400, "user.full_name, user.email, user.cnic are required");
+  if (!user?.full_name || !user?.email) {
+    throw new ApiError(400, "user.full_name and user.email are required");
   }
 
   const conn = await pool.getConnection();
@@ -85,25 +91,27 @@ export async function createUserWithOrganization(req, res) {
       if (businessEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(businessEmail)) {
         throw new ApiError(400, "organization.business_email must be a valid email address");
       }
+      const [orgTypeRows] = await conn.query(
+        "SELECT id FROM organization_types WHERE LOWER(name)=LOWER(?) ORDER BY id DESC LIMIT 1",
+        [String(organization.organization_type || "").trim()]
+      );
       const [orgRes] = await conn.query(
         "INSERT INTO organizations (name, verified, logo, organization_type, business_email) VALUES (?, 'yes', ?, ?, ?)",
-        [organization.name, orgLogoPath, organization.organization_type || null, businessEmail]
+        [organization.name, orgLogoPath, orgTypeRows.length ? orgTypeRows[0].id : null, businessEmail]
       );
       orgId = orgRes.insertId;
     }
 
     const dummyHash = await hashPassword(crypto.randomBytes(16).toString("hex"));
-    const plan = ["free", "basic", "premium"].includes(user.subscription_plan) ? user.subscription_plan : "free";
     const isVerified = user.is_verified === "yes" ? "yes" : "no";
     const profileImagePath = req.file ? `uploads/profiles/${req.file.filename}` : (user.profile_image || null);
 
     const [userRes] = await conn.query(
       `INSERT INTO users
        (full_name, email, phone, password, cnic, status, org_role,
-        subscription_plan, subscription_expiry, organization, profile_image, is_verified, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, 'org_admin', ?, ?, ?, ?, ?, NOW())`,
-      [user.full_name, user.email, user.phone || null, dummyHash, user.cnic, "inactive", plan,
-        user.subscription_expiry || null, orgId, profileImagePath, isVerified]
+        organization, profile_image, is_verified, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'org_admin', ?, ?, ?, NOW())`,
+      [user.full_name, user.email, user.phone || null, dummyHash, user.cnic || null, "active", orgId, profileImagePath, isVerified]
     );
 
     const rawToken = crypto.randomBytes(32).toString("hex");
@@ -157,7 +165,7 @@ export async function createUserWithOrganization(req, res) {
 
 export async function updateUser(req, res) {
   const { uuid } = req.params;
-  const { full_name, email, phone, cnic, status, subscription_plan, subscription_expiry, organization_uuid, is_verified, password } = req.body;
+  const { full_name, email, phone, cnic, status, organization_uuid, is_verified, password } = req.body;
 
   assertUuid(uuid, "User UUID");
   if ("organization" in req.body) {
@@ -173,13 +181,8 @@ export async function updateUser(req, res) {
   if (full_name !== undefined) { updateFields.push("full_name = ?"); updateValues.push(full_name); }
   if (email !== undefined) { updateFields.push("email = ?"); updateValues.push(email); }
   if (phone !== undefined) { updateFields.push("phone = ?"); updateValues.push(phone); }
-  if (cnic !== undefined) { updateFields.push("cnic = ?"); updateValues.push(cnic); }
+  if (cnic !== undefined) { updateFields.push("cnic = ?"); updateValues.push(cnic || null); }
   if (status !== undefined) { updateFields.push("status = ?"); updateValues.push(status === "inactive" ? "inactive" : "active"); }
-  if (subscription_plan !== undefined) {
-    updateFields.push("subscription_plan = ?");
-    updateValues.push(["free", "basic", "premium"].includes(subscription_plan) ? subscription_plan : "free");
-  }
-  if (subscription_expiry !== undefined) { updateFields.push("subscription_expiry = ?"); updateValues.push(subscription_expiry); }
   if (organization_uuid !== undefined) {
     updateFields.push("organization = ?");
     updateValues.push(await resolveOrganizationUuid(organization_uuid));

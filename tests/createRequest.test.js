@@ -21,7 +21,7 @@ afterAll(() => {
 function makeReq({ body = {}, user = {}, file = null } = {}) {
   return {
     body,
-    user,
+    user: { id: 1, org_role: "org_admin", ...user },
     file: file || { filename: "doc_test.pdf", mimetype: "application/pdf" },
   };
 }
@@ -200,7 +200,7 @@ describe("createRequest — submission_remarks validation", () => {
     const insertCall = pool.query.mock.calls.find(([sql]) =>
       typeof sql === "string" && sql.includes("INSERT INTO verification_requests")
     );
-    const remarksValue = insertCall[1][9];
+    const remarksValue = insertCall[1][8];
     expect(remarksValue).toBeNull();
   });
 });

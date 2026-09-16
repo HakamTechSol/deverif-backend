@@ -4,6 +4,7 @@ import { ok } from "../utils/response.js";
 import { getPlanSummary } from "../utils/plan.js";
 import { calculatePlanExpiry, getPurchasablePlan, getPurchasablePlans } from "../utils/paymentPlans.js";
 import { getOrgQuotaStatus } from "../utils/requestQuota.js";
+import { normalizePlanFeatures } from "../utils/planFeatures.js";
 import {
   buildProviderCheckout,
   getEnabledProviders,
@@ -50,7 +51,7 @@ async function finalizeSuccessfulPayment(callbackResult) {
     }
 
     const [userRows] = await connection.query(
-      `SELECT id, subscription_plan, subscription_expiry
+      `SELECT id, organization
        FROM users
        WHERE uuid=?
        LIMIT 1
@@ -62,20 +63,55 @@ async function finalizeSuccessfulPayment(callbackResult) {
       throw new ApiError(404, "User for payment not found");
     }
 
-    const nextExpiry = calculatePlanExpiry(userRows[0].subscription_expiry, expectedPlan.duration_days);
+    const organizationId = userRows[0].organization;
+    if (!organizationId) {
+      throw new ApiError(
+        400,
+        "Subscription is managed by your organization, but your account is not linked to one"
+      );
+    }
+
+    // Subscriptions are org-scoped: the payment activates/extends the
+    // organization's subscription, never the user's.
+    const [orgRows] = await connection.query(
+      `SELECT id, subscription_status, subscription_expiry, subscription_plan_id
+       FROM organizations
+       WHERE id=?
+       FOR UPDATE`,
+      [organizationId]
+    );
+    if (!orgRows.length) {
+      throw new ApiError(404, "Organization for payment not found");
+    }
+    const org = orgRows[0];
+
+    const nextExpiry = calculatePlanExpiry(org.subscription_expiry, expectedPlan.duration_days);
+
+    // Assign a plan row when the purchasable plan matches one by name
+    // (e.g. "Basic"); otherwise keep the org's existing plan assignment.
+    let planId = org.subscription_plan_id ?? null;
+    const [[planMatch]] = await connection.query(
+      "SELECT id FROM subscription_plans WHERE name=? ORDER BY id ASC LIMIT 1",
+      [expectedPlan.label]
+    );
+    if (planMatch) planId = planMatch.id;
 
     await connection.query(
-      `UPDATE users
-       SET subscription_plan=?, subscription_expiry=?
+      `UPDATE organizations
+       SET subscription_status='active',
+           subscription_start=CASE WHEN ? THEN NOW() ELSE subscription_start END,
+           subscription_expiry=?, subscription_plan_id=?,
+           reminder_2d_sent='no', reminder_2h_sent='no'
        WHERE id=?`,
-      [expectedPlan.code, formatSqlDateTime(nextExpiry), userRows[0].id]
+      [org.subscription_status !== "active", formatSqlDateTime(nextExpiry), planId, organizationId]
     );
 
     const [insertResult] = await connection.query(
-      `INSERT INTO payment (user_id, amount, payment_method, transaction_reference, paid_at, purpose)
-       VALUES (?, ?, ?, ?, NOW(), ?)`,
+      `INSERT INTO payment (user_id, organization_id, amount, payment_method, transaction_reference, paid_at, purpose)
+       VALUES (?, ?, ?, ?, ?, NOW(), ?)`,
       [
         userRows[0].id,
+        organizationId,
         expectedPlan.amount,
         callbackResult.provider,
         transactionReference,
@@ -98,7 +134,7 @@ async function finalizeSuccessfulPayment(callbackResult) {
 
 export async function myPlan(req, res) {
   const [rows] = await pool.query(
-    `SELECT id, uuid, subscription_plan, subscription_expiry, organization
+    `SELECT id, uuid, organization
      FROM users
      WHERE id=?`,
     [req.user.id]
@@ -117,7 +153,7 @@ export async function myPlan(req, res) {
   let payments = [];
   if (organizationId) {
     const [[org]] = await pool.query(
-      `SELECT o.id, o.subscription_status, o.subscription_plan, o.subscription_expiry, o.subscription_start,
+      `SELECT o.id, o.subscription_status, o.subscription_expiry, o.subscription_start,
               o.subscription_plan_id, sp.name AS plan_name, sp.monthly_price, sp.daily_request_quota,
               sp.description, sp.features
        FROM organizations o
@@ -130,16 +166,10 @@ export async function myPlan(req, res) {
         org.subscription_status = "expired";
         await pool.query("UPDATE organizations SET subscription_status='expired' WHERE id=?", [org.id]);
       }
-      let features = [];
-      if (org.features) {
-        try {
-          const parsed = JSON.parse(org.features);
-          if (Array.isArray(parsed)) features = parsed;
-        } catch { /* ignore malformed features */ }
-      }
+      let features = normalizePlanFeatures(org.features);
       orgSubscription = {
         status: org.subscription_status,
-        plan: org.subscription_plan,
+        plan: org.plan_name || null,
         plan_name: org.plan_name || null,
         monthly_price: org.monthly_price != null ? Number(org.monthly_price) : null,
         daily_request_quota: org.daily_request_quota != null ? Number(org.daily_request_quota) : null,
@@ -156,7 +186,7 @@ export async function myPlan(req, res) {
               u.uuid AS user_uuid, u.full_name, u.email
        FROM payment p
        JOIN users u ON u.id = p.user_id
-       WHERE u.organization = ?
+       WHERE p.organization_id = ?
        ORDER BY p.paid_at DESC
        LIMIT 50`,
       [organizationId]
@@ -164,8 +194,8 @@ export async function myPlan(req, res) {
     payments = paymentRows;
   }
 
-  // Build the plan summary from the org subscription (source of truth for
-  // quota/billing), falling back to the user-level fields for orgless users.
+  // Build the plan summary from the org subscription (the only place the plan
+  // lives); orgless users report the free tier.
   const planSummary = getPlanSummary(user, orgSubscription);
 
   return ok(res, {

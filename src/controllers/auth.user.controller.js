@@ -61,7 +61,7 @@ export async function loginUser(req, res) {
   const expiresAt = new Date(decoded.exp * 1000);
   await storeRefreshToken({ token: refreshToken, type: "user", identifier: user.uuid, expiresAt });
 
-  res.cookie("dvarif_refresh", refreshToken, getRefreshCookieOptions(!!rememberMe));
+  res.cookie("dverif_refresh", refreshToken, getRefreshCookieOptions(!!rememberMe));
 
   return ok(res, { token: accessToken, user: { uuid: user.uuid, full_name: user.full_name, email: user.email, profile_image: user.profile_image, organization: user.organization, org_role: user.org_role, feature_access: user.feature_access, preferred_language: user.preferred_language || "en" } }, "Login successful");
 }
@@ -114,11 +114,11 @@ export async function logoutUser(req, res) {
   const token = header.slice(7).trim();
   if (token) await blacklistToken(token);
 
-  const refreshToken = req.cookies?.dvarif_refresh;
+  const refreshToken = req.cookies?.dverif_refresh;
   if (refreshToken) {
     await revokeRefreshRecord(refreshToken);
   }
-  res.clearCookie("dvarif_refresh", { path: "/api/v1" });
+  res.clearCookie("dverif_refresh", { path: "/api/v1" });
   return ok(res, {}, "Logged out successfully");
 }
 

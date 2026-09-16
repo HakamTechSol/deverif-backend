@@ -7,18 +7,6 @@ import ipaddr from "ipaddr.js";
  * network spoofing. Callers should surface this limitation to users.
  */
 
-/** Parse a JSON allow-list column into a plain string array (NULL/empty → []). */
-export function parseAllowedIps(row) {
-  const value = row?.allowed_ip_addresses;
-  if (value == null) return [];
-  try {
-    const parsed = typeof value === "string" ? JSON.parse(value) : value;
-    return Array.isArray(parsed) ? parsed.map(String) : [];
-  } catch {
-    return [];
-  }
-}
-
 /** Validate an entry: exact IP, CIDR range, or IPv4 wildcard (192.168.1.*). */
 export function isValidIpRule(rule) {
   const value = String(rule).trim();

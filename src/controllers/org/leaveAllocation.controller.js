@@ -28,8 +28,10 @@ export async function listLeaveAllocations(req, res) {
   );
 
   const [employees] = await pool.query(
-    `SELECT e.uuid AS employee_uuid, e.full_name, e.email, e.designation, e.department, e.status
+    `SELECT e.uuid AS employee_uuid, e.full_name, e.email, dg.name AS designation, dp.name AS department, e.status
      FROM employees e
+     LEFT JOIN designations dg ON dg.id = e.designation_id
+     LEFT JOIN departments dp ON dp.id = e.department_id
      WHERE e.organization_id = ? AND e.status <> 'removed'
      ORDER BY e.full_name`,
     [orgId]

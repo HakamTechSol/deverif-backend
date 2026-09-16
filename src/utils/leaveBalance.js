@@ -1,5 +1,3 @@
-import { pool } from "../config/db.js";
-
 /** Normalize a DATE value (string "YYYY-MM-DD" or JS Date from mysql2) to "YYYY-MM-DD". */
 function toIsoDate(value) {
   if (value instanceof Date && !isNaN(value.getTime())) {
@@ -30,29 +28,4 @@ export function yearOfDate(value) {
 /** "YYYY-MM-DD" string for display from a DATE value. */
 export function isoDate(value) {
   return toIsoDate(value);
-}
-
-/**
- * Create a balance row for the given (employee, leave type, year) if missing,
- * allocating `days_allowed_per_year`. Accepts a transaction connection.
- */
-export async function ensureBalance({ employeeUuid, leaveTypeId, year }, conn = pool) {
-  await conn.query(
-    `INSERT IGNORE INTO leave_balances
-       (employee_uuid, leave_type_id, year, total_allocated, used, remaining)
-     SELECT ?, ?, ?, lt.days_allowed_per_year, 0, lt.days_allowed_per_year
-     FROM leave_types lt WHERE lt.id = ?`,
-    [employeeUuid, leaveTypeId, year, leaveTypeId]
-  );
-}
-
-/** Create balance rows for every leave type of an org for a given year. */
-export async function ensureBalancesForEmployee({ employeeUuid, orgId, year }, conn = pool) {
-  await conn.query(
-    `INSERT IGNORE INTO leave_balances
-       (employee_uuid, leave_type_id, year, total_allocated, used, remaining)
-     SELECT ?, lt.id, ?, lt.days_allowed_per_year, 0, lt.days_allowed_per_year
-     FROM leave_types lt WHERE lt.organization_id = ?`,
-    [employeeUuid, year, orgId]
-  );
 }

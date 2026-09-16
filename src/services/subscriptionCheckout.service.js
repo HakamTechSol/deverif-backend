@@ -89,7 +89,7 @@ export async function createOrgCheckout({ organizationId, plan, requestedByUuid,
     const trackerSession = await createSafepayPaymentSession({
       amount: amountPaisa,
       currency: "PKR",
-      metadata: { order_id: checkout.uuid, source: "dvarif-org-admin" },
+      metadata: { order_id: checkout.uuid, source: "dverif-org-admin" },
     });
     const passport = await createSafepayAuthToken();
     const redirectUrl = `${getFrontendBaseUrl()}/payment/callback`;
@@ -119,7 +119,7 @@ export async function getOrgSubscriptionStatus(orgId) {
   await expireStaleCheckouts();
 
   const [orgRows] = await pool.query(
-    `SELECT o.id, o.subscription_status AS status, o.subscription_plan AS plan,
+    `SELECT o.id, o.subscription_status AS status,
             o.subscription_start AS start, o.subscription_expiry AS expiry, o.subscription_plan_id,
             sp.name AS plan_name, sp.monthly_price, sp.daily_request_quota
      FROM organizations o
@@ -170,7 +170,7 @@ export async function getOrgSubscriptionStatus(orgId) {
   // If reconciliation activated the subscription, refresh the org fields so the
   // response reflects the just-activated plan rather than the stale pre-reconcile row.
   const [freshOrgRows] = await pool.query(
-    `SELECT o.subscription_status AS status, o.subscription_plan AS plan,
+    `SELECT o.subscription_status AS status,
             o.subscription_start AS start, o.subscription_expiry AS expiry, o.subscription_plan_id,
             sp.name AS plan_name, sp.monthly_price, sp.daily_request_quota
      FROM organizations o
@@ -183,7 +183,7 @@ export async function getOrgSubscriptionStatus(orgId) {
   return {
     subscription: {
       status: freshOrg.status,
-      plan: freshOrg.plan ?? null,
+      plan: freshOrg.plan_name ?? null,
       plan_name: freshOrg.plan_name ?? null,
       monthly_price: freshOrg.monthly_price != null ? Number(freshOrg.monthly_price) : null,
       daily_request_quota: freshOrg.daily_request_quota != null ? Number(freshOrg.daily_request_quota) : null,

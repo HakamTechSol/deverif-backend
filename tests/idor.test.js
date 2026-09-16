@@ -21,9 +21,8 @@ const REQUEST_UUID = "ffffffff-aaaa-4bbb-8ccc-dddddddddddd";
 const NONEXISTENT_UUID = "00000000-0000-4000-8000-000000000000";
 
 function mockReq({ params = {}, body = {}, user = {} } = {}) {
-  return { params, body, user };
+  return { params, body, user: { org_role: "org_admin", ...user } };
 }
-
 function mockRes() {
   const res = {};
   res.status = vi.fn().mockReturnValue(res);

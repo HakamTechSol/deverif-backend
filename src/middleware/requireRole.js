@@ -37,7 +37,7 @@ export default function requireRole(...allowedRoles) {
 
       const [rows] = await pool.query(
         `SELECT id, uuid, full_name, email, phone, cnic, status, org_role,
-                subscription_plan, subscription_expiry, organization,
+                organization,
                 profile_image, is_verified, created_at
          FROM users WHERE uuid=?`,
         [decoded.userId]
@@ -46,7 +46,9 @@ export default function requireRole(...allowedRoles) {
       if (!rows.length) throw new ApiError(401, "Unauthorized");
       const user = rows[0];
 
-      if (user.status !== "active") throw new ApiError(403, "User inactive");
+      if (user.status !== "active") {
+        throw new ApiError(403, "Your account has been deactivated by admin");
+      }
       if (!user.organization) throw new ApiError(403, "User has no organization");
       if (user.organization !== claimedOrg) {
         throw new ApiError(403, "Token organization does not match your account");

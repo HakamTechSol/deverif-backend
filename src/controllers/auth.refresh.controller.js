@@ -28,15 +28,15 @@ function getAdminRefreshCookieOptions() {
 }
 
 export async function refreshAccessToken(req, res) {
-  const refreshTokenValue = req.cookies?.dvarif_refresh || req.cookies?.dvarif_admin_refresh;
+  const refreshTokenValue = req.cookies?.dverif_refresh || req.cookies?.dverif_admin_refresh;
 
   if (!refreshTokenValue) {
     throw new ApiError(401, "Please sign in again.");
   }
 
-  const isUserRefresh = !!req.cookies?.dvarif_refresh;
+  const isUserRefresh = !!req.cookies?.dverif_refresh;
   const type = isUserRefresh ? "user" : "admin";
-  const cookieName = isUserRefresh ? "dvarif_refresh" : "dvarif_admin_refresh";
+  const cookieName = isUserRefresh ? "dverif_refresh" : "dverif_admin_refresh";
 
   let decoded;
   try {

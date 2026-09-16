@@ -20,7 +20,7 @@ import { normalizedFeatureAccess } from "../../utils/permissions.js";
  */
 
 const ADMIN_USER_SELECT = `SELECT id, uuid, full_name, email, phone, cnic, status,
-        org_role, feature_access, subscription_plan, created_at
+        org_role, feature_access, created_at
  FROM users`;
 
 export async function listAdminUsers(req, res) {
@@ -84,8 +84,8 @@ export async function createAdminUser(req, res) {
     const [userRes] = await conn.query(
       `INSERT INTO users
        (full_name, email, phone, password, cnic, status, org_role, feature_access,
-        subscription_plan, subscription_expiry, organization, profile_image, is_verified, created_at)
-       VALUES (?, ?, ?, ?, ?, 'inactive', 'sub_admin', ?, 'free', NULL, ?, NULL, 'no', NOW())`,
+        organization, profile_image, is_verified, created_at)
+       VALUES (?, ?, ?, ?, ?, 'inactive', 'sub_admin', ?, ?, NULL, 'no', NOW())`,
       [
         String(full_name).trim(),
         email,
@@ -210,13 +210,51 @@ export async function revokeAdminUser(req, res) {
   const action = req.body?.action === "deactivate" ? "deactivate" : "demote";
   const target = await loadSubAdminInScope(uuid, req.scopeOrgId, req.user.uuid);
 
-  if (action === "deactivate") {
-    await pool.query("UPDATE users SET status='inactive' WHERE uuid=?", [uuid]);
-  } else {
-    // Demote to a regular employee; no elevated permission survives.
-    await pool.query("UPDATE users SET org_role='employee', feature_access=NULL WHERE uuid=?", [
-      uuid,
-    ]);
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    if (action === "deactivate") {
+      await conn.query("UPDATE users SET status='inactive' WHERE uuid=?", [uuid]);
+    } else {
+      // Demote to a regular employee. Sub-admins created via createAdminUser
+      // have NO employees record — we must create one so they remain visible
+      // in the Employees / My Team table. Without this, the demoted person
+      // vanishes from the org's employee list entirely.
+      const [[empCheck]] = await conn.query(
+        "SELECT uuid FROM employees WHERE linked_user_uuid=?",
+        [uuid]
+      );
+
+      if (!empCheck) {
+        const [userRow] = await conn.query(
+          "SELECT full_name, email, phone, cnic, organization FROM users WHERE uuid=?",
+          [uuid]
+        );
+        const u = userRow[0];
+        await conn.query(
+          `INSERT INTO employees
+           (uuid, organization_id, full_name, email, phone, cnic,
+            status, joining_date, emergency_contact,
+            is_platform_user, linked_user_uuid, added_by_uuid, created_at)
+           VALUES (UUID(), ?, ?, ?, ?, ?, 'active', NULL, NULL,
+                   'yes', ?, ?, NOW())`,
+          [u.organization, u.full_name, u.email, u.phone, u.cnic, uuid, req.user.uuid]
+        );
+      }
+
+      await conn.query(
+        "UPDATE users SET org_role='employee', feature_access=NULL WHERE uuid=?",
+        [uuid]
+      );
+    }
+
+    await conn.commit();
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
   }
 
   const [rows] = await pool.query(`${ADMIN_USER_SELECT} WHERE uuid=?`, [uuid]);

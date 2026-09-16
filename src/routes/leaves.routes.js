@@ -2,6 +2,7 @@ import { Router } from "express";
 import asyncHandler from "../utils/asyncHandler.js";
 import authUser from "../middleware/authUser.js";
 import requireRole from "../middleware/requireRole.js";
+import requireActiveSubscription from "../middleware/requireActiveSubscription.js";
 import { createLeaveLimiter } from "../middleware/rateLimiter.js";
 import {
   createLeave,
@@ -15,9 +16,11 @@ const router = Router();
 
 // Self-service leave: only the `employee` role uses it. Staff (org_admin /
 // sub_admin) review rather than submit, and are handled via /org/leaves & decide.
-const employeesOnly = requireRole("employee");
+// Both are gated by requireActiveSubscription so leave only works with an
+// active org subscription.
+const employeesOnly = [requireRole("employee"), requireActiveSubscription];
 // Approve/reject is shared staff access.
-const staff = requireRole("org_admin", "sub_admin");
+const staff = [requireRole("org_admin", "sub_admin"), requireActiveSubscription];
 
 router.use(authUser);
 

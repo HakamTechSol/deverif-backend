@@ -4,8 +4,7 @@ const PLAN_LABELS = {
   premium: "Premium"
 };
 
-// Map plan names (from subscription_plans.name) back to codes when the
-// org-level `subscription_plan` column is empty or missing.
+// Map plan names (from subscription_plans.name) back to codes.
 const PLAN_NAME_TO_CODE = {};
 for (const [code, label] of Object.entries(PLAN_LABELS)) {
   PLAN_NAME_TO_CODE[label.toLowerCase()] = code;
@@ -16,12 +15,11 @@ export function normalizePlan(plan) {
 }
 
 /**
- * Build a plan summary.  When an `orgSubscription` object is provided (from
- * the organizations table), it takes precedence over the user-level fields
- * because subscriptions are managed at the org level.
+ * Build a plan summary from the organizations table (subscriptions are managed
+ * at the org level only). When no `orgSubscription` is provided the user has
+ * no org-managed subscription, so the summary reports the free tier.
  */
-export function getPlanSummary(user = {}, orgSubscription = null) {
-  // Prefer org-level subscription data when available.
+export function getPlanSummary(_user, orgSubscription = null) {
   const source = orgSubscription
     ? {
         subscription_plan: orgSubscription.plan ?? orgSubscription.subscription_plan ?? "free",
@@ -29,10 +27,10 @@ export function getPlanSummary(user = {}, orgSubscription = null) {
         plan_name: orgSubscription.plan_name ?? null,
         status: orgSubscription.status ?? null,
       }
-    : user;
+    : { subscription_plan: "free", subscription_expiry: null };
 
-  // Resolve the plan code.  `org.subscription_plan` is often left blank —
-  // the real data lives in subscription_plans.name (plan_name).
+  // Resolve the plan code. Plan identity comes from subscription_plans.name
+  // (via `plan`/subscription_plan_id); `plan_name` is the fallback.
   let planCode = source.subscription_plan || "free";
   if (planCode === "free" && source.plan_name) {
     const derived = PLAN_NAME_TO_CODE[source.plan_name.toLowerCase()];

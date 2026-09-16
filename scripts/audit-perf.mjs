@@ -13,13 +13,13 @@ const ORG_ID = parseInt(process.argv[4], 10);
 const adminToken = jwt.sign(
   { type: "admin", userId: ADMIN_UUID, role: "admin", email: "hunainhaidre78822@gmail.com" },
   JWT_SECRET,
-  { expiresIn: "30m", issuer: process.env.JWT_ISSUER || "dvarif-api", audience: process.env.JWT_AUDIENCE || "dvarif-client" }
+  { expiresIn: "30m", issuer: process.env.JWT_ISSUER || "dverif-api", audience: process.env.JWT_AUDIENCE || "dverif-client" }
 );
 
 const userToken = jwt.sign(
   { type: "user", userId: ORG_ADMIN_UUID, role: "user", organization: ORG_ID, org_role: "org_admin" },
   JWT_SECRET,
-  { expiresIn: "30m", issuer: process.env.JWT_ISSUER || "dvarif-api", audience: process.env.JWT_AUDIENCE || "dvarif-client" }
+  { expiresIn: "30m", issuer: process.env.JWT_ISSUER || "dverif-api", audience: process.env.JWT_AUDIENCE || "dverif-client" }
 );
 
 async function measure(name, path, token, { n = 20, concurrency = 5 } = {}) {

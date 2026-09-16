@@ -150,7 +150,7 @@ export async function adminRequestsCount(req, res) {
 async function getUpcomingExpirations() {
   try {
     const [rows] = await pool.query(
-      `SELECT uuid, name, subscription_expiry, subscription_plan
+      `SELECT uuid, name, subscription_expiry
        FROM organizations
        WHERE subscription_status='active' AND subscription_expiry IS NOT NULL
        AND subscription_expiry > NOW()
@@ -162,9 +162,58 @@ async function getUpcomingExpirations() {
       uuid: r.uuid,
       name: r.name,
       subscription_expiry: r.subscription_expiry,
-      subscription_plan: r.subscription_plan,
     }));
   } catch {
     return [];
   }
+}
+
+// ---------------------------------------------------------------------------
+// Admin analytics — aggregated data for charts
+// ---------------------------------------------------------------------------
+
+export async function adminDashboardAnalytics(_req, res) {
+  // 1. Requests per month (last 12 months)
+  const [requestsPerMonth] = await pool.query(`
+    SELECT DATE_FORMAT(submitted_at, '%Y-%m') AS month, COUNT(*) AS count
+    FROM verification_requests
+    WHERE submitted_at >= DATE_SUB(CURDATE(), INTERVAL 12 MONTH)
+    GROUP BY DATE_FORMAT(submitted_at, '%Y-%m')
+    ORDER BY month ASC
+  `);
+
+  // 2. Request status breakdown (all-time)
+  const [statusBreakdown] = await pool.query(`
+    SELECT status, COUNT(*) AS count
+    FROM verification_requests
+    GROUP BY status
+  `);
+
+  // 3. Organizations registered per month (last 12 months)
+  const [orgsPerMonth] = await pool.query(`
+    SELECT DATE_FORMAT(created_at, '%Y-%m') AS month, COUNT(*) AS count
+    FROM organizations
+    WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL 12 MONTH)
+    GROUP BY DATE_FORMAT(created_at, '%Y-%m')
+    ORDER BY month ASC
+  `);
+
+  // 4. Top 10 organizations by verification requests (last 90 days)
+  const [topOrgs] = await pool.query(`
+    SELECT o.name AS org_name, COUNT(*) AS request_count
+    FROM verification_requests vr
+    JOIN organizations o ON o.id = vr.issuing_organization_id
+    WHERE vr.submitted_at >= DATE_SUB(CURDATE(), INTERVAL 90 DAY)
+      AND vr.issuing_organization_id IS NOT NULL
+    GROUP BY o.id, o.name
+    ORDER BY request_count DESC
+    LIMIT 10
+  `);
+
+  return ok(res, {
+    requests_per_month: requestsPerMonth,
+    request_status_breakdown: statusBreakdown,
+    orgs_registered_per_month: orgsPerMonth,
+    top_organizations_by_requests: topOrgs,
+  }, "Admin dashboard analytics");
 }

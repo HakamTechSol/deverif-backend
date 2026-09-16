@@ -1,9 +1,13 @@
 import multer from "multer";
 import path from "path";
+import fs from "fs";
 import { PROFILES_DIR } from "../config/uploadPaths.js";
 
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, PROFILES_DIR),
+  destination: (req, file, cb) => {
+    if (!fs.existsSync(PROFILES_DIR)) fs.mkdirSync(PROFILES_DIR, { recursive: true });
+    cb(null, PROFILES_DIR);
+  },
   filename: (req, file, cb) => {
     const ext = path.extname(file.originalname).toLowerCase();
     cb(null, `profile_${Date.now()}${ext}`);

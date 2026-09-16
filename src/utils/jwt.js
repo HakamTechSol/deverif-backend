@@ -4,11 +4,11 @@ import ApiError from "./ApiError.js";
 const ACCESS_TOKEN_EXPIRES_IN = "30m";
 const ACCESS_TOKEN_MAX_SECONDS = 30 * 60;
 
-const JWT_ISSUER = process.env.JWT_ISSUER || "dvarif-api";
-const JWT_AUDIENCE = process.env.JWT_AUDIENCE || "dvarif-client";
+const JWT_ISSUER = process.env.JWT_ISSUER || "dverif-api";
+const JWT_AUDIENCE = process.env.JWT_AUDIENCE || "dverif-client";
 
-const REFRESH_ISSUER = process.env.JWT_ISSUER || "dvarif-api";
-const REFRESH_AUDIENCE = "dvarif-refresh";
+const REFRESH_ISSUER = process.env.JWT_ISSUER || "dverif-api";
+const REFRESH_AUDIENCE = "dverif-refresh";
 const REQUIRED_CLAIMS = ["userId", "role", "iat", "exp"];
 
 export function getJwtSecret() {

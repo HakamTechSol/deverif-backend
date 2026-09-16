@@ -24,7 +24,8 @@ export async function listOrgCustomPlanRequests(req, res) {
     throw new ApiError(400, "Your account is not linked to an organization");
   }
   const [rows] = await pool.query(
-    `SELECT cpr.uuid, cpr.message, cpr.status, cpr.approved_daily_quota, cpr.approved_price, cpr.created_at,
+    `SELECT cpr.uuid, cpr.message, cpr.requested_quota, cpr.requested_price, cpr.status,
+            cpr.approved_daily_quota, cpr.approved_price, cpr.created_at,
             cpr.decided_at, cpr.decided_by,
             u.full_name AS requested_by_name
      FROM custom_plan_requests cpr
@@ -44,7 +45,23 @@ export async function requestCustomPlan(req, res) {
     throw new ApiError(400, "Your account is not linked to an organization");
   }
   const message = req.body?.message ? String(req.body.message).trim() : "";
-  if (!message) throw new ApiError(400, "message is required");
+
+  const requestedQuota = req.body?.requested_quota;
+  if (requestedQuota === undefined || requestedQuota === null || String(requestedQuota).trim() === "") {
+    throw new ApiError(400, "requested_quota is required");
+  }
+  const quotaNum = Number(requestedQuota);
+  if (!Number.isInteger(quotaNum) || quotaNum <= 0) {
+    throw new ApiError(400, "requested_quota must be a positive integer");
+  }
+
+  let priceNum = null;
+  if (req.body?.requested_price !== undefined && req.body?.requested_price !== null && String(req.body.requested_price).trim() !== "") {
+    priceNum = Number(req.body.requested_price);
+    if (!Number.isFinite(priceNum) || priceNum <= 0) {
+      throw new ApiError(400, "requested_price must be a positive number");
+    }
+  }
 
   const [[org]] = await pool.query(
     "SELECT id, uuid, name, subscription_status FROM organizations WHERE id=?",
@@ -62,9 +79,9 @@ export async function requestCustomPlan(req, res) {
   }
 
   const [result] = await pool.query(
-    `INSERT INTO custom_plan_requests (organization_id, requested_by_uuid, message, status)
-     VALUES (?, ?, ?, 'pending')`,
-    [org.id, req.user.uuid, message]
+    `INSERT INTO custom_plan_requests (organization_id, requested_by_uuid, message, requested_quota, requested_price, status)
+     VALUES (?, ?, ?, ?, ?, 'pending')`,
+    [org.id, req.user.uuid, message || null, quotaNum, priceNum != null ? priceNum.toFixed(2) : null]
   );
 
   const [rows] = await pool.query(
@@ -84,7 +101,7 @@ export async function requestCustomPlan(req, res) {
       userIds: adminUuids.map((r) => r.uuid),
       type: "custom_plan_request",
       title: "Custom plan request",
-      message: `${org.name} requested a custom plan.`,
+      message: `${org.name} requested a custom plan (${quotaNum} requests/day).`,
       link: "/admin/payments",
       referenceId: rows[0].uuid,
     }).catch(() => {});
@@ -164,10 +181,10 @@ export async function selfSubscribe(req, res) {
   await pool.query(
     `UPDATE organizations
      SET subscription_status='pending_payment', subscription_start=?,
-         subscription_plan=?, subscription_plan_id=?,
+         subscription_plan_id=?,
          reminder_2d_sent='no', reminder_2h_sent='no'
      WHERE id=?`,
-    [now, plan.name, plan.id, org.id]
+    [now, plan.id, org.id]
   );
 
   // Notify system admins about the new self-subscription request.

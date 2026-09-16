@@ -12,6 +12,11 @@ import notificationRoutes from "./notification.routes.js";
 import adminAuth from "./admin/auth.routes.js";
 import adminUsers from "./admin/users.routes.js";
 import adminOrganizations from "./admin/organizations.routes.js";
+import {
+  listOrganizationTypes,
+  createOrganizationType,
+  deleteOrganizationType,
+} from "../controllers/admin/organizations.controller.js";
 import adminVerification from "./admin/verification.routes.js";
 import adminPayment from "./admin/payment.routes.js";
 import leadsRoutes from "./leads.routes.js";
@@ -31,6 +36,14 @@ import paymentWebhookRoutes from "./paymentWebhook.routes.js";
 import adminSubscription from "./admin/subscription.routes.js";
 import adminPlans from "./admin/plans.routes.js";
 import marketingRoutes from "./marketing.routes.js";
+
+import asyncHandler from "../utils/asyncHandler.js";
+import authAdminEnv from "../middleware/authAdminEnv.js";
+
+const orgTypesRouter = Router();
+orgTypesRouter.get("/", authAdminEnv, asyncHandler(listOrganizationTypes));
+orgTypesRouter.post("/", authAdminEnv, asyncHandler(createOrganizationType));
+orgTypesRouter.delete("/:id", authAdminEnv, asyncHandler(deleteOrganizationType));
 
 const router = Router();
 
@@ -71,6 +84,7 @@ router.use("/salary-records", salarySelfRoutes);
 router.use("/admin/auth", adminAuth);
 router.use("/admin/users", adminUsers);
 router.use("/admin/organizations", adminOrganizations);
+router.use("/admin/organization-types", orgTypesRouter);
 router.use("/admin/verification-requests", adminVerification);
 router.use("/admin/payment", adminPayment);
 router.use("/admin/leads", adminLeads);

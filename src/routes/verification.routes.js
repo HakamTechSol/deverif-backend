@@ -11,6 +11,7 @@ import {
   updateMySentRequest,
   myInboxRequests,
   myInboxCount,
+  getMyInboxRequestDetail,
   verifyRequest,
   listOrganizations
 } from "../controllers/verification.controller.js";
@@ -25,6 +26,7 @@ router.put("/my/sent/:uuid", authUser, uploadDocs.single("document"), asyncHandl
 router.delete("/my/sent/:uuid", authUser, asyncHandler(deleteMySentRequest));
 router.get("/my/inbox", authUser, asyncHandler(myInboxRequests));
 router.get("/my/inbox/count", authUser, asyncHandler(myInboxCount));
+router.get("/my/inbox/:uuid", authUser, asyncHandler(getMyInboxRequestDetail));
 router.patch("/:uuid/verify", authUser, asyncHandler(verifyRequest));
 router.get("/:uuid/certificate", authUser, asyncHandler(downloadCertificate));
 

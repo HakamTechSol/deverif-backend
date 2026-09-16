@@ -1,12 +1,12 @@
 import { pool } from "../config/db.js";
 import { sendSlaReminderEmail } from "./mailer.js";
 
-const SLA_REMINDER_HOURS = 48; // 2 days
-const SLA_FLAG_HOURS = 72; // 3 days
+const SLA_REMINDER_HOURS = 72; // 3 days
+const SLA_FLAG_HOURS = 96; // 4 days
 
 /**
  * Lazy SLA check (mirrors the subscription-expiry pattern): reminds the
- * receiving organization by email after 2 days and flags the request after 3
+ * receiving organization by email after 3 days and flags the request after 4
  * days. Only applies to requests where BOTH organizations are registered
  * (issuing_organization_id IS NOT NULL); "Other/unmatched org" requests are
  * handled by the separate Unmatched Orgs flow. Never throws — failures are
@@ -17,6 +17,7 @@ export async function runSlaChecks() {
     // 1. Remind the receiving org after 2 days (once per request)
     const [reminders] = await pool.query(
       `SELECT vr.id, vr.uuid, vr.document_type,
+              vr.issuing_organization_id,
               o.name AS org_name, o.business_email
        FROM verification_requests vr
        JOIN organizations o ON o.id = vr.issuing_organization_id
@@ -28,25 +29,42 @@ export async function runSlaChecks() {
     );
 
     for (const r of reminders) {
-      try {
-        if (r.business_email) {
-          // Render the email in the recipient's preferred language (default English).
-          let lang = "en";
-          const [recipient] = await pool.query(
-            "SELECT preferred_language FROM users WHERE email=? AND status='active' LIMIT 1",
-            [r.business_email]
-          );
-          if (recipient.length) lang = recipient[0].preferred_language || "en";
+      // Collect unique recipients: org business email + org admin emails.
+      // Deduped by address so the same inbox gets the email only once.
+      const recipients = new Map();
+      if (r.business_email) {
+        let lang = "en";
+        const [recipient] = await pool.query(
+          "SELECT preferred_language FROM users WHERE email=? AND status='active' AND deleted_at IS NULL LIMIT 1",
+          [r.business_email]
+        );
+        if (recipient.length) lang = recipient[0].preferred_language || "en";
+        recipients.set(r.business_email, lang);
+      }
+      const [admins] = await pool.query(
+        `SELECT email, preferred_language
+         FROM users
+         WHERE organization=? AND org_role='org_admin'
+           AND status='active' AND deleted_at IS NULL`,
+        [r.issuing_organization_id]
+      );
+      for (const admin of admins) {
+        if (admin.email) {
+          recipients.set(admin.email, admin.preferred_language === "ur" ? "ur" : "en");
+        }
+      }
 
+      for (const [email, lang] of recipients) {
+        try {
           await sendSlaReminderEmail({
-            to: r.business_email,
+            to: email,
             orgName: r.org_name,
             documentType: r.document_type,
             lang,
           });
+        } catch (e) {
+          console.error(`SLA reminder email failed for request ${r.uuid}:`, e.message);
         }
-      } catch (e) {
-        console.error(`SLA reminder email failed for request ${r.uuid}:`, e.message);
       }
       await pool.query(
         "UPDATE verification_requests SET sla_reminder_sent_at=NOW() WHERE id=?",

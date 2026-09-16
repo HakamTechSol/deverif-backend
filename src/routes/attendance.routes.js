@@ -2,14 +2,16 @@ import { Router } from "express";
 import asyncHandler from "../utils/asyncHandler.js";
 import authUser from "../middleware/authUser.js";
 import requireRole from "../middleware/requireRole.js";
+import requireActiveSubscription from "../middleware/requireActiveSubscription.js";
 import { attendanceLimiter } from "../middleware/rateLimiter.js";
 import { checkIn, checkOut, todayStatus, myAttendanceHistory } from "../controllers/attendance.controller.js";
 
 const router = Router();
 
 // Self-service attendance: only the `employee` role signs in/out. Staff manage
-// attendance org-wide through /org/attendance instead.
-const employeesOnly = requireRole("employee");
+// attendance org-wide through /org/attendance instead. Gated by
+// requireActiveSubscription so attendance only works with an active subscription.
+const employeesOnly = [requireRole("employee"), requireActiveSubscription];
 
 router.use(authUser);
 

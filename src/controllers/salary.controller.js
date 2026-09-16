@@ -1,4 +1,4 @@
-﻿import ApiError from "../utils/ApiError.js";
+import ApiError from "../utils/ApiError.js";
 import { pool } from "../config/db.js";
 import { ok } from "../utils/response.js";
 import { assertUuid } from "../utils/publicResponse.js";
@@ -35,7 +35,7 @@ function monthYearFields(month, year) {
 async function findEmployee(employeeUuid, orgId) {
   assertUuid(employeeUuid, "Employee UUID");
   const [rows] = await pool.query(
-    "SELECT uuid, full_name, email, designation FROM employees WHERE uuid=? AND organization_id=?",
+    "SELECT uuid, full_name, email, dg.name AS designation FROM employees e LEFT JOIN designations dg ON dg.id = e.designation_id WHERE e.uuid=? AND e.organization_id=?",
     [employeeUuid, orgId]
   );
   if (!rows.length) throw new ApiError(404, "Employee not found in this organization");
@@ -223,9 +223,10 @@ export async function generatePayroll(req, res) {
 
   const [rows] = await pool.query(
     `SELECT sr.*, e.full_name AS employee_name, e.email AS employee_email,
-            e.designation, o.name AS organization_name
+            dg.name AS designation, o.name AS organization_name
      FROM salary_records sr
      JOIN employees e ON e.uuid = sr.employee_uuid
+     LEFT JOIN designations dg ON dg.id = e.designation_id
      JOIN organizations o ON o.id = sr.organization_id
      WHERE sr.organization_id=? AND sr.month=? AND sr.year=?
      ORDER BY e.full_name`,
@@ -338,10 +339,11 @@ export async function listOrgSalaryRecords(req, res) {
   const [rows] = await pool.query(
     `SELECT sr.uuid, sr.employee_uuid, sr.month, sr.year, sr.basic_salary,
             sr.allowances, sr.deductions, sr.net_salary, sr.notes, sr.created_at,
-            e.full_name AS employee_name, e.email AS employee_email, e.designation,
+            e.full_name AS employee_name, e.email AS employee_email, dg.name AS designation,
             o.name AS organization_name
      FROM salary_records sr
      JOIN employees e ON e.uuid = sr.employee_uuid
+     LEFT JOIN designations dg ON dg.id = e.designation_id
      JOIN organizations o ON o.id = sr.organization_id
      ${whereClause}
      ORDER BY sr.year DESC, sr.month DESC, e.full_name
@@ -401,10 +403,11 @@ export async function listAllSalaryRecords(req, res) {
   const [rows] = await pool.query(
     `SELECT sr.uuid, sr.employee_uuid, sr.month, sr.year, sr.basic_salary,
             sr.allowances, sr.deductions, sr.net_salary, sr.notes, sr.created_at,
-            e.full_name AS employee_name, e.email AS employee_email, e.designation,
+            e.full_name AS employee_name, e.email AS employee_email, dg.name AS designation,
             o.uuid AS organization_uuid, o.name AS organization_name
      FROM salary_records sr
      JOIN employees e ON e.uuid = sr.employee_uuid
+     LEFT JOIN designations dg ON dg.id = e.designation_id
      JOIN organizations o ON o.id = sr.organization_id
      ${whereClause}
      ORDER BY sr.year DESC, sr.month DESC, e.full_name
@@ -453,7 +456,7 @@ export async function downloadPayslip(req, res) {
     organizationName: record.organization_name,
   });
 
-  const filename = `dvarif-payslip-${record.uuid.slice(0, 8)}.pdf`;
+  const filename = `dverif-payslip-${record.uuid.slice(0, 8)}.pdf`;
   res.setHeader("Content-Type", "application/pdf");
   res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
   res.send(pdf);
@@ -505,9 +508,10 @@ export async function exportOrgSalaryRecords(req, res) {
   const [rows] = await pool.query(
     `SELECT sr.employee_uuid, sr.month, sr.year, sr.basic_salary,
             sr.allowances, sr.deductions, sr.net_salary, sr.notes, sr.created_at,
-            e.full_name AS employee_name, e.email AS employee_email, e.designation
+            e.full_name AS employee_name, e.email AS employee_email, dg.name AS designation
      FROM salary_records sr
      JOIN employees e ON e.uuid = sr.employee_uuid
+     LEFT JOIN designations dg ON dg.id = e.designation_id
      ${whereClause}
      ORDER BY sr.year DESC, sr.month DESC, e.full_name`,
     params
@@ -528,7 +532,7 @@ export async function exportOrgSalaryRecords(req, res) {
   ].map(escapeCsvCell).join(","));
 
   const csv = [header, ...lines].join("\r\n");
-  const filename = `dvarif-payroll-${year || "all"}-${month ? MONTHS[m - 1] || "all" : "all"}.csv`;
+  const filename = `dverif-payroll-${year || "all"}-${month ? MONTHS[m - 1] || "all" : "all"}.csv`;
 
   res.setHeader("Content-Type", "text/csv; charset=utf-8");
   res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
@@ -572,10 +576,11 @@ export async function mySalaryRecords(req, res) {
   const [rows] = await pool.query(
     `SELECT sr.uuid, sr.employee_uuid, sr.month, sr.year, sr.basic_salary,
             sr.allowances, sr.deductions, sr.net_salary, sr.notes, sr.created_at,
-            e.full_name AS employee_name, e.email AS employee_email, e.designation,
+            e.full_name AS employee_name, e.email AS employee_email, dg.name AS designation,
             o.name AS organization_name
      FROM salary_records sr
      JOIN employees e ON e.uuid = sr.employee_uuid
+     LEFT JOIN designations dg ON dg.id = e.designation_id
      JOIN organizations o ON o.id = sr.organization_id
      ${whereClause}
      ORDER BY sr.year DESC, sr.month DESC

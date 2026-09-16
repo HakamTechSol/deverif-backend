@@ -1,5 +1,7 @@
 import ApiError from "../utils/ApiError.js";
 import { pool } from "../config/db.js";
+import { encryptCnic, hashCnic } from "../utils/personCrypto.js";
+import { recordPersonDocument } from "../utils/personDocuments.js";
 import { created, ok } from "../utils/response.js";
 import { assertUuid } from "../utils/publicResponse.js";
 import { parsePagination, paginatedResponse } from "../utils/pagination.js";
@@ -10,6 +12,8 @@ import { resolveUnmatchedOrg } from "../utils/unmatchedOrg.js";
 import { logAudit, getActorFromReq } from "../utils/auditLog.js";
 import { generateQrForRequest } from "../utils/qrCertificate.js";
 import { runSlaChecks } from "../utils/slaChecks.js";
+import { sendVerificationResultEmailToOrg } from "../utils/mailer.js";
+import { firstFrontendUrl } from "../utils/frontendUrl.js";
 import crypto from "crypto";
 import fs from "fs";
 import path from "path";
@@ -23,6 +27,9 @@ function docFormatFromMime(m) {
 }
 
 function generateFileHash(filePath) {
+  if (!fs.existsSync(filePath)) {
+    throw new ApiError(400, "Uploaded document file is missing — please upload the document again");
+  }
   const buffer = fs.readFileSync(filePath);
   return crypto.createHash("sha256").update(buffer).digest("hex");
 }
@@ -42,7 +49,8 @@ export async function createRequest(req, res) {
   requirePermission(req.user, "generate_request");
   const { document_type, issuing_organization_uuid,
           other_organization_name, submission_remarks,
-          other_organization_email, other_organization_phone, other_organization_website } = req.body;
+          other_organization_email, other_organization_phone, other_organization_website,
+          document_owner_cnic, document_owner_name } = req.body;
 
   if ("issuing_organization_id" in req.body) {
     throw new ApiError(400, "issuing_organization_uuid is required; integer IDs are not accepted");
@@ -58,6 +66,23 @@ export async function createRequest(req, res) {
 
   const otherOrgName = other_organization_name ? String(other_organization_name).trim() : null;
   const remarks = submission_remarks ? String(submission_remarks).trim() : null;
+
+  const documentOwnerName = document_owner_name ? String(document_owner_name).trim() : null;
+  if (documentOwnerName && documentOwnerName.length > 200) {
+    throw new ApiError(400, "document_owner_name must be 200 characters or fewer");
+  }
+
+  const rawOwnerCnic = document_owner_cnic ? String(document_owner_cnic).trim() : null;
+  let documentOwnerCnic = null;
+  let documentOwnerCnicHash = null;
+  if (rawOwnerCnic) {
+    const normalized = rawOwnerCnic.replace(/\D/g, "");
+    if (!/^\d{13}$/.test(normalized)) {
+      throw new ApiError(400, "document_owner_cnic must be a valid CNIC (XXXXX-XXXXXXX-X)");
+    }
+    documentOwnerCnic = encryptCnic(normalized);
+    documentOwnerCnicHash = hashCnic(normalized);
+  }
 
   if (!orgId && !otherOrgName) {
     throw new ApiError(400, "other_organization_name is required when no organization is selected");
@@ -111,8 +136,8 @@ export async function createRequest(req, res) {
      (user_id, document_type, issuing_organization_id, unmatched_org_id, status, submitted_at,
       document_path, document_format, document_hash,
       organization_conserned_for_future, submission_remarks,
-      verification_method, verified_at, created_at)
-     VALUES (?, ?, ?, ?, ?, NOW(), ?, ?, ?, 'no', ?, ?, ?, NOW())`,
+      verification_method, verified_at, document_owner_name, created_at)
+     VALUES (?, ?, ?, ?, ?, NOW(), ?, ?, ?, 'no', ?, ?, ?, ?, NOW())`,
     [
       req.user.id,
       document_type,
@@ -124,9 +149,38 @@ export async function createRequest(req, res) {
       documentHash,
       remarks,
       autoVerify ? "auto" : "manual",
-      autoVerify ? new Date() : null
+      autoVerify ? new Date() : null,
+      documentOwnerName
     ]
   );
+
+  // Link the request to a persons row when a document owner CNIC was given.
+  // Case A: no matching person yet -> create one (full_name taken from the
+  // unverified claim; never trusted over an existing record).
+  // Case B: person already exists -> reuse it, keep the original name.
+  if (documentOwnerCnicHash) {
+    const [personRows] = await pool.query(
+      `SELECT id FROM persons WHERE cnic_hash=? LIMIT 1`,
+      [documentOwnerCnicHash]
+    );
+
+    let linkedPersonId;
+    if (personRows.length) {
+      linkedPersonId = personRows[0].id;
+    } else {
+      const [personInsert] = await pool.query(
+        `INSERT INTO persons (cnic_encrypted, cnic_hash, full_name, is_nadra_verified, created_at)
+         VALUES (?, ?, ?, 'no', NOW())`,
+        [documentOwnerCnic, documentOwnerCnicHash, documentOwnerName]
+      );
+      linkedPersonId = personInsert.insertId;
+    }
+
+    await pool.query(
+      `UPDATE verification_requests SET linked_person_id=? WHERE id=?`,
+      [linkedPersonId, result.insertId]
+    );
+  }
 
   const [rows] = await pool.query(
     `SELECT vr.*, o.uuid AS issuing_organization_uuid, o.name AS issuing_org_name,
@@ -152,6 +206,8 @@ export async function createRequest(req, res) {
       message: `${senderName} sent a "${document_type}" document for your verification.`,
       link: "/inbox",
       referenceId: rows[0].uuid,
+      excludeUserId: req.user.id,
+      requirePermission: "approve_request",
     }).catch((e) => console.error("Failed to create notification:", e.message));
   }
 
@@ -197,11 +253,16 @@ export async function mySentRequests(req, res) {
   const [rows] = await pool.query(
     `SELECT vr.*, o.uuid AS issuing_organization_uuid, o.name AS issuing_org_name,
             uo.uuid AS unmatched_org_uuid, uo.name AS unmatched_org_name,
-            locker.full_name AS locked_by_name
+            requester.full_name AS requester_name,
+            requester_org.uuid AS requester_organization_uuid,
+            requester_org.name AS requester_organization,
+            admin_locker.full_name AS locked_by_name
      FROM verification_requests vr
+     JOIN users requester ON requester.id = vr.user_id
+     LEFT JOIN organizations requester_org ON requester_org.id = requester.organization
      LEFT JOIN organizations o ON o.id = vr.issuing_organization_id
      LEFT JOIN unmatched_organizations uo ON uo.id = vr.unmatched_org_id
-     LEFT JOIN users locker ON locker.id = vr.locked_by
+     LEFT JOIN admin_profiles admin_locker ON admin_locker.id = vr.locked_by
      ${whereClause}
      ORDER BY vr.created_at DESC
      LIMIT ? OFFSET ?`,
@@ -272,13 +333,19 @@ export async function updateMySentRequest(req, res) {
 
   const { document_type, issuing_organization_uuid,
           other_organization_name, submission_remarks,
-          other_organization_email, other_organization_phone, other_organization_website } = req.body;
+          other_organization_email, other_organization_phone, other_organization_website,
+          document_owner_name } = req.body;
 
   if (!document_type) throw new ApiError(400, "document_type is required");
 
   const orgId = await resolveOrganizationUuid(issuing_organization_uuid || null);
   const otherOrgName = other_organization_name ? String(other_organization_name).trim() : null;
   const remarks = submission_remarks ? String(submission_remarks).trim() : null;
+
+  const documentOwnerName = document_owner_name ? String(document_owner_name).trim() : null;
+  if (documentOwnerName && documentOwnerName.length > 200) {
+    throw new ApiError(400, "document_owner_name must be 200 characters or fewer");
+  }
 
   if (!orgId && !otherOrgName) {
     throw new ApiError(400, "other_organization_name is required when no organization is selected");
@@ -320,10 +387,10 @@ export async function updateMySentRequest(req, res) {
   await pool.query(
     `UPDATE verification_requests
      SET document_type=?, issuing_organization_id=?, unmatched_org_id=?,
-         submission_remarks=?,
+         submission_remarks=?, document_owner_name=?,
          document_path=?, document_format=?, document_hash=?
      WHERE uuid=?`,
-    [document_type, orgId, unmatchedOrgId, remarks,
+    [document_type, orgId, unmatchedOrgId, remarks, documentOwnerName,
       docPath, docFormat, documentHash, uuid]
   );
 
@@ -392,6 +459,7 @@ export async function myInboxRequests(req, res) {
             requester_org.uuid AS requester_organization_uuid,
             requester_org.name AS requester_organization,
             issuing_org.uuid AS issuing_organization_uuid,
+            issuing_org.name AS issuing_org_name,
             uo.uuid AS unmatched_org_uuid, uo.name AS unmatched_org_name,
             verifier.uuid AS verified_by_uuid,
             verifier.full_name AS verified_by_name,
@@ -409,6 +477,63 @@ export async function myInboxRequests(req, res) {
   );
 
   return ok(res, paginatedResponse(rows, total, page, limit), "Inbox requests");
+}
+
+export async function getMyInboxRequestDetail(req, res) {
+  requirePermission(req.user, "approve_request");
+  assertUuid(req.params.uuid, "Request UUID");
+  if (!req.user.organization) throw new ApiError(400, "User has no organization");
+
+  const [rows] = await pool.query(
+    `SELECT vr.*,
+            requester.uuid AS requester_uuid,
+            requester.full_name AS requester_name,
+            requester.email AS requester_email,
+            requester_org.uuid AS requester_organization_uuid,
+            requester_org.name AS requester_organization,
+            issuing_org.uuid AS issuing_organization_uuid,
+            issuing_org.name AS issuing_org_name,
+            uo.uuid AS unmatched_org_uuid, uo.name AS unmatched_org_name,
+            verifier.uuid AS verified_by_uuid,
+            verifier.full_name AS verified_by_name,
+            verifier.email AS verified_by_email
+     FROM verification_requests vr
+     JOIN users requester ON requester.id = vr.user_id
+     LEFT JOIN organizations requester_org ON requester_org.id = requester.organization
+     LEFT JOIN organizations issuing_org ON issuing_org.id = vr.issuing_organization_id
+     LEFT JOIN unmatched_organizations uo ON uo.id = vr.unmatched_org_id
+     LEFT JOIN users verifier ON verifier.id = vr.verified_by
+     WHERE vr.uuid=?`,
+    [req.params.uuid]
+  );
+
+  if (!rows.length) throw new ApiError(404, "Request not found");
+  const vr = rows[0];
+  if (vr.issuing_organization_id !== req.user.organization) {
+    throw new ApiError(403, "You are not allowed to view this request");
+  }
+
+  const detail = { ...vr, has_prior_verification: false, prior_verified_at: null };
+
+  // Prior-verification hint: if the request was linked to a person at creation
+  // time, check whether this exact document was already verified for that
+  // person. Deliberately generic — the verifying organization is not exposed.
+  if (vr.linked_person_id && vr.document_hash) {
+    const [priorRows] = await pool.query(
+      `SELECT verified_at
+       FROM person_documents
+       WHERE person_id=? AND document_hash=? AND status='verified'
+       ORDER BY verified_at DESC
+       LIMIT 1`,
+      [vr.linked_person_id, vr.document_hash]
+    );
+    if (priorRows.length) {
+      detail.has_prior_verification = true;
+      detail.prior_verified_at = priorRows[0].verified_at;
+    }
+  }
+
+  return ok(res, { request: detail }, "Request detail");
 }
 
 export async function myInboxCount(req, res) {
@@ -470,6 +595,11 @@ export async function verifyRequest(req, res) {
     await generateQrForRequest(updated[0]);
   }
 
+  // Append to the person's document history (accumulates across re-verifications)
+  if (status === "verified") {
+    await recordPersonDocument(updated[0], req.user.organization);
+  }
+
   // Notify the requester
   const [requester] = await pool.query(
     `SELECT u.uuid, u.organization FROM users u WHERE u.id=?`,
@@ -496,6 +626,23 @@ export async function verifyRequest(req, res) {
     console.error(`Could not notify requester: user_id ${vr.user_id} not found`);
   }
 
+  // Email the org the request came FROM once it is approved — to the org's
+  // business email + its org admins (deduplicated).
+  if (status === "verified") {
+    const reqOrgId = requester.length ? requester[0].organization : null;
+    if (reqOrgId) {
+      try {
+        await sendVerificationResultEmailToOrg({
+          orgId: reqOrgId,
+          documentType: vr.document_type,
+          portalLink: `${firstFrontendUrl(process.env.FRONTEND_URL, "http://localhost:8080")}/requests`,
+        });
+      } catch (e) {
+        console.error("Failed to send verification result email to org:", e.message);
+      }
+    }
+  }
+
   logAudit({
     ...getActorFromReq(req),
     action: status === "verified" ? "request.verify" : "request.reject",
@@ -510,12 +657,15 @@ export async function verifyRequest(req, res) {
 
 export async function listOrganizations(req, res) {
   const [rows] = await pool.query(
-    `SELECT uuid, name, verified, logo, organization_type, created_at
-     FROM organizations
-     WHERE verified='yes'
-       AND (id <> ? OR ? IS NULL)
-     ORDER BY created_at DESC`,
-    [req.user.organization || null, req.user.organization || null]
+    `SELECT DISTINCT o.uuid, o.name, o.verified, o.logo,
+            COALESCE(ot.name, o.organization_type) AS organization_type, o.created_at
+     FROM organizations o
+     LEFT JOIN organization_types ot ON ot.id = o.organization_type
+     WHERE o.verified='yes'
+       AND o.deleted_at IS NULL
+       AND o.id <> ?
+     ORDER BY o.created_at DESC`,
+    [req.user.organization]
   );
 
   return ok(res, { items: rows }, "Organizations list");

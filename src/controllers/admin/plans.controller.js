@@ -3,27 +3,20 @@ import { pool } from "../../config/db.js";
 import { ok, created } from "../../utils/response.js";
 import { assertUuid } from "../../utils/publicResponse.js";
 import { logAudit, getActorFromReq } from "../../utils/auditLog.js";
+import { normalizePlanFeatures } from "../../utils/planFeatures.js";
 
 const PLAN_SELECT = `id, uuid, name, monthly_price, daily_request_quota,
   description, features, billing_period, is_public, is_custom, created_at, updated_at`;
 
 function normalizePlan(row) {
   if (!row) return row;
-  let features = row.features;
-  if (typeof features === "string" && features) {
-    try {
-      features = JSON.parse(features);
-    } catch {
-      features = features.split(",").map((s) => s.trim()).filter(Boolean);
-    }
-  }
   return {
     ...row,
     monthly_price: Number(row.monthly_price),
     daily_request_quota: Number(row.daily_request_quota),
     is_public: Number(row.is_public),
     is_custom: Number(row.is_custom),
-    features: Array.isArray(features) ? features : [],
+    features: normalizePlanFeatures(row.features),
   };
 }
 
@@ -60,11 +53,7 @@ function validatePlanBody(body, { partial = false } = {}) {
   }
 
   if (has("features")) {
-    const features = Array.isArray(body.features)
-      ? body.features.map((f) => String(f).trim()).filter(Boolean)
-      : typeof body.features === "string"
-        ? body.features.split(",").map((s) => s.trim()).filter(Boolean)
-        : [];
+    const features = normalizePlanFeatures(body.features);
     out.features = JSON.stringify(features);
   }
 

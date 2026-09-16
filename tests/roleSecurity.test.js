@@ -15,8 +15,8 @@ import { pool } from "../src/config/db.js";
 function signToken(payload) {
   return jwt.sign(payload, JWT_SECRET, {
     expiresIn: "30m",
-    issuer: "dvarif-api",
-    audience: "dvarif-client",
+    issuer: "dverif-api",
+    audience: "dverif-client",
     algorithm: "HS256",
   });
 }
@@ -129,7 +129,7 @@ describe("Role security — middleware reads role from JWT, not from request", (
       const token = jwt.sign(
         { type: "admin", userId: "attacker@test.com", role: "admin", email: "attacker@test.com" },
         "wrong-secret-12345678901234567890",
-        { expiresIn: "30m", issuer: "dvarif-api", audience: "dvarif-client", algorithm: "HS256" }
+        { expiresIn: "30m", issuer: "dverif-api", audience: "dverif-client", algorithm: "HS256" }
       );
       const req = mockReq({ headers: { authorization: `Bearer ${token}` } });
       const next = vi.fn();

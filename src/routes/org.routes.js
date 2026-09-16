@@ -1,6 +1,7 @@
 ﻿import { Router } from "express";
 import asyncHandler from "../utils/asyncHandler.js";
 import requireRole from "../middleware/requireRole.js";
+import requireActiveSubscription from "../middleware/requireActiveSubscription.js";
 import { createEmployeeLimiter } from "../middleware/rateLimiter.js";
 import { uploadDocs } from "../middleware/uploadDocs.js";
 
@@ -76,14 +77,20 @@ import {
   deleteSalaryPeriod,
   deleteSalaryRecord,
 } from "../controllers/salary.controller.js";
+import {
+  orgDashboardAnalytics,
+} from "../controllers/org/orgDashboardAnalytics.controller.js";
 
 const router = Router();
 
 // Clean 3-tier role system. Staff (org_admin + sub_admin) share all operational
 // management access; destructive operations (delete/sub-admin mgmt/org settings)
 // are org_admin-only. All routes are scoped to the JWT's org claim.
-const staff = requireRole("org_admin", "sub_admin");
-const orgAdminsOnly = requireRole("org_admin");
+//
+// Staff/org-admin modules are ALSO gated by requireActiveSubscription so that
+// none of them work without an active org subscription.
+const staff = [requireRole("org_admin", "sub_admin"), requireActiveSubscription];
+const orgAdminsOnly = [requireRole("org_admin"), requireActiveSubscription];
 
 // ---- Employees ----
 // Staff can create/edit/list/view employees and upload documents. Only the
@@ -139,7 +146,7 @@ router.get("/employees/:uuid/leave-allocations", staff, asyncHandler(getEmployee
 router.get("/attendance", staff, asyncHandler(listOrgAttendance));
 router.get("/attendance/ips", staff, asyncHandler(getAllowedIps));
 router.post("/attendance/ips", staff, asyncHandler(addAllowedIp));
-router.delete("/attendance/ips", orgAdminsOnly, asyncHandler(removeAllowedIp));
+router.delete("/attendance/ips/:id", orgAdminsOnly, asyncHandler(removeAllowedIp));
 router.post("/attendance/manual-entry", staff, asyncHandler(manualEntry));
 
 // ---- Salary records / payroll ledger (staff view+export+build; delete period = org_admin) ----
@@ -170,6 +177,9 @@ router.delete("/employees/:uuid/salary-components/:assignUuid", staff, asyncHand
 
 // ---- Payroll auto-generation (staff) ----
 router.post("/payroll/generate", staff, asyncHandler(generatePayroll));
+
+// ---- Org dashboard analytics (staff) ----
+router.get("/dashboard/analytics", staff, asyncHandler(orgDashboardAnalytics));
 
 export default router;
 

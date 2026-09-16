@@ -36,7 +36,7 @@ export async function generatePayslipPdf({ record, employeeName, organizationNam
 
   // Header band
   doc.rect(0, 0, pageWidth, 96).fill(DARK);
-  doc.fillColor("#ffffff").font("Helvetica-Bold").fontSize(22).text("Dvarif", 50, 30);
+  doc.fillColor("#ffffff").font("Helvetica-Bold").fontSize(22).text("Dverif", 50, 30);
   doc.font("Helvetica").fontSize(11).fillColor("#99f6e4").text("Salary Payslip", 50, 58);
 
   // Title

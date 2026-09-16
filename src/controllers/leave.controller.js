@@ -366,10 +366,11 @@ export async function listOrgLeaves(req, res) {
             lr.reason, lr.status,
             lr.approved_by, lr.approved_at, lr.created_at,
             e.uuid AS employee_uuid, e.full_name AS employee_name,
-            e.email AS employee_email, e.designation,
+            e.email AS employee_email, dg.name AS designation,
             lt.id AS leave_type_id, lt.name AS leave_type_name
      FROM leave_requests lr
      JOIN employees e ON e.uuid = lr.employee_uuid
+     LEFT JOIN designations dg ON dg.id = e.designation_id
      JOIN leave_types lt ON lt.id = lr.leave_type_id
      ${whereClause}
      ORDER BY lr.created_at DESC
@@ -420,11 +421,12 @@ export async function listAllLeaves(req, res) {
             lr.reason, lr.status,
             lr.approved_by, lr.approved_at, lr.created_at,
             e.uuid AS employee_uuid, e.full_name AS employee_name,
-            e.email AS employee_email, e.designation,
+            e.email AS employee_email, dg.name AS designation,
             o.uuid AS organization_uuid, o.name AS organization_name,
             lt.id AS leave_type_id, lt.name AS leave_type_name
      FROM leave_requests lr
      JOIN employees e ON e.uuid = lr.employee_uuid
+     LEFT JOIN designations dg ON dg.id = e.designation_id
      JOIN leave_types lt ON lt.id = lr.leave_type_id
      JOIN organizations o ON o.id = e.organization_id
      ${whereClause}

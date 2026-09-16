@@ -83,7 +83,7 @@ export async function verifyOtp(req, res) {
     const expiresAt = new Date(decoded.exp * 1000);
     await storeRefreshToken({ token: refreshToken, type: "admin", identifier: admin.uuid, expiresAt });
 
-    res.cookie("dvarif_admin_refresh", refreshToken, getAdminRefreshCookieOptions());
+    res.cookie("dverif_admin_refresh", refreshToken, getAdminRefreshCookieOptions());
 
     logLoginAttempt({ req, identityType: "admin", identityId: admin.id, success: true });
 
@@ -125,7 +125,7 @@ export async function verifyOtp(req, res) {
   const expiresAt = new Date(decoded.exp * 1000);
   await storeRefreshToken({ token: refreshToken, type: "user", identifier: user.uuid, expiresAt });
 
-  res.cookie("dvarif_refresh", refreshToken, getRefreshCookieOptions(!!rememberMe));
+  res.cookie("dverif_refresh", refreshToken, getRefreshCookieOptions(!!rememberMe));
 
   logLoginAttempt({ req, identityType: "user", identityId: user.id, success: true });
 

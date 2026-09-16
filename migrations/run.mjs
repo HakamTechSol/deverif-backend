@@ -1,5 +1,5 @@
 /*
- * Migration runner for the Dvarif backend.
+ * Migration runner for the Dverif backend.
  *
  * Keeps the configured MySQL/MariaDB database in sync with the SQL files in
  * this `migrations/` folder. Every applied migration is recorded in a

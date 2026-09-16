@@ -10,8 +10,8 @@ import {
   recordSubscriptionPayment,
 } from "../../services/payment.service.js";
 
-const CUSTOM_PLAN_REQ_SELECT = `SELECT cpr.id, cpr.uuid, cpr.message, cpr.status,
-        cpr.approved_daily_quota, cpr.approved_price, cpr.created_at, cpr.decided_at, cpr.decided_by,
+const CUSTOM_PLAN_REQ_SELECT = `SELECT cpr.id, cpr.uuid, cpr.message, cpr.requested_quota, cpr.requested_price,
+        cpr.status, cpr.approved_daily_quota, cpr.approved_price, cpr.created_at, cpr.decided_at, cpr.decided_by,
         o.id AS organization_id, o.uuid AS organization_uuid, o.name AS organization_name,
         o.subscription_status, o.subscription_expiry,
         u.full_name AS requested_by_name, u.email AS requested_by_email
@@ -98,7 +98,7 @@ export async function approveCustomPlanRequest(req, res) {
     await connection.query(
       `UPDATE organizations
        SET subscription_status='active', subscription_start=?, subscription_expiry=?,
-           subscription_plan=NULL, subscription_plan_id=?, reminder_2d_sent='no', reminder_2h_sent='no'
+           subscription_plan_id=?, reminder_2d_sent='no', reminder_2h_sent='no'
        WHERE id=?`,
       [now, expiry, planId, planReq.organization_id]
     );
@@ -139,6 +139,7 @@ export async function approveCustomPlanRequest(req, res) {
       message: `Your custom plan was approved: ${dailyQuota} requests/day.`,
       link: "/payments",
       referenceId: uuid,
+      orgRoles: ["org_admin"],
     }).catch(() => {});
 
     return ok(
@@ -199,6 +200,7 @@ export async function denyCustomPlanRequest(req, res) {
     message: "Your custom plan request was denied. Please contact support for details.",
     link: "/payments",
     referenceId: uuid,
+    orgRoles: ["org_admin"],
   }).catch(() => {});
 
   return ok(res, { request: finalReq[0] }, "Custom plan request denied");
@@ -245,7 +247,8 @@ export async function listSelfSubscriptionRequests(req, res) {
 const CHECKOUT_SELECT = `SELECT sc.id, sc.uuid, sc.plan_uuid, sc.plan_name, sc.gateway, sc.amount,
         sc.currency, sc.status, sc.gateway_tracker_id, sc.gateway_event_id,
         sc.created_at, sc.updated_at, sc.completed_at, sc.failed_at,
-        o.uuid AS organization_uuid, o.name AS organization_name
+        o.uuid AS organization_uuid, o.name AS organization_name,
+        o.subscription_status, o.subscription_expiry
  FROM subscription_checkouts sc
  LEFT JOIN organizations o ON o.id = sc.organization_id`;
 
@@ -364,6 +367,7 @@ export async function confirmSelfSubscriptionRequest(req, res) {
       message: `Your subscription to ${plan.name} is now active (expires ${expiry.toISOString().slice(0, 10)}).`,
       link: "/payments",
       referenceId: uuid,
+      orgRoles: ["org_admin"],
     }).catch(() => {});
 
     return ok(res, { request: finalReq[0] }, `Subscription activated for ${r.organization_name}`);
@@ -411,7 +415,7 @@ export async function cancelSelfSubscriptionRequest(req, res) {
     await connection.query(
       `UPDATE organizations
        SET subscription_status='none', subscription_start=NULL, subscription_expiry=NULL,
-           subscription_plan=NULL, subscription_plan_id=NULL, reminder_2d_sent='no', reminder_2h_sent='no'
+           subscription_plan_id=NULL, reminder_2d_sent='no', reminder_2h_sent='no'
        WHERE uuid=? AND subscription_status='pending_payment'`,
       [r.organization_uuid]
     );
@@ -436,6 +440,7 @@ export async function cancelSelfSubscriptionRequest(req, res) {
       message: `Your request to subscribe to ${r.plan_name} was cancelled. Please contact support.`,
       link: "/payments",
       referenceId: uuid,
+      orgRoles: ["org_admin"],
     }).catch(() => {});
 
     return ok(res, { request: finalReq[0] }, "Self-subscription request cancelled");

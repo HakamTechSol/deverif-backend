@@ -4,7 +4,7 @@ import { ok, created } from "../utils/response.js";
 import { assertUuid } from "../utils/publicResponse.js";
 import { parsePagination, paginatedResponse } from "../utils/pagination.js";
 import { logAudit, getActorFromReq } from "../utils/auditLog.js";
-import { ipMatches, isValidIpRule, parseAllowedIps } from "../utils/ipMatch.js";
+import { ipMatches, isValidIpRule } from "../utils/ipMatch.js";
 import { normalizeIp } from "../utils/ip.js";
 import ipaddr from "ipaddr.js";
 
@@ -12,10 +12,11 @@ const RECORD_SELECT = `
   SELECT ar.uuid, ar.employee_uuid, ar.organization_id, ar.check_in_at, ar.check_out_at,
          ar.check_in_ip, ar.check_out_ip, ar.date, ar.status, ar.is_manual,
          ar.manual_reason, ar.created_at,
-         e.full_name AS employee_name, e.email AS employee_email, e.designation,
+         e.full_name AS employee_name, e.email AS employee_email, dg.name AS designation,
          o.uuid AS organization_uuid, o.name AS organization_name
   FROM attendance_records ar
   JOIN employees e ON e.uuid = ar.employee_uuid
+  LEFT JOIN designations dg ON dg.id = e.designation_id
   JOIN organizations o ON o.id = ar.organization_id`;
 
 /** Resolve org id for IP-list management (org-admin scoped, or admin by uuid). */
@@ -60,7 +61,7 @@ function isLoopbackIp(value) {
 /** Reject if the request IP is not on the organization's allow-list. */
 async function assertAllowedIp(req, orgId) {
   const [orgRows] = await pool.query(
-    "SELECT allowed_ip_addresses FROM organizations WHERE id=?",
+    "SELECT id FROM organizations WHERE id=?",
     [orgId]
   );
   if (!orgRows.length) throw new ApiError(404, "Organization not found");
@@ -73,7 +74,24 @@ async function assertAllowedIp(req, orgId) {
     return;
   }
 
-  if (!ipMatches(clientIp, parseAllowedIps(orgRows[0]))) {
+  const [ruleRows] = await pool.query(
+    "SELECT ip_address, rule_type FROM organization_ip_rules WHERE organization_id=?",
+    [orgId]
+  );
+  const allowRules = [];
+  const denyRules = [];
+  for (const r of ruleRows) {
+    if (r.rule_type === "deny") denyRules.push(r.ip_address);
+    else allowRules.push(r.ip_address);
+  }
+
+  if (ipMatches(clientIp, denyRules)) {
+    throw new ApiError(
+      403,
+      `Your IP address (${clientIp}) is explicitly blocked on this organization.`
+    );
+  }
+  if (!ipMatches(clientIp, allowRules)) {
     throw new ApiError(
       403,
       `Your IP address (${clientIp}) is not on this organization's allowed list. ` +
@@ -315,8 +333,12 @@ export async function manualEntry(req, res) {
 
 export async function getAllowedIps(req, res) {
   const orgId = await resolveScopeOrgId(req);
-  const [rows] = await pool.query("SELECT allowed_ip_addresses FROM organizations WHERE id=?", [orgId]);
-  return ok(res, { allowedIps: parseAllowedIps(rows[0]) }, "Allowed IP addresses");
+  const [rules] = await pool.query(
+    "SELECT id, ip_address, rule_type FROM organization_ip_rules WHERE organization_id=? ORDER BY id ASC",
+    [orgId]
+  );
+  const allowedIps = rules.filter((r) => r.rule_type === "allow").map((r) => r.ip_address);
+  return ok(res, { allowedIps, rules }, "Allowed IP addresses");
 }
 
 export async function addAllowedIp(req, res) {
@@ -327,18 +349,15 @@ export async function addAllowedIp(req, res) {
     throw new ApiError(400, "Invalid IP — use an exact address, CIDR range (e.g. 192.168.1.0/24), or IPv4 wildcard (e.g. 192.168.1.*)");
   }
 
-  const [rows] = await pool.query(
-    "SELECT allowed_ip_addresses FROM organizations WHERE id=? FOR UPDATE",
-    [orgId]
+  const [dup] = await pool.query(
+    "SELECT id FROM organization_ip_rules WHERE organization_id=? AND ip_address=?",
+    [orgId, value]
   );
-  if (!rows.length) throw new ApiError(404, "Organization not found");
-  const list = parseAllowedIps(rows[0]);
-  if (list.includes(value)) throw new ApiError(409, "This IP is already allowed");
+  if (dup.length) throw new ApiError(409, "This IP is already allowed");
 
-  list.push(value);
   await pool.query(
-    "UPDATE organizations SET allowed_ip_addresses=? WHERE id=?",
-    [JSON.stringify(list), orgId]
+    "INSERT INTO organization_ip_rules (organization_id, ip_address, rule_type) VALUES (?, ?, 'allow')",
+    [orgId, value]
   );
 
   logAudit({
@@ -349,35 +368,41 @@ export async function addAllowedIp(req, res) {
     details: { ip: value },
     req,
   });
-  return ok(res, { allowedIps: list }, "IP added to allow-list");
+
+  const [rules] = await pool.query(
+    "SELECT id, ip_address, rule_type FROM organization_ip_rules WHERE organization_id=? ORDER BY id ASC",
+    [orgId]
+  );
+  return ok(res, { allowedIps: rules.filter((r) => r.rule_type === "allow").map((r) => r.ip_address), rules }, "IP added to allow-list");
 }
 
 export async function removeAllowedIp(req, res) {
   const orgId = await resolveScopeOrgId(req);
-  const value = req.query.ip !== undefined ? String(req.query.ip).trim() : "";
-  if (!value) throw new ApiError(400, "ip query parameter is required");
+  const ruleId = Number(req.params.id);
+  if (!Number.isInteger(ruleId) || ruleId <= 0) {
+    throw new ApiError(400, "Valid IP rule id is required");
+  }
 
-  const [rows] = await pool.query(
-    "SELECT allowed_ip_addresses FROM organizations WHERE id=? FOR UPDATE",
-    [orgId]
+  const [result] = await pool.query(
+    "DELETE FROM organization_ip_rules WHERE id=? AND organization_id=?",
+    [ruleId, orgId]
   );
-  if (!rows.length) throw new ApiError(404, "Organization not found");
-  const list = parseAllowedIps(rows[0]).filter((x) => x !== value);
-
-  await pool.query(
-    "UPDATE organizations SET allowed_ip_addresses=? WHERE id=?",
-    [JSON.stringify(list), orgId]
-  );
+  if (!result.affectedRows) throw new ApiError(404, "IP rule not found");
 
   logAudit({
     ...getActorFromReq(req),
     action: "attendance.ip_remove",
     entityType: "organization",
     entityId: String(orgId),
-    details: { ip: value },
+    details: { rule_id: ruleId },
     req,
   });
-  return ok(res, { allowedIps: list }, "IP removed from allow-list");
+
+  const [rules] = await pool.query(
+    "SELECT id, ip_address, rule_type FROM organization_ip_rules WHERE organization_id=? ORDER BY id ASC",
+    [orgId]
+  );
+  return ok(res, { allowedIps: rules.filter((r) => r.rule_type === "allow").map((r) => r.ip_address), rules }, "IP removed from allow-list");
 }
 
 // ---------------------------------------------------------------------------

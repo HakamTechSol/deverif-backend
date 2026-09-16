@@ -6,6 +6,7 @@ import authAdminEnv from "../middleware/authAdminEnv.js";
 import {
   dashboardStats,
   adminDashboardStats,
+  adminDashboardAnalytics,
   userRequestsCount,
   organizationCount,
   adminVerificationCount,
@@ -17,6 +18,7 @@ const router = Router();
 router.get("/dashboard", authAny, asyncHandler(dashboardStats));
 router.get("/dashboard/user", authAny, asyncHandler(dashboardStats));
 router.get("/dashboard/admin", authAdminEnv, asyncHandler(adminDashboardStats));
+router.get("/dashboard/analytics", authAdminEnv, asyncHandler(adminDashboardAnalytics));
 
 router.get("/user-requests", authUser, asyncHandler(userRequestsCount));
 router.get("/organization", authAny, asyncHandler(organizationCount));

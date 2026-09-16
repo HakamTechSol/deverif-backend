@@ -1,9 +1,13 @@
 import multer from "multer";
 import path from "path";
+import fs from "fs";
 import { DOCS_DIR } from "../config/uploadPaths.js";
 
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, DOCS_DIR),
+  destination: (req, file, cb) => {
+    if (!fs.existsSync(DOCS_DIR)) fs.mkdirSync(DOCS_DIR, { recursive: true });
+    cb(null, DOCS_DIR);
+  },
   filename: (req, file, cb) => {
     const ext = path.extname(file.originalname).toLowerCase();
     cb(null, `doc_${Date.now()}_${Math.round(Math.random() * 1e9)}${ext}`);

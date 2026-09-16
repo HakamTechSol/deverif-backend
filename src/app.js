@@ -23,7 +23,7 @@ app.use(
 );
 
 // Allow frontend origin(s)
-// CORS_ORIGINS: comma-separated list, e.g. "http://localhost:5173,https://app.dvarif.com"
+// CORS_ORIGINS: comma-separated list, e.g. "http://localhost:5173,https://app.dverif.com"
 const allowedOrigins = (process.env.CORS_ORIGINS || "http://localhost:5173")
   .split(",")
   .map((o) => o.trim())

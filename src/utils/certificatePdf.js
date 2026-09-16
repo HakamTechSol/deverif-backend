@@ -40,7 +40,7 @@ export async function generateCertificatePdf({ request, organizationName, reques
 
   // Header band
   doc.rect(0, 0, pageWidth, 96).fill(DARK);
-  doc.fillColor("#ffffff").font("Helvetica-Bold").fontSize(22).text("Dvarif", 50, 30);
+  doc.fillColor("#ffffff").font("Helvetica-Bold").fontSize(22).text("Dverif", 50, 30);
   doc.font("Helvetica").fontSize(11).fillColor("#99f6e4").text("Document Verification Certificate", 50, 58);
 
   // Title
@@ -73,7 +73,7 @@ export async function generateCertificatePdf({ request, organizationName, reques
     width: pageWidth - 100,
   });
   doc.fillColor(MUTED).fontSize(9).text(
-    "Scan the QR code or open the link above to confirm this certificate on dvarif.com.",
+    "Scan the QR code or open the link above to confirm this certificate on dverif.com.",
     50,
     qrY + 272,
     { align: "center", width: pageWidth - 100 }

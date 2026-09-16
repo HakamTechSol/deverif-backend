@@ -5,7 +5,6 @@ import {
   acceptNullOrganizationRequest,
   adminActOnSlaRequest,
   adminVerifyUnmatchedRequest,
-  deleteRequest,
   getUnmatchedOrgDetail,
   listAllRequests,
   listNullOrganizationRequests,
@@ -26,7 +25,6 @@ router.patch("/sla/:uuid", authAdminEnv, asyncHandler(adminActOnSlaRequest));
 router.patch("/:uuid/accept", authAdminEnv, asyncHandler(acceptNullOrganizationRequest));
 router.patch("/:uuid/lock", authAdminEnv, asyncHandler(lockRequest));
 router.patch("/:uuid/unlock", authAdminEnv, asyncHandler(unlockRequest));
-router.delete("/:uuid", authAdminEnv, asyncHandler(deleteRequest));
 router.get("/:uuid/certificate", authAdminEnv, asyncHandler(downloadCertificate));
 
 export default router;

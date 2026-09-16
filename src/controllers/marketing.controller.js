@@ -1,5 +1,6 @@
 import { pool } from "../config/db.js";
 import { ok } from "../utils/response.js";
+import { normalizePlanFeatures } from "../utils/planFeatures.js";
 
 /**
  * Public, unauthenticated: return the plans to display on the marketing/landing
@@ -19,15 +20,7 @@ export async function listPublicPlans(req, res) {
     monthly_price: Number(r.monthly_price),
     daily_request_quota: Number(r.daily_request_quota),
     description: r.description,
-    features: (() => {
-      if (!r.features) return [];
-      try {
-        const parsed = JSON.parse(r.features);
-        return Array.isArray(parsed) ? parsed : [];
-      } catch {
-        return [];
-      }
-    })(),
+    features: normalizePlanFeatures(r.features),
     billing_period: r.billing_period,
   }));
   return ok(res, { items: plans }, "Public plans");

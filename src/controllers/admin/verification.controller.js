@@ -3,24 +3,31 @@ import { pool } from "../../config/db.js";
 import { ok } from "../../utils/response.js";
 import { assertUuid } from "../../utils/publicResponse.js";
 import { parsePagination, paginatedResponse } from "../../utils/pagination.js";
-import { createNotificationForUsers } from "../notification.controller.js";
+import { createNotificationForOrgUsers, createNotificationForUsers } from "../notification.controller.js";
 import { logAudit, getActorFromReq } from "../../utils/auditLog.js";
 import { generateQrForRequest } from "../../utils/qrCertificate.js";
 import { runSlaChecks } from "../../utils/slaChecks.js";
+import { sendVerificationResultEmailToOrg } from "../../utils/mailer.js";
+import { firstFrontendUrl } from "../../utils/frontendUrl.js";
+import { recordPersonDocument } from "../../utils/personDocuments.js";
 
 const REQUEST_SELECT = `SELECT vr.*,
         requester.uuid AS requester_uuid,
         requester.full_name AS requester_name,
         requester.email AS requester_email,
+        requester_org.uuid AS requester_organization_uuid,
+        requester_org.name AS requester_organization,
         issuing_org.uuid AS issuing_organization_uuid,
         issuing_org.name AS issuing_org_name,
         uo.uuid AS unmatched_org_uuid, uo.name AS unmatched_org_name,
-        locker.uuid AS locked_by_uuid, locker.full_name AS locked_by_name
+        admin_locker.uuid AS locked_by_uuid,
+        admin_locker.full_name AS locked_by_name
  FROM verification_requests vr
  JOIN users requester ON requester.id = vr.user_id
+ LEFT JOIN organizations requester_org ON requester_org.id = requester.organization
  LEFT JOIN organizations issuing_org ON issuing_org.id = vr.issuing_organization_id
  LEFT JOIN unmatched_organizations uo ON uo.id = vr.unmatched_org_id
- LEFT JOIN users locker ON locker.id = vr.locked_by`;
+ LEFT JOIN admin_profiles admin_locker ON admin_locker.id = vr.locked_by`;
 
 export async function listAllRequests(req, res) {
   const { page, limit, offset } = parsePagination(req.query);
@@ -141,6 +148,11 @@ export async function adminActOnSlaRequest(req, res) {
     await generateQrForRequest(updated[0]);
   }
 
+  // Append to the person's document history
+  if (status === "verified") {
+    await recordPersonDocument(updated[0], vr.issuing_organization_id);
+  }
+
   // Notify the original submitter
   const [requester] = await pool.query(
     "SELECT uuid FROM users WHERE id=?",
@@ -153,7 +165,7 @@ export async function adminActOnSlaRequest(req, res) {
         userIds: [requester[0].uuid],
         type: "request_verified",
         title: `Request ${statusText.toLowerCase()}`,
-        message: `Your "${vr.document_type}" request was ${statusText} by Dvarif Admin (unresponsive organization).`,
+        message: `Your "${vr.document_type}" request was ${statusText} by Dverif Admin (unresponsive organization).`,
         link: "/requests",
         referenceId: uuid,
       });
@@ -254,26 +266,37 @@ export async function getUnmatchedOrgDetail(req, res) {
   assertUuid(uuid, "Unmatched Organization UUID");
 
   const [[org]] = await pool.query(
-    "SELECT * FROM unmatched_organizations WHERE uuid=?",
+    `SELECT uo.*,
+            o.uuid AS assigned_org_uuid,
+            o.name AS assigned_org_name
+     FROM unmatched_organizations uo
+     LEFT JOIN organizations o ON o.id = uo.assigned_organization_id
+     WHERE uo.uuid=?`,
     [uuid]
   );
   if (!org) throw new ApiError(404, "Unmatched organization not found");
 
-  const [requests] = await pool.query(
+const [requests] = await pool.query(
     `SELECT vr.uuid, vr.document_type, vr.document_format, vr.document_path, vr.status, vr.submitted_at,
             vr.verified_at, vr.submission_remarks, vr.verification_remarks, vr.verification_method,
             vr.locked_by, vr.locked_at,
             requester.full_name AS requester_name, requester.email AS requester_email,
-            locker.full_name AS locked_by_name
+            requester_org.uuid AS requester_org_uuid,
+            admin_locker.full_name AS locked_by_name
      FROM verification_requests vr
      JOIN users requester ON requester.id = vr.user_id
-     LEFT JOIN users locker ON locker.id = vr.locked_by
+     LEFT JOIN organizations requester_org ON requester_org.id = requester.organization
+     LEFT JOIN admin_profiles admin_locker ON admin_locker.id = vr.locked_by
      WHERE vr.unmatched_org_id=?
      ORDER BY vr.submitted_at DESC`,
     [org.id]
   );
 
-  return ok(res, { organization: org, requests }, "Unmatched organization detail");
+  const assigned = org.assigned_org_uuid
+    ? { uuid: org.assigned_org_uuid, name: org.assigned_org_name }
+    : null;
+
+  return ok(res, { organization: { ...org, assigned_organization: assigned }, requests }, "Unmatched organization detail");
 }
 
 export async function adminVerifyUnmatchedRequest(req, res) {
@@ -318,7 +341,7 @@ export async function adminVerifyUnmatchedRequest(req, res) {
 
   // Notify the submitter
   const [requester] = await pool.query(
-    "SELECT uuid FROM users WHERE id=?",
+    "SELECT uuid, email, preferred_language, organization FROM users WHERE id=?",
     [vr.user_id]
   );
   if (requester.length) {
@@ -328,12 +351,26 @@ export async function adminVerifyUnmatchedRequest(req, res) {
         userIds: [requester[0].uuid],
         type: "request_verified",
         title: `Request ${statusText.toLowerCase()}`,
-        message: `Your "${vr.document_type}" request was ${statusText} by Dvarif Admin.`,
+        message: `Your "${vr.document_type}" request was ${statusText} by Dverif Admin.`,
         link: "/requests",
         referenceId: uuid,
       });
     } catch (e) {
       console.error("Failed to create requester notification:", e.message);
+    }
+  }
+
+  // Email the org the document was verified for once it is approved — the
+  // org's business email + its org admins (deduplicated, same address only once).
+  if (status === "verified" && requester.length && requester[0].organization) {
+    try {
+      await sendVerificationResultEmailToOrg({
+        orgId: requester[0].organization,
+        documentType: vr.document_type,
+        portalLink: `${firstFrontendUrl(process.env.FRONTEND_URL, "http://localhost:8080")}/requests`,
+      });
+    } catch (e) {
+      console.error("Failed to send verification result email to org:", e.message);
     }
   }
 
@@ -347,6 +384,11 @@ export async function adminVerifyUnmatchedRequest(req, res) {
 
   if (status === "verified") {
     await generateQrForRequest(updated[0]);
+  }
+
+  // Append to the person's document history
+  if (status === "verified") {
+    await recordPersonDocument(updated[0], vr.issuing_organization_id);
   }
 
   logAudit({
@@ -383,42 +425,64 @@ export async function acceptNullOrganizationRequest(req, res) {
   if (!orgRows.length) throw new ApiError(404, "Organization not found");
   const assignedOrgId = orgRows[0].id;
 
-  // Update all linked under_review requests to assign the verified org and auto-verify
+  // Route all pending requests to the assigned org (stay under_review for them to verify)
   await pool.query(
     `UPDATE verification_requests
-     SET status='verified', verified_at=NOW(), verified_by=NULL,
-         issuing_organization_id=?, verification_remarks=?, verification_method='admin'
+     SET issuing_organization_id=?, verification_remarks=?, verification_method='admin'
      WHERE unmatched_org_id=? AND status='under_review'`,
     [assignedOrgId, verification_remarks || null, unmatchedOrg.id]
   );
 
-  // Generate a QR certificate for each newly-verified request
-  const [affectedRequests] = await pool.query(
-    `SELECT id, uuid, issuing_organization_id, verified_at
+  // Notify the assigned org's users with approve_request permission about each routed request
+  const [routedRequests] = await pool.query(
+    `SELECT id, uuid, user_id, document_type
      FROM verification_requests
-     WHERE unmatched_org_id=? AND status='verified' AND qr_token IS NULL`,
-    [unmatchedOrg.id]
+     WHERE unmatched_org_id=? AND issuing_organization_id=? AND status='under_review'`,
+    [unmatchedOrg.id, assignedOrgId]
   );
-  for (const requestRow of affectedRequests) {
-    await generateQrForRequest(requestRow);
+
+  const routedCount = routedRequests.length;
+  for (const requestRow of routedRequests) {
+    try {
+      await createNotificationForOrgUsers({
+        orgId: assignedOrgId,
+        type: "verification_request",
+        title: "New verification request",
+        message: `A document request was assigned to your organization for review: ${requestRow.document_type}.`,
+        link: "/inbox",
+        referenceId: requestRow.uuid,
+        requirePermission: "approve_request",
+      });
+    } catch (e) {
+      console.error("Failed to create notification for assigned org:", e.message);
+    }
   }
 
-  // Mark the unmatched org as converted
+  // Mark the unmatched org as converted and remember which org it was assigned to
   await pool.query(
-    "UPDATE unmatched_organizations SET status='converted' WHERE id=?",
-    [unmatchedOrg.id]
+    "UPDATE unmatched_organizations SET status='converted', assigned_organization_id=? WHERE id=?",
+    [assignedOrgId, unmatchedOrg.id]
   );
+
+  // Detach the routed requests from the unmatched org so they leave the
+  // unmatched queue and live only under the assigned (verified) org.
+  if (routedCount > 0) {
+    await pool.query(
+      "UPDATE verification_requests SET unmatched_org_id=NULL WHERE id IN (?)",
+      [routedRequests.map((r) => r.id)]
+    );
+  }
 
   logAudit({
     ...getActorFromReq(req),
     action: "unmatched_org.assign",
     entityType: "unmatched_organization",
     entityId: uuid,
-    details: { organization_uuid: issuing_organization_uuid },
+    details: { organization_uuid: issuing_organization_uuid, routed_requests: routedCount },
     req,
   });
 
-  return ok(res, { unmatched_org: { uuid, name: unmatchedOrg.name, status: "converted" } }, "Unmatched organization assigned");
+  return ok(res, { unmatched_org: { uuid, name: unmatchedOrg.name, status: "converted" }, routed_requests: routedCount }, "Unmatched organization assigned");
 }
 
 export async function lockRequest(req, res) {
@@ -439,12 +503,11 @@ export async function lockRequest(req, res) {
     throw new ApiError(409, "Request is already locked.");
   }
 
-  const lockerId = req.admin ? req.admin.id : req.user?.id;
-  const lockerName = req.admin ? req.admin.full_name : req.user?.full_name;
+  const lockerName = req.admin.full_name;
 
   await pool.query(
     "UPDATE verification_requests SET locked_by=?, locked_at=NOW() WHERE uuid=?",
-    [lockerId, uuid]
+    [req.admin.id, uuid]
   );
 
   const [updated] = await pool.query(

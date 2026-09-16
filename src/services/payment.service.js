@@ -14,9 +14,9 @@ export async function activateOrgSubscription(connection, { organizationId, plan
   await connection.query(
     `UPDATE organizations
      SET subscription_status='active', subscription_start=?, subscription_expiry=?,
-         subscription_plan=?, subscription_plan_id=?, reminder_2d_sent='no', reminder_2h_sent='no'
+         subscription_plan_id=?, reminder_2d_sent='no', reminder_2h_sent='no'
      WHERE id=?`,
-    [now, expiry, plan.name, plan.id, organizationId]
+    [now, expiry, plan.id, organizationId]
   );
   return { expiry, duration_months: durationMonths };
 }
@@ -29,7 +29,7 @@ export async function recordSubscriptionPayment(
   if (!Number.isFinite(numericAmount) || numericAmount <= 0) return null;
 
   const [userRows] = await connection.query(
-    "SELECT id FROM users WHERE organization=? ORDER BY created_at ASC LIMIT 1",
+    "SELECT id, organization FROM users WHERE organization=? ORDER BY created_at ASC LIMIT 1",
     [organizationId]
   );
   if (!userRows.length) return null;
@@ -38,10 +38,11 @@ export async function recordSubscriptionPayment(
   const fallbackPurpose = "Org subscription";
 
   const [result] = await connection.query(
-    `INSERT INTO payment (user_id, amount, payment_method, transaction_reference, paid_at, purpose)
-     VALUES (?, ?, ?, ?, NOW(), ?)`,
+    `INSERT INTO payment (user_id, organization_id, amount, payment_method, transaction_reference, paid_at, purpose)
+     VALUES (?, ?, ?, ?, ?, NOW(), ?)`,
     [
       userRows[0].id,
+      userRows[0].organization,
       numericAmount,
       method,
       transactionReference || fallbackReference,

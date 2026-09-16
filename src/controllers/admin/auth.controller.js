@@ -1,4 +1,4 @@
-﻿import ApiError from "../../utils/ApiError.js";
+import ApiError from "../../utils/ApiError.js";
 import { ok } from "../../utils/response.js";
 import { pool } from "../../config/db.js";
 import crypto from "crypto";
@@ -229,7 +229,7 @@ export async function adminVerifyOtp(req, res) {
   const expiresAt = new Date(decoded.exp * 1000);
   await storeRefreshToken({ token: refreshToken, type: "admin", identifier: admin.uuid, expiresAt });
 
-  res.cookie("dvarif_admin_refresh", refreshToken, getRefreshCookieOptions(!!rememberMe));
+  res.cookie("dverif_admin_refresh", refreshToken, getRefreshCookieOptions(!!rememberMe));
 
   logLoginAttempt({ req, identityType: "admin", identityId: admin.id, success: true });
 
@@ -244,11 +244,11 @@ export async function logoutAdmin(req, res) {
   const token = header.slice(7).trim();
   if (token) await blacklistToken(token);
 
-  const refreshToken = req.cookies?.dvarif_admin_refresh;
+  const refreshToken = req.cookies?.dverif_admin_refresh;
   if (refreshToken) {
     await revokeRefreshRecord(refreshToken);
   }
-  res.clearCookie("dvarif_admin_refresh", { path: "/api/v1" });
+  res.clearCookie("dverif_admin_refresh", { path: "/api/v1" });
   return ok(res, {}, "Logged out successfully");
 }
 

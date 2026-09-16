@@ -53,7 +53,7 @@ export async function login(req, res) {
     throw new ApiError(403, "Your account has been deactivated. Contact your organization admin.");
   }
 
-  if (user.status !== "active") throw new ApiError(403, "Account is inactive");
+  if (user.status !== "active") throw new ApiError(403, "Your account has been deactivated by admin");
 
   const match = await comparePassword(password, user.password);
   if (!match) {

@@ -2,6 +2,7 @@ import dotenv from "dotenv";
 dotenv.config();
 import app from "./app.js";
 import { pool } from "./config/db.js";
+import { checkAndSendExpiryReminders } from "./controllers/admin/organizations.controller.js";
 
 const PORT = process.env.PORT || 5000;
 
@@ -31,6 +32,9 @@ const webhookSecret = String(process.env.PAYMENT_GATEWAY_WEBHOOK_SECRET || "").t
     }
 
     app.listen(PORT, () => console.log(`✅ Server running on http://localhost:${PORT}`));
+
+    checkAndSendExpiryReminders().catch(() => {});
+    setInterval(() => checkAndSendExpiryReminders().catch(() => {}), 60 * 60 * 1000);
   } catch (e) {
     console.error("❌ DB connection failed:", e.message);
     process.exit(1);

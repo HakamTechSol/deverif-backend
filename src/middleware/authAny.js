@@ -22,7 +22,7 @@ export default async function authAny(req, res, next) {
     if (decoded.type === "user" && decoded.role === "user") {
       const [rows] = await pool.query(
         `SELECT id, uuid, full_name, email, phone, cnic, status,
-                subscription_plan, subscription_expiry, organization,
+                organization,
                 profile_image, is_verified, created_at
          FROM users WHERE uuid = ?`,
         [decoded.userId]
