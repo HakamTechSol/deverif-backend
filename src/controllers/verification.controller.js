@@ -2,6 +2,7 @@ import ApiError from "../utils/ApiError.js";
 import { pool } from "../config/db.js";
 import { encryptCnic, hashCnic } from "../utils/personCrypto.js";
 import { recordPersonDocument } from "../utils/personDocuments.js";
+import { assertDocumentValid } from "../utils/documentValidate.js";
 import { created, ok } from "../utils/response.js";
 import { assertUuid } from "../utils/publicResponse.js";
 import { parsePagination, paginatedResponse } from "../utils/pagination.js";
@@ -12,6 +13,8 @@ import { resolveUnmatchedOrg } from "../utils/unmatchedOrg.js";
 import { logAudit, getActorFromReq } from "../utils/auditLog.js";
 import { generateQrForRequest } from "../utils/qrCertificate.js";
 import { runSlaChecks } from "../utils/slaChecks.js";
+import { runAutoMatchChecks, hasMatchMismatchRisk } from "../utils/autoMatch.js";
+import { buildDocumentCrossCheck } from "../utils/documentConsistency.js";
 import { sendVerificationResultEmailToOrg } from "../utils/mailer.js";
 import { firstFrontendUrl } from "../utils/frontendUrl.js";
 import crypto from "crypto";
@@ -67,22 +70,24 @@ export async function createRequest(req, res) {
   const otherOrgName = other_organization_name ? String(other_organization_name).trim() : null;
   const remarks = submission_remarks ? String(submission_remarks).trim() : null;
 
-  const documentOwnerName = document_owner_name ? String(document_owner_name).trim() : null;
-  if (documentOwnerName && documentOwnerName.length > 200) {
+  const documentOwnerName = document_owner_name ? String(document_owner_name).trim() : "";
+  if (!documentOwnerName) {
+    throw new ApiError(400, "document_owner_name is required");
+  }
+  if (documentOwnerName.length > 200) {
     throw new ApiError(400, "document_owner_name must be 200 characters or fewer");
   }
 
-  const rawOwnerCnic = document_owner_cnic ? String(document_owner_cnic).trim() : null;
-  let documentOwnerCnic = null;
-  let documentOwnerCnicHash = null;
-  if (rawOwnerCnic) {
-    const normalized = rawOwnerCnic.replace(/\D/g, "");
-    if (!/^\d{13}$/.test(normalized)) {
-      throw new ApiError(400, "document_owner_cnic must be a valid CNIC (XXXXX-XXXXXXX-X)");
-    }
-    documentOwnerCnic = encryptCnic(normalized);
-    documentOwnerCnicHash = hashCnic(normalized);
+  const rawOwnerCnic = document_owner_cnic ? String(document_owner_cnic).trim() : "";
+  if (!rawOwnerCnic) {
+    throw new ApiError(400, "document_owner_cnic is required");
   }
+  const normalized = rawOwnerCnic.replace(/\D/g, "");
+  if (!/^\d{13}$/.test(normalized)) {
+    throw new ApiError(400, "document_owner_cnic must be a valid CNIC (XXXXX-XXXXXXX-X)");
+  }
+  const documentOwnerCnic = encryptCnic(normalized);
+  const documentOwnerCnicHash = hashCnic(normalized);
 
   if (!orgId && !otherOrgName) {
     throw new ApiError(400, "other_organization_name is required when no organization is selected");
@@ -109,6 +114,10 @@ export async function createRequest(req, res) {
   const fullPath = path.join(DOCS_DIR, req.file.filename);
   const docFormat = docFormatFromMime(req.file.mimetype);
   const documentHash = generateFileHash(fullPath);
+
+  // Corrupt-file guard: reject definitively corrupt uploads before they reach
+  // the DB. Fails open (warn-only) if the document service is unreachable.
+  await assertDocumentValid(fullPath);
 
   // Resolve unmatched organization if "Other" was selected
   let unmatchedOrgId = null;
@@ -152,6 +161,48 @@ export async function createRequest(req, res) {
       autoVerify ? new Date() : null,
       documentOwnerName
     ]
+  );
+
+  // Reference-match setup: after the request is saved, locate a roster (or, as a
+  // fallback, learned_reference) employee in the target org whose CNIC matches
+  // the document owner, and stage the document match. The actual document match
+  // (auto-approve/manual-review decision) happens lazily, not here.
+  let matchStatus;
+  let matchedEmployeeDocumentId = null;
+  if (orgId) {
+    const [refRows] = await pool.query(
+      `SELECT e.uuid AS employee_uuid, ed.id AS doc_id, ed.document_hash
+       FROM employees e
+       JOIN employee_documents ed ON ed.employee_uuid = e.uuid
+       WHERE e.organization_id = ?
+         AND REPLACE(REPLACE(e.cnic, '-', ''), ' ', '') = ?
+       ORDER BY (e.record_type = 'roster') DESC
+       LIMIT 1`,
+      [orgId, normalized]
+    );
+    if (refRows.length) {
+      matchStatus = "not_attempted";
+      matchedEmployeeDocumentId = refRows[0].doc_id;
+    } else {
+      const [empRows] = await pool.query(
+        `SELECT emp.uuid FROM employees emp
+         WHERE emp.organization_id = ?
+           AND REPLACE(REPLACE(emp.cnic, '-', ''), ' ', '') = ?
+         ORDER BY (emp.record_type = 'roster') DESC
+         LIMIT 1`,
+        [orgId, normalized]
+      );
+      matchStatus = empRows.length ? "manual_review" : "no_reference_found";
+    }
+  } else {
+    matchStatus = "no_reference_found";
+  }
+
+  await pool.query(
+    `UPDATE verification_requests
+     SET match_status=?, matched_employee_document_id=?
+     WHERE id=?`,
+    [matchStatus, matchedEmployeeDocumentId, result.insertId]
   );
 
   // Link the request to a persons row when a document owner CNIC was given.
@@ -252,10 +303,12 @@ export async function mySentRequests(req, res) {
   );
   const [rows] = await pool.query(
     `SELECT vr.*, o.uuid AS issuing_organization_uuid, o.name AS issuing_org_name,
+            o.logo AS issuing_org_logo,
             uo.uuid AS unmatched_org_uuid, uo.name AS unmatched_org_name,
             requester.full_name AS requester_name,
             requester_org.uuid AS requester_organization_uuid,
             requester_org.name AS requester_organization,
+            requester_org.logo AS requester_org_logo,
             admin_locker.full_name AS locked_by_name
      FROM verification_requests vr
      JOIN users requester ON requester.id = vr.user_id
@@ -320,7 +373,7 @@ export async function updateMySentRequest(req, res) {
   assertUuid(uuid, "Request UUID");
 
   const [allRows] = await pool.query(
-    `SELECT id, status, user_id, document_path, document_format, document_hash
+    `SELECT id, status, user_id, document_path, document_format, document_hash, document_owner_name
      FROM verification_requests WHERE uuid=?`,
     [uuid]
   );
@@ -342,9 +395,35 @@ export async function updateMySentRequest(req, res) {
   const otherOrgName = other_organization_name ? String(other_organization_name).trim() : null;
   const remarks = submission_remarks ? String(submission_remarks).trim() : null;
 
-  const documentOwnerName = document_owner_name ? String(document_owner_name).trim() : null;
-  if (documentOwnerName && documentOwnerName.length > 200) {
-    throw new ApiError(400, "document_owner_name must be 200 characters or fewer");
+  // Owner-field enforcement on the edit path, backward compatible: validate
+  // ONLY what the caller provides. Old records whose fields were null before
+  // this change stay editable — an omitted field (or an explicitly empty one
+  // on an already-null record) is left untouched, never rejected.
+  let documentOwnerName = allRows[0].document_owner_name ?? null;
+  if ("document_owner_name" in req.body) {
+    const submitted = String(req.body.document_owner_name ?? "").trim();
+    if (submitted) {
+      if (submitted.length > 200) {
+        throw new ApiError(400, "document_owner_name must be 200 characters or fewer");
+      }
+      documentOwnerName = submitted;
+    } else if (documentOwnerName) {
+      // The owner name is required once set — it cannot be cleared to empty.
+      throw new ApiError(400, "document_owner_name is required");
+    }
+    // submitted empty + previously null -> keep null, no error
+  }
+
+  if ("document_owner_cnic" in req.body) {
+    const submittedCnic = String(req.body.document_owner_cnic ?? "").trim();
+    if (submittedCnic) {
+      const normalized = submittedCnic.replace(/\D/g, "");
+      if (!/^\d{13}$/.test(normalized)) {
+        throw new ApiError(400, "document_owner_cnic must be a valid CNIC (XXXXX-XXXXXXX-X)");
+      }
+    }
+    // empty submitted cnic -> ignored (validation only; the request row has no
+    // cnic column — a person link, if any, is managed at the create/verify side)
   }
 
   if (!orgId && !otherOrgName) {
@@ -375,7 +454,10 @@ export async function updateMySentRequest(req, res) {
   if (req.file) {
     docPath = `/uploads/documents/${req.file.filename}`;
     docFormat = docFormatFromMime(req.file.mimetype);
-    documentHash = generateFileHash(path.join(DOCS_DIR, req.file.filename));
+    const fullPath = path.join(DOCS_DIR, req.file.filename);
+    documentHash = generateFileHash(fullPath);
+    // Corrupt-file guard on the re-upload path (fails open if service down).
+    await assertDocumentValid(fullPath);
   }
 
   // Resolve unmatched organization if "Other" was selected
@@ -422,6 +504,9 @@ export async function myInboxRequests(req, res) {
   // Lazy SLA check on read (reminder + flag overdue requests)
   runSlaChecks().catch(() => {});
 
+  // Lazy reference-match check on read (same fire-and-forget pattern)
+  runAutoMatchChecks({ orgId: req.user.organization }).catch(() => {});
+
   const { page, limit, offset } = parsePagination(req.query);
   const search = typeof req.query.search === "string" ? req.query.search.trim() : "";
   const dateFrom = typeof req.query.dateFrom === "string" ? req.query.dateFrom.trim() : "";
@@ -458,25 +543,35 @@ export async function myInboxRequests(req, res) {
             requester.email AS requester_email,
             requester_org.uuid AS requester_organization_uuid,
             requester_org.name AS requester_organization,
+            requester_org.logo AS requester_org_logo,
             issuing_org.uuid AS issuing_organization_uuid,
             issuing_org.name AS issuing_org_name,
+            issuing_org.logo AS issuing_org_logo,
             uo.uuid AS unmatched_org_uuid, uo.name AS unmatched_org_name,
             verifier.uuid AS verified_by_uuid,
             verifier.full_name AS verified_by_name,
-            verifier.email AS verified_by_email
+            verifier.email AS verified_by_email,
+            med.uuid AS matched_document_uuid,
+            med.file_name AS matched_document_name,
+            med.file_path AS matched_document_path,
+            med.document_type AS matched_document_type,
+            memp.full_name AS matched_employee_name
      FROM verification_requests vr
      JOIN users requester ON requester.id = vr.user_id
      LEFT JOIN organizations requester_org ON requester_org.id = requester.organization
      LEFT JOIN organizations issuing_org ON issuing_org.id = vr.issuing_organization_id
      LEFT JOIN unmatched_organizations uo ON uo.id = vr.unmatched_org_id
      LEFT JOIN users verifier ON verifier.id = vr.verified_by
+     LEFT JOIN employee_documents med ON med.id = vr.matched_employee_document_id
+     LEFT JOIN employees memp ON memp.uuid = med.employee_uuid
      ${whereClause}
      ORDER BY vr.created_at DESC
      LIMIT ? OFFSET ?`,
     [...params, limit, offset]
   );
 
-  return ok(res, paginatedResponse(rows, total, page, limit), "Inbox requests");
+  const enriched = rows.map(r => ({ ...r, match_mismatch_risk: hasMatchMismatchRisk(r) }));
+  return ok(res, paginatedResponse(enriched, total, page, limit), "Inbox requests");
 }
 
 export async function getMyInboxRequestDetail(req, res) {
@@ -491,18 +586,27 @@ export async function getMyInboxRequestDetail(req, res) {
             requester.email AS requester_email,
             requester_org.uuid AS requester_organization_uuid,
             requester_org.name AS requester_organization,
+            requester_org.logo AS requester_org_logo,
             issuing_org.uuid AS issuing_organization_uuid,
             issuing_org.name AS issuing_org_name,
+            issuing_org.logo AS issuing_org_logo,
             uo.uuid AS unmatched_org_uuid, uo.name AS unmatched_org_name,
             verifier.uuid AS verified_by_uuid,
             verifier.full_name AS verified_by_name,
-            verifier.email AS verified_by_email
+            verifier.email AS verified_by_email,
+            med.uuid AS matched_document_uuid,
+            med.file_name AS matched_document_name,
+            med.file_path AS matched_document_path,
+            med.document_type AS matched_document_type,
+            memp.full_name AS matched_employee_name
      FROM verification_requests vr
      JOIN users requester ON requester.id = vr.user_id
      LEFT JOIN organizations requester_org ON requester_org.id = requester.organization
      LEFT JOIN organizations issuing_org ON issuing_org.id = vr.issuing_organization_id
      LEFT JOIN unmatched_organizations uo ON uo.id = vr.unmatched_org_id
      LEFT JOIN users verifier ON verifier.id = vr.verified_by
+     LEFT JOIN employee_documents med ON med.id = vr.matched_employee_document_id
+     LEFT JOIN employees memp ON memp.uuid = med.employee_uuid
      WHERE vr.uuid=?`,
     [req.params.uuid]
   );
@@ -512,6 +616,9 @@ export async function getMyInboxRequestDetail(req, res) {
   if (vr.issuing_organization_id !== req.user.organization) {
     throw new ApiError(403, "You are not allowed to view this request");
   }
+
+  // Lazy reference-match check on read (fire-and-forget; results appear on next fetch)
+  runAutoMatchChecks({ requestId: vr.id }).catch(() => {});
 
   const detail = { ...vr, has_prior_verification: false, prior_verified_at: null };
 
@@ -532,6 +639,8 @@ export async function getMyInboxRequestDetail(req, res) {
       detail.prior_verified_at = priorRows[0].verified_at;
     }
   }
+
+  detail.match_mismatch_risk = hasMatchMismatchRisk(vr);
 
   return ok(res, { request: detail }, "Request detail");
 }
@@ -597,7 +706,14 @@ export async function verifyRequest(req, res) {
 
   // Append to the person's document history (accumulates across re-verifications)
   if (status === "verified") {
-    await recordPersonDocument(updated[0], req.user.organization);
+    // Data-quality signal (never a blocker): OCR the submitted document once
+    // and cross-check the extracted identity fields against the form-entered
+    // ones, caching the result on the person_documents row so a future NADRA
+    // script can re-verify without OCR. Service outage -> 'not_checked', the
+    // approval itself is unaffected.
+    const crossCheck = await buildDocumentCrossCheck(updated[0]);
+    await recordPersonDocument(updated[0], req.user.organization, crossCheck);
+    updated[0].document_consistency = crossCheck;
   }
 
   // Notify the requester

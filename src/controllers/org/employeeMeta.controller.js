@@ -1,11 +1,13 @@
 import fs from "fs";
 import path from "path";
+import crypto from "crypto";
 import ApiError from "../../utils/ApiError.js";
 import { pool } from "../../config/db.js";
 import { ok, created } from "../../utils/response.js";
 import { assertUuid } from "../../utils/publicResponse.js";
 import { DOCS_DIR } from "../../config/uploadPaths.js";
 import { getActorFromReq, logAudit } from "../../utils/auditLog.js";
+import { assertDocumentValid } from "../../utils/documentValidate.js";
 
 function requireOrgId(req) {
   const orgId = req.scopeOrgId;
@@ -126,11 +128,25 @@ export async function uploadEmployeeDocuments(req, res) {
 
   const inserted = [];
   for (const file of files) {
+    const diskPath = path.join(DOCS_DIR, file.filename);
+
+    // Corrupt-file guard per file. Fails open (warn-only) if the document
+    // service is unreachable; throws 400 on a definite corruption verdict.
+    await assertDocumentValid(diskPath);
+
+    // Exact-file fingerprint for the auto-verification fast path. Only PDF and
+    // image files get hashed — office/zip formats are skipped on purpose.
+    let documentHash = null;
+    const isPdfOrImage = file.mimetype === "application/pdf" || (file.mimetype && file.mimetype.startsWith("image/"));
+    if (isPdfOrImage && fs.existsSync(diskPath)) {
+      documentHash = crypto.createHash("sha256").update(fs.readFileSync(diskPath)).digest("hex");
+    }
+
     const [r] = await pool.query(
       `INSERT INTO employee_documents
-        (uuid, employee_uuid, document_type, file_name, file_path, file_size, uploaded_by_uuid)
-       VALUES (UUID(), ?, ?, ?, ?, ?, ?)`,
-      [uuid, documentType, file.originalname, `documents/${file.filename}`, file.size, uploadedBy]
+        (uuid, employee_uuid, document_type, file_name, file_path, file_size, uploaded_by_uuid, document_hash)
+       VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?)`,
+      [uuid, documentType, file.originalname, `documents/${file.filename}`, file.size, uploadedBy, documentHash]
     );
     const [[row]] = await pool.query(
       "SELECT uuid, employee_uuid, document_type, file_name, file_path, file_size, uploaded_at, created_at FROM employee_documents WHERE id=?",

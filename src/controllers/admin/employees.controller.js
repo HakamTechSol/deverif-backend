@@ -9,9 +9,10 @@ import { sendInviteEmail } from "../../utils/mailer.js";
 import { firstFrontendUrl } from "../../utils/frontendUrl.js";
 import { logAudit, getActorFromReq } from "../../utils/auditLog.js";
 import { STAFF_ROLES, assertRole } from "../../utils/roles.js";
+import { assertModuleFeature } from "../../middleware/requireModuleFeature.js";
 
 const EMPLOYEE_SELECT = `SELECT e.id, e.uuid, e.organization_id, e.full_name, e.email, e.phone,
-        e.cnic, dg.name AS designation, dp.name AS department, e.status, e.is_platform_user,
+        e.cnic, dg.name AS designation, dp.name AS department, e.status, e.record_type, e.is_platform_user,
         e.linked_user_uuid, e.added_by_uuid, e.promoted_by_uuid, e.promoted_at,
         e.joining_date, e.emergency_contact,
         e.created_at,
@@ -144,6 +145,13 @@ export async function createEmployee(req, res) {
 
   const addedByUuid = req.admin?.uuid || req.user?.uuid || null;
   const wantsPlatformUser = !!data.email;
+
+  // "Add as Platform User" crosses from employee record-keeping into the
+  // user-management module (it creates a real login + invite): the org's
+  // CURRENT ACTIVE plan must therefore include user_management.
+  if (wantsPlatformUser) {
+    await assertModuleFeature("user_management", orgId);
+  }
 
   let createdEmployeeUuid = null;
   let linkedUserUuid = null;
@@ -339,6 +347,11 @@ export async function listEmployees(req, res) {
   const conditions = [];
   const params = [];
 
+  // Default: only roster employees. ?reference=1 shows learned_reference rows instead.
+  const showReferences = req.query.reference === "1" || req.query.reference === "true";
+  conditions.push("e.record_type = ?");
+  params.push(showReferences ? "learned_reference" : "roster");
+
   if (scope.scoped) {
     conditions.push("e.organization_id = ?");
     params.push(scope.orgId);
@@ -509,4 +522,82 @@ export async function deleteEmployee(req, res) {
   });
 
   return ok(res, {}, "Employee deleted successfully");
+}
+
+export async function archiveReference(req, res) {
+  assertRole(req.user, STAFF_ROLES);
+  const { uuid } = req.params;
+  assertUuid(uuid, "Employee UUID");
+  const scope = await resolveScopeOrganization(req);
+
+  const [rows] = await pool.query("SELECT * FROM employees WHERE uuid=?", [uuid]);
+  if (!rows.length) throw new ApiError(404, "Employee not found");
+  const emp = rows[0];
+
+  if (scope.scoped && emp.organization_id !== scope.orgId) {
+    throw new ApiError(403, "You can only manage employees within your organization");
+  }
+
+  await pool.query(
+    `UPDATE employees SET record_type='learned_reference', status='resigned' WHERE uuid=?`,
+    [uuid]
+  );
+
+  const [updated] = await pool.query(`${EMPLOYEE_SELECT} WHERE e.uuid=?`, [uuid]);
+
+  logAudit({
+    ...getActorFromReq(req),
+    action: "employee.archive_reference",
+    entityType: "employee",
+    entityId: uuid,
+    details: { full_name: emp.full_name, previous_status: emp.status },
+    req,
+  });
+
+  return ok(res, { employee: updated[0] }, "Employee archived as reference");
+}
+
+export async function createReference(req, res) {
+  assertRole(req.user, STAFF_ROLES);
+  const scope = await resolveScopeOrganization(req);
+
+  const { full_name, cnic } = req.body;
+  if (!full_name || String(full_name).trim() === "") throw new ApiError(400, "full_name is required");
+  if (!cnic || String(cnic).trim() === "") throw new ApiError(400, "cnic is required");
+
+  let orgId;
+  if (scope.scoped) {
+    orgId = scope.orgId;
+  } else {
+    orgId = await resolveOrganizationId(req.body.organization_uuid);
+  }
+
+  const trimmedCnic = String(cnic).trim();
+  const [dupeCnic] = await pool.query("SELECT uuid FROM employees WHERE cnic=? AND organization_id=?", [trimmedCnic, orgId]);
+  if (dupeCnic.length) throw new ApiError(409, "An employee with this CNIC already exists in this organization");
+
+  const addedByUuid = req.admin?.uuid || req.user?.uuid || null;
+
+  const [result] = await pool.query(
+    `INSERT INTO employees
+     (uuid, organization_id, full_name, cnic, status, record_type,
+      is_platform_user, added_by_uuid, created_at)
+     VALUES (UUID(), ?, ?, ?, 'active', 'learned_reference', 'no', ?, NOW())`,
+    [orgId, String(full_name).trim(), trimmedCnic, addedByUuid]
+  );
+
+  const [[createdRow]] = await pool.query("SELECT uuid FROM employees WHERE id=?", [result.insertId]);
+
+  const [employeeRow] = await pool.query(`${EMPLOYEE_SELECT} WHERE e.uuid=?`, [createdRow.uuid]);
+
+  logAudit({
+    ...getActorFromReq(req),
+    action: "employee.create_reference",
+    entityType: "employee",
+    entityId: createdRow.uuid,
+    details: { full_name: String(full_name).trim(), organization_id: orgId },
+    req,
+  });
+
+  return created(res, { employee: employeeRow[0] }, "Reference record created");
 }

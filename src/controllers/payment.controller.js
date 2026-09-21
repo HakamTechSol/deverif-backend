@@ -155,7 +155,7 @@ export async function myPlan(req, res) {
     const [[org]] = await pool.query(
       `SELECT o.id, o.subscription_status, o.subscription_expiry, o.subscription_start,
               o.subscription_plan_id, sp.name AS plan_name, sp.monthly_price, sp.daily_request_quota,
-              sp.description, sp.features
+              sp.description, sp.features, sp.module_flags
        FROM organizations o
        LEFT JOIN subscription_plans sp ON sp.id = o.subscription_plan_id
        WHERE o.id=?`,
@@ -167,6 +167,14 @@ export async function myPlan(req, res) {
         await pool.query("UPDATE organizations SET subscription_status='expired' WHERE id=?", [org.id]);
       }
       let features = normalizePlanFeatures(org.features);
+      let moduleFlags = null;
+      if (org.module_flags != null) {
+        try {
+          moduleFlags = JSON.parse(org.module_flags);
+        } catch {
+          moduleFlags = null;
+        }
+      }
       orgSubscription = {
         status: org.subscription_status,
         plan: org.plan_name || null,
@@ -175,6 +183,7 @@ export async function myPlan(req, res) {
         daily_request_quota: org.daily_request_quota != null ? Number(org.daily_request_quota) : null,
         description: org.description || null,
         features,
+        module_flags: moduleFlags,
         expiry: org.subscription_expiry,
         start: org.subscription_start,
       };

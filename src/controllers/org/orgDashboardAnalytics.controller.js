@@ -11,7 +11,7 @@ export async function orgDashboardAnalytics(req, res) {
 
   // 1. Active employee count
   const [[empCount]] = await pool.query(
-    `SELECT COUNT(*) AS total FROM employees WHERE organization_id=? AND status='active'`,
+    `SELECT COUNT(*) AS total FROM employees WHERE organization_id=? AND status='active' AND record_type='roster'`,
     [orgId]
   );
 
@@ -58,7 +58,7 @@ export async function orgDashboardAnalytics(req, res) {
     `SELECT COALESCE(dp.name, 'Unassigned') AS department, COUNT(*) AS count
      FROM employees e
      LEFT JOIN departments dp ON dp.id = e.department_id
-     WHERE e.organization_id=? AND e.status='active'
+     WHERE e.organization_id=? AND e.status='active' AND e.record_type='roster'
      GROUP BY dp.name
      ORDER BY count DESC`,
     [orgId]
@@ -74,7 +74,7 @@ export async function orgDashboardAnalytics(req, res) {
             ar.status
      FROM attendance_records ar
      JOIN employees e ON e.uuid = ar.employee_uuid
-     WHERE e.organization_id=? AND ar.date = CURDATE()`,
+     WHERE e.organization_id=? AND ar.date = CURDATE() AND e.record_type='roster'`,
     [orgId]
   );
 

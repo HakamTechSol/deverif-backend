@@ -8,6 +8,7 @@ import { parsePagination, paginatedResponse } from "../../utils/pagination.js";
 import { sendInviteEmail } from "../../utils/mailer.js";
 import { firstFrontendUrl } from "../../utils/frontendUrl.js";
 import { logAudit, getActorFromReq } from "../../utils/auditLog.js";
+import { assignFreePlanToOrg } from "../../utils/freePlan.js";
 
 const USER_SELECT = `SELECT u.id, u.uuid, u.full_name, u.email, u.phone, u.cnic, u.status,
         u.org_role, u.profile_image,
@@ -100,6 +101,8 @@ export async function createUserWithOrganization(req, res) {
         [organization.name, orgLogoPath, orgTypeRows.length ? orgTypeRows[0].id : null, businessEmail]
       );
       orgId = orgRes.insertId;
+      // Automatically subscribe the new org to the Free plan (baseline experience).
+      await assignFreePlanToOrg(conn, orgId);
     }
 
     const dummyHash = await hashPassword(crypto.randomBytes(16).toString("hex"));
@@ -230,6 +233,103 @@ export async function deleteUser(req, res) {
   });
 
   return ok(res, {}, "User deleted successfully");
+}
+
+export async function cancelInvite(req, res) {
+  const { uuid } = req.params;
+  assertUuid(uuid, "User UUID");
+
+  const [userRows] = await pool.query(
+    "SELECT id, uuid, email, full_name, is_verified FROM users WHERE uuid=? AND deleted_at IS NULL",
+    [uuid]
+  );
+  if (!userRows.length) throw new ApiError(404, "User not found");
+
+  const user = userRows[0];
+  if (user.is_verified === "yes") {
+    throw new ApiError(400, "Cannot cancel — this user has already accepted their invitation. Use deactivate instead.");
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    await conn.query(
+      "DELETE FROM invite_tokens WHERE user_uuid=? AND used_at IS NULL",
+      [user.uuid]
+    );
+    await conn.query(
+      "UPDATE users SET status='inactive' WHERE uuid=? AND is_verified='no'",
+      [user.uuid]
+    );
+    await conn.commit();
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+
+  logAudit({
+    ...getActorFromReq(req),
+    action: "user.invite_cancelled",
+    entityType: "user",
+    entityId: user.uuid,
+    details: { email: user.email, full_name: user.full_name },
+    req,
+  });
+
+  return ok(res, {}, "Invitation cancelled. User marked inactive.");
+}
+
+export async function removeUserPermanently(req, res) {
+  const { uuid } = req.params;
+  assertUuid(uuid, "User UUID");
+
+  const [userRows] = await pool.query(
+    "SELECT id, uuid, email, full_name, is_verified FROM users WHERE uuid=? AND deleted_at IS NULL",
+    [uuid]
+  );
+  if (!userRows.length) throw new ApiError(404, "User not found");
+
+  const user = userRows[0];
+  if (user.is_verified === "yes") {
+    throw new ApiError(400, "Cannot permanently remove an account that already accepted its invitation.");
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    await conn.query("DELETE FROM invite_tokens WHERE user_uuid=?", [user.uuid]);
+    await conn.query(
+      "UPDATE employees SET linked_user_uuid=NULL, is_platform_user='no' WHERE linked_user_uuid=?",
+      [user.uuid]
+    );
+    const [del] = await conn.query(
+      "DELETE FROM users WHERE uuid=? AND is_verified='no'",
+      [user.uuid]
+    );
+    if (del.affectedRows === 0) {
+      await conn.rollback();
+      throw new ApiError(409, "User could not be removed. The record may have changed concurrently.");
+    }
+    await conn.commit();
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+
+  logAudit({
+    ...getActorFromReq(req),
+    action: "user.removed_permanently",
+    entityType: "user",
+    entityId: user.uuid,
+    details: { email: user.email, full_name: user.full_name },
+    req,
+  });
+
+  return ok(res, {}, "User permanently removed");
 }
 
 export async function resendInvite(req, res) {

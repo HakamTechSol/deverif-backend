@@ -14,26 +14,30 @@ export const FREE_DAILY_REQUESTS = 1;
 
 /**
  * Resolve the current plan quota for an organization.
- * Returns { quota, plan_id, plan_uuid, plan_name }.
+ * Returns { quota, plan_id, plan_uuid, plan_name, is_free }.
  */
 export async function getOrgPlan(orgId) {
   const [[row]] = await pool.query(
     `SELECT o.subscription_plan_id AS plan_id,
             o.subscription_status AS subscription_status,
-            sp.uuid AS plan_uuid, sp.name AS plan_name, sp.daily_request_quota AS quota
+            sp.uuid AS plan_uuid, sp.name AS plan_name, sp.daily_request_quota AS quota,
+            sp.is_free AS is_free
      FROM organizations o
      LEFT JOIN subscription_plans sp ON sp.id = o.subscription_plan_id
      WHERE o.id = ?`,
     [orgId]
   );
-  // Paid quota only applies while the subscription is ACTIVE. Orgs without an
-  // active subscription still get the 1 FREE request/day (quota resolved to 0).
-  const isActive = row?.subscription_status === "active";
+  // Paid quota only applies while the subscription is ACTIVE. The FREE plan is
+  // paid-neutral: even though the org is "active", its quota stays 0 so the org
+  // keeps the 1 FREE request/day baseline. Orgs without an active subscription
+  // still get the 1 FREE request/day (quota resolved to 0).
+  const isPaidActive = row?.subscription_status === "active" && row?.is_free !== 1;
   return {
-    quota: isActive ? Number(row?.quota ?? 0) : 0,
+    quota: isPaidActive ? Number(row?.quota ?? 0) : 0,
     plan_id: row?.plan_id ?? null,
     plan_uuid: row?.plan_uuid ?? null,
     plan_name: row?.plan_name ?? null,
+    is_free: row?.is_free === 1,
   };
 }
 
@@ -93,17 +97,21 @@ export async function enforceRequestQuota(orgId) {
     // Lock the organization row + its plan.
     const [[org]] = await connection.query(
       `SELECT o.subscription_status AS subscription_status,
-              sp.daily_request_quota AS quota
+              sp.daily_request_quota AS quota,
+              sp.is_free AS is_free
        FROM organizations o
        LEFT JOIN subscription_plans sp ON sp.id = o.subscription_plan_id
        WHERE o.id = ?
        FOR UPDATE`,
       [orgId]
     );
-    // Paid quota applies only while the subscription is ACTIVE; otherwise there
-    // is no paid quota and only the 1 FREE request/day remains.
-    const isActive = org?.subscription_status === "active";
-    const quota = isActive ? Number(org?.quota ?? 0) : 0;
+    // Paid quota applies only while the subscription is ACTIVE — unless the org
+    // is on the FREE plan, whose quota stays 0 so the 1 FREE request/day baseline
+    // keeps working even though the subscription is "active".
+    const quota = org?.subscription_status === "active" && org?.is_free !== 1
+      ? Number(org?.quota ?? 0)
+      : 0;
+    const isActive = quota > 0;
 
     // Ensure today's usage bucket exists (created on first request of the day).
     await connection.query(

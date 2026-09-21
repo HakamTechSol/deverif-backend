@@ -8,6 +8,8 @@ import {
   createUserWithOrganization,
   updateUser,
   resendInvite,
+  cancelInvite,
+  removeUserPermanently,
 } from "../../controllers/admin/users.controller.js";
 
 const router = Router();
@@ -19,5 +21,7 @@ router.post("/", authAdminEnv, uploadUserFiles.fields([
 ]), asyncHandler(createUserWithOrganization));
 router.put("/:uuid", authAdminEnv, asyncHandler(updateUser));
 router.post("/:uuid/resend-invite", authAdminEnv, asyncHandler(resendInvite));
+router.delete("/:uuid/cancel-invite", authAdminEnv, asyncHandler(cancelInvite));
+router.delete("/:uuid", authAdminEnv, asyncHandler(removeUserPermanently));
 
 export default router;

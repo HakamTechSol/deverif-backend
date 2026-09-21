@@ -6,6 +6,7 @@ import { parsePagination, paginatedResponse } from "../../utils/pagination.js";
 import { sendExpiryReminderEmail } from "../../utils/mailer.js";
 import { createNotificationForOrgUsers } from "../notification.controller.js";
 import { logAudit, getActorFromReq } from "../../utils/auditLog.js";
+import { assignFreePlanToOrg } from "../../utils/freePlan.js";
 
 const ORG_SELECT = `organizations.id, organizations.uuid, organizations.name, organizations.verified,
   organizations.logo, ot.name AS organization_type, organizations.business_email,
@@ -16,7 +17,7 @@ const ORG_SELECT = `organizations.id, organizations.uuid, organizations.name, or
 
   const ORG_LIST_SELECT = `${ORG_SELECT},
   (SELECT COUNT(*) FROM users u WHERE u.organization = organizations.id AND u.deleted_at IS NULL) AS users_count,
-  (SELECT COUNT(*) FROM employees e WHERE e.organization_id = organizations.id) AS employees_count,
+  (SELECT COUNT(*) FROM employees e WHERE e.organization_id = organizations.id AND e.record_type='roster') AS employees_count,
   (SELECT COUNT(*) FROM verification_requests vr WHERE vr.issuing_organization_id = organizations.id) AS requests_count,
   (SELECT u.full_name FROM users u WHERE u.organization = organizations.id AND u.org_role = 'org_admin' AND u.deleted_at IS NULL ORDER BY u.id ASC LIMIT 1) AS admin_name,
   (SELECT u.email FROM users u WHERE u.organization = organizations.id AND u.org_role = 'org_admin' AND u.deleted_at IS NULL ORDER BY u.id ASC LIMIT 1) AS admin_email`;
@@ -97,6 +98,9 @@ export async function createOrganization(req, res) {
     "INSERT INTO organizations (name, verified, logo, organization_type, business_email) VALUES (?, 'yes', ?, ?, ?)",
     [name, logoPath, typeId, email]
   );
+
+  // Automatically subscribe new orgs to the Free plan (baseline experience).
+  await assignFreePlanToOrg(pool, result.insertId);
 
   const [rows] = await pool.query(`SELECT ${ORG_SELECT} FROM organizations ${ORG_TYPE_JOIN} WHERE organizations.id=?`, [result.insertId]);
 
