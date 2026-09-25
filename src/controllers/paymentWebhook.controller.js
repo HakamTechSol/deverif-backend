@@ -87,15 +87,6 @@ export async function handlePaymentWebhook(req, res) {
     return res.status(200).json({ success: true });
   }
 
-  if (checkout.status === "completed" && checkout.gateway_event_id === eventId) {
-    await logPaymentEvent({
-      message: `duplicate webhook for completed checkout ${checkout.uuid}`,
-      level: "info",
-      event_id: eventId,
-    });
-    return res.status(200).json({ success: true });
-  }
-
   const SUCCESS_TYPES = new Set(["payment.succeeded", "payment.completed", "payment.authorized"]);
   const FAILURE_TYPES = new Set(["payment.failed", "payment.rejected"]);
 

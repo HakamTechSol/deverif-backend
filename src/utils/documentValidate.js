@@ -1,5 +1,5 @@
 import ApiError from "./ApiError.js";
-import { validate } from "../services/documentService.js";
+import { validate, DocumentServiceError } from "../services/documentService.js";
 
 /**
  * Fail-safe corrupt-file guard for upload paths.
@@ -9,15 +9,20 @@ import { validate } from "../services/documentService.js";
  *
  *   - valid:false  -> throws ApiError(400, "File is corrupt or invalid")
  *
- * Transport failures (service down, timeout, HTTP error) FAIL OPEN: the
- * upload proceeds and the problem is logged, so a healthy user flow is
- * never blocked by an unhealthy validation dependency. DocumentServiceError
- * (the client's own transport error class) is recognized by name so this
- * util never masks a genuine 400 the service intentionally returns.
+ * Transport failures FAIL OPEN only when the service is genuinely unreachable
+ * (DocumentServiceError kind "timeout" or "connection"): the upload proceeds
+ * and a warning is logged, so a healthy user flow is never blocked by an
+ * unhealthy validation dependency.
+ *
+ * Every OTHER failure kind fails CLOSED so an unvalidated file is never
+ * silently accepted — the service responded but with a 4xx/5xx (kind "http"),
+ * a malformed/unexpected payload (kind "generic"), or any unexpected local
+ * error. Those reject the upload with a clear 400 message.
  *
  * @returns {Promise<object|null>} the /validate data ({valid, reason,
  *   file_type}) on success, or null when fail-opened. Never resolves to a
- *   value meaning "corrupt": on a definite corruption verdict we throw.
+ *   value meaning "corrupt" or "unvalidated": on a definite corruption verdict
+ *   or an unexpected validating failure we throw.
  */
 export async function assertDocumentValid(filePath) {
   try {
@@ -27,12 +32,21 @@ export async function assertDocumentValid(filePath) {
     }
     return data ?? { valid: true };
   } catch (error) {
-    if (error instanceof ApiError && error.name !== "DocumentServiceError") {
+    if (error instanceof ApiError && !(error instanceof DocumentServiceError)) {
       throw error;
     }
-    console.warn(
-      `[documentValidate] Document validation unavailable (kind=${error?.kind || "unknown"}), failing open for ${filePath}: ${error.message}`
+
+    const { kind } = error ?? {};
+    if (kind === "timeout" || kind === "connection") {
+      console.warn(
+        `[documentValidate] Document validation unavailable (kind=${kind}), failing open for ${filePath}: ${error.message}`
+      );
+      return null;
+    }
+
+    console.error(
+      `[documentValidate] Document validation failed closed (kind=${kind || "unknown"}) for ${filePath}: ${error.message}`
     );
-    return null;
+    throw new ApiError(400, "Document could not be validated — please try again.");
   }
 }

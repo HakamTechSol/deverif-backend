@@ -1,13 +1,6 @@
 import nodemailer from "nodemailer";
 import { pool } from "../config/db.js";
 
-// TEMP-DEBUG (remove after production SMTP diagnosis):
-console.log(
-  `[smtp-debug] transport config at module load: host=${process.env.SMTP_HOST || "(unset)"} port=${process.env.SMTP_PORT || "(unset)"} secure=${process.env.SMTP_SECURE ?? "(unset)"} user=${
-    process.env.SMTP_USER ? process.env.SMTP_USER.replace(/^(.).*(@.*)$/, "$1***$2") : "(unset)"
-  } pass_len=${(process.env.SMTP_PASS || "").trim().length} pass_raw_len=${(process.env.SMTP_PASS || "").length}`
-);
-
 function dumpSmtpError(label, err) {
   // TEMP-DEBUG (remove after diagnosis): full raw error incl. non-enumerable props
   const raw = {};
@@ -39,8 +32,48 @@ export function getMailerTransport() {
     host,
     port,
     secure: toBool(process.env.SMTP_SECURE, port === 465),
-    auth: { user, pass }
+    auth: { user, pass },
+    // Use the sending domain for EHLO + Message-ID instead of the machine's
+    // hostname (e.g. "DESKTOP-XXXX" / "ip-10-0-0-1"), which mail filters flag.
+    name: process.env.SMTP_EHLO_NAME || user.split("@")[1] || undefined,
+    hostname: process.env.SMTP_EHLO_NAME || user.split("@")[1] || undefined,
   });
+}
+
+function getFromAddress() {
+  const address = process.env.SMTP_FROM || process.env.SMTP_USER;
+  const name = process.env.MAIL_FROM_NAME || process.env.APP_NAME || "Dverif";
+  return `"${name}" <${address}>`;
+}
+
+function getReplyTo() {
+  return process.env.MAIL_REPLY_TO || process.env.SMTP_FROM || process.env.SMTP_USER;
+}
+
+// Headers for automated transactional mail.
+// Deliberately NO "List-Unsubscribe": unsubscribe headers on transactional
+// messages (OTP, password reset, invites) mark them as bulk mail and are a
+// common reason Gmail files them under Spam. "Auto-Submitted" correctly labels
+// the message as machine-generated so providers do not expect engagement.
+function transactionalHeaders() {
+  return {
+    "Auto-Submitted": "auto-generated",
+    "X-Auto-Response-Suppress": "All",
+  };
+}
+
+// Single source of truth for every outbound message so sender identity and
+// deliverability headers stay consistent across all notification types.
+function buildMail({ to, subject, text, html }) {
+  return {
+    from: getFromAddress(),
+    replyTo: getReplyTo(),
+    to,
+    subject,
+    text,
+    html,
+    headers: transactionalHeaders(),
+  };
 }
 
 /**
@@ -101,7 +134,7 @@ function emailTexts(lang) {
       : "If you did not request this code, you can safely ignore this email.",
 
     // Invite
-    inviteSubject: ur ? "آپ کو مدعو کیا گیا ہے" : "You're Invited to Join",
+    inviteSubject: ur ? "آپ کو مدعو کیا گیا ہے" : "Set up your Dverif account",
     inviteHeading: ur ? "آپ کو مدعو کیا گیا ہے!" : "You're invited!",
     inviteIntro: (name, appName) =>
       ur
@@ -116,7 +149,9 @@ function emailTexts(lang) {
       ? "اگر آپ کو اس دعوت کی توقع نہیں تھی تو آپ اس ای میل کو نظر انداز کر سکتے ہیں۔"
       : "If you did not expect this invitation, you can safely ignore this email.",
     inviteTextTitle: (appName) =>
-      ur ? `آپ کو ${appName} میں شامل ہونے کی دعوت دی گئی ہے!` : `You're invited to join ${appName}!`,
+      ur
+        ? `آپ کو ${appName} میں شامل ہونے کی دعوت دی گئی ہے!`
+        : `Set up your ${appName} account`,
     inviteTextIntro: (name, appName) =>
       ur
         ? `${name ? `${name} نے` : "کسی نے"} آپ کو ${appName} دستاویز کی تصدیق کے نیٹ ورک میں شامل ہونے کی دعوت دی ہے۔`
@@ -217,11 +252,9 @@ export async function sendPasswordResetEmail({ to, resetLink, lang = "en" }) {
     throw new Error("SMTP is not configured. Please set SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS");
   }
 
-  const from = process.env.SMTP_FROM || process.env.SMTP_USER;
   const appName = process.env.APP_NAME || "Dverif";
   const expiry = process.env.RESET_PASSWORD_EXPIRES_IN || "15m";
   const T = emailTexts(lang);
-
   const bodyHtml = `
     <tr><td style="padding:40px;">
       <h2 style="margin:0 0 8px;color:#1a1a2e;font-size:20px;font-weight:600;">${T.resetHeading}</h2>
@@ -256,19 +289,14 @@ export async function sendPasswordResetEmail({ to, resetLink, lang = "en" }) {
   ].join("\n");
 
   try {
-    const info = await transporter.sendMail({
-      from: `"${appName}" <${from}>`,
-      to,
-      subject: `${appName} — ${T.resetSubject}`,
-      text,
-      html: emailWrapper(bodyHtml, lang),
-      headers: {
-        "X-Mailer": "Dverif",
-        "List-Unsubscribe": `<mailto:${from}?subject=unsubscribe>`,
-      },
-    });
-    // TEMP-DEBUG (remove after diagnosis):
-    console.log(`[smtp-debug] reset email ACCEPTED by SMTP server: response="${info.response}" messageId=${info.messageId} accepted=${JSON.stringify(info.accepted)} rejected=${JSON.stringify(info.rejected)}`);
+    const info = await transporter.sendMail(
+      buildMail({
+        to,
+        subject: `${appName} — ${T.resetSubject}`,
+        text,
+        html: emailWrapper(bodyHtml, lang),
+      })
+    );
     return info;
   } catch (err) {
     dumpSmtpError("sendPasswordResetEmail", err);
@@ -282,8 +310,6 @@ export async function sendLoginOtpEmail({ to, otp, lang = "en" }) {
     throw new Error("SMTP is not configured. Please set SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS");
   }
 
-  const from = process.env.SMTP_FROM || process.env.SMTP_USER;
-  const appName = process.env.APP_NAME || "Dverif";
   const T = emailTexts(lang);
 
   const bodyHtml = `
@@ -308,17 +334,14 @@ export async function sendLoginOtpEmail({ to, otp, lang = "en" }) {
     T.otpTextIgnore,
   ].join("\n");
 
-  await transporter.sendMail({
-    from: `"${appName}" <${from}>`,
-    to,
-    subject: T.otpSubject,
-    text,
-    html: emailWrapper(bodyHtml, lang),
-    headers: {
-      "X-Mailer": "Dverif",
-      "List-Unsubscribe": `<mailto:${from}?subject=unsubscribe>`,
-    },
-  });
+  await transporter.sendMail(
+    buildMail({
+      to,
+      subject: T.otpSubject,
+      text,
+      html: emailWrapper(bodyHtml, lang),
+    })
+  );
 }
 
 export async function sendInviteEmail({ to, setLink, invitedByName, lang = "en" }) {
@@ -327,7 +350,6 @@ export async function sendInviteEmail({ to, setLink, invitedByName, lang = "en" 
     throw new Error("SMTP is not configured. Please set SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS");
   }
 
-  const from = process.env.SMTP_FROM || process.env.SMTP_USER;
   const appName = process.env.APP_NAME || "Dverif";
   const expiryHours = process.env.INVITE_EXPIRES_IN_HOURS || "72";
   const T = emailTexts(lang);
@@ -366,17 +388,14 @@ export async function sendInviteEmail({ to, setLink, invitedByName, lang = "en" 
     T.inviteTextIgnore,
   ].join("\n");
 
-  await transporter.sendMail({
-    from: `"${appName}" <${from}>`,
-    to,
-    subject: `${appName} — ${T.inviteSubject}`,
-    text,
-    html: emailWrapper(bodyHtml, lang),
-    headers: {
-      "X-Mailer": "Dverif",
-      "List-Unsubscribe": `<mailto:${from}?subject=unsubscribe>`,
-    },
-  });
+  await transporter.sendMail(
+    buildMail({
+      to,
+      subject: `${appName} — ${T.inviteSubject}`,
+      text,
+      html: emailWrapper(bodyHtml, lang),
+    })
+  );
 }
 
 export async function sendVerificationResultEmail({ to, documentType, portalLink, lang = "en" }) {
@@ -386,7 +405,6 @@ export async function sendVerificationResultEmail({ to, documentType, portalLink
     return;
   }
 
-  const from = process.env.SMTP_FROM || process.env.SMTP_USER;
   const appName = process.env.APP_NAME || "Dverif";
   const T = emailTexts(lang);
 
@@ -421,17 +439,14 @@ export async function sendVerificationResultEmail({ to, documentType, portalLink
     portalLink,
   ].join("\n");
 
-  await transporter.sendMail({
-    from: `"${appName}" <${from}>`,
-    to,
-    subject: `${appName} — ${T.verifiedSubject}`,
-    text,
-    html: emailWrapper(bodyHtml, lang),
-    headers: {
-      "X-Mailer": "Dverif",
-      "List-Unsubscribe": `<mailto:${from}?subject=unsubscribe>`,
-    },
-  });
+  await transporter.sendMail(
+    buildMail({
+      to,
+      subject: `${appName} — ${T.verifiedSubject}`,
+      text,
+      html: emailWrapper(bodyHtml, lang),
+    })
+  );
 }
 
 // Sends the verification-result email to the organization the request CAME FROM:
@@ -481,7 +496,6 @@ export async function sendLeadNotificationEmail({ type, data }) {
     return;
   }
 
-  const from = process.env.SMTP_FROM || process.env.SMTP_USER;
   const appName = process.env.APP_NAME || "Dverif";
 
   const recipientsEnv = (process.env.LEAD_NOTIFICATION_RECIPIENTS || "")
@@ -526,17 +540,14 @@ export async function sendLeadNotificationEmail({ type, data }) {
     "Review this lead in the admin panel.",
   ].join("\n");
 
-  await transporter.sendMail({
-    from: `"${appName}" <${from}>`,
-    to: recipients,
-    subject: `${appName} — ${subjectLine}`,
-    text,
-    html: emailWrapper(bodyHtml),
-    headers: {
-      "X-Mailer": "Dverif",
-      "List-Unsubscribe": `<mailto:${from}?subject=unsubscribe>`,
-    },
-  });
+  await transporter.sendMail(
+    buildMail({
+      to: recipients,
+      subject: `${appName} — ${subjectLine}`,
+      text,
+      html: emailWrapper(bodyHtml),
+    })
+  );
 }
 
 export async function sendExpiryReminderEmail({ to, orgName, type, daysLeft, hoursLeft }) {
@@ -552,7 +563,7 @@ export async function sendExpiryReminderEmail({ to, orgName, type, daysLeft, hou
   const isUrgent = type === "2h";
   const recipients = Array.isArray(to) ? to : [to || from];
   const timeText = isUrgent ? `${hoursLeft} hour(s)` : `${daysLeft} day(s)`;
-  const subjectPrefix = isUrgent ? "URGENT:" : "";
+  const subjectPrefix = isUrgent ? "Action needed:" : "";
   const accentColor = isUrgent ? "#dc2626" : "#d97706";
 
   const bodyHtml = `
@@ -582,17 +593,14 @@ export async function sendExpiryReminderEmail({ to, orgName, type, daysLeft, hou
     `Please contact your administrator to renew the subscription.`,
   ].join("\n");
 
-  await transporter.sendMail({
-    from: `"${appName}" <${from}>`,
-    to: recipients.join(", "),
-    subject: `${subjectPrefix} ${appName} — Subscription Expiring for ${orgName}`,
-    text,
-    html: emailWrapper(bodyHtml),
-    headers: {
-      "X-Mailer": "Dverif",
-      "List-Unsubscribe": `<mailto:${from}?subject=unsubscribe>`,
-    },
-  });
+  await transporter.sendMail(
+    buildMail({
+      to: recipients.join(", "),
+      subject: `${subjectPrefix} ${appName} — Subscription Expiring for ${orgName}`,
+      text,
+      html: emailWrapper(bodyHtml),
+    })
+  );
 }
 
 export async function sendSlaReminderEmail({ to, orgName, documentType, lang = "en" }) {
@@ -602,7 +610,6 @@ export async function sendSlaReminderEmail({ to, orgName, documentType, lang = "
     return;
   }
 
-  const from = process.env.SMTP_FROM || process.env.SMTP_USER;
   const appName = process.env.APP_NAME || "Dverif";
   const T = emailTexts(lang);
 
@@ -632,15 +639,12 @@ export async function sendSlaReminderEmail({ to, orgName, documentType, lang = "
     T.slaTextAction,
   ].join("\n");
 
-  await transporter.sendMail({
-    from: `"${appName}" <${from}>`,
-    to,
-    subject: `${appName} — ${T.slaSubject(orgName)}`,
-    text,
-    html: emailWrapper(bodyHtml, lang),
-    headers: {
-      "X-Mailer": "Dverif",
-      "List-Unsubscribe": `<mailto:${from}?subject=unsubscribe>`,
-    },
-  });
+  await transporter.sendMail(
+    buildMail({
+      to,
+      subject: `${appName} — ${T.slaSubject(orgName)}`,
+      text,
+      html: emailWrapper(bodyHtml, lang),
+    })
+  );
 }

@@ -52,7 +52,7 @@ export async function userDashboardStats(req, res) {
     under_review_requests: underReviewReqsRows[0].total,
     organizations_progress: totalOrgs > 0 ? Math.round((verifiedOrgsRows[0].total / totalOrgs) * 100) : 0,
     requests_progress: totalReqs > 0 ? Math.round((verifiedReqsRows[0].total / totalReqs) * 100) : 0,
-    unmatched_progress: totalReqs > 0 ? Math.round(((totalReqs - adminRequestsCountRows[0].total) / totalReqs) * 100) : 100,
+    unmatched_progress: totalReqs > 0 ? Math.round(((totalReqs - adminRequestsCountRows[0].total) / totalReqs) * 100) : 0,
   }, "User dashboard stats");
 }
 
@@ -106,7 +106,7 @@ export async function adminDashboardStats(req, res) {
     users_progress: totalUsers > 0 ? Math.round((activeUsersRows[0].total / totalUsers) * 100) : 0,
     organizations_progress: totalOrgs > 0 ? Math.round((verifiedOrgsRows[0].total / totalOrgs) * 100) : 0,
     requests_progress: totalReqs > 0 ? Math.round((verifiedReqsRows[0].total / totalReqs) * 100) : 0,
-    unmatched_progress: totalReqs > 0 ? Math.round(((totalReqs - unmatched) / totalReqs) * 100) : 100,
+    unmatched_progress: totalReqs > 0 ? Math.round(((totalReqs - unmatched) / totalReqs) * 100) : 0,
     upcoming_expirations: await getUpcomingExpirations(),
   }, "Admin dashboard stats");
 }

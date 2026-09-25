@@ -96,13 +96,14 @@ describe("bcrypt hash rounds", () => {
 describe("forgotPassword", () => {
   const USER_UUID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 
-  it("returns generic success even if user does not exist (no enumeration)", async () => {
+  it("returns 404 'not registered' when the email does not exist", async () => {
     pool.query.mockResolvedValueOnce([[]]);
 
     const req = mockReq({ body: { email: "noone@test.com" } });
     const res = mockRes();
-    await forgotPassword(req, res);
-    expect(res.status).toHaveBeenCalledWith(200);
+    await expect(forgotPassword(req, res)).rejects.toMatchObject({
+      statusCode: 404,
+    });
   });
 
   it("generates a token and sends email for valid active user", async () => {

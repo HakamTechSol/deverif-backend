@@ -16,12 +16,15 @@ export async function createCheckout(req, res) {
   const normalizedPurpose = purpose === "change_plan" ? "change_plan" : "subscribe";
 
   const [[plan]] = await pool.query(
-    `SELECT id, uuid, name, monthly_price, daily_request_quota, billing_period
+    `SELECT id, uuid, name, monthly_price, daily_request_quota, billing_period, is_free
      FROM subscription_plans
      WHERE uuid=? AND is_custom=0 AND is_public=1`,
     [plan_uuid]
   );
   if (!plan) throw new ApiError(404, "Plan not found or not available for self-subscription");
+  if (plan.is_free === 1) {
+    throw new ApiError(400, "The free plan is assigned automatically and cannot be purchased or renewed");
+  }
 
   const result = await createOrgCheckout({
     organizationId: req.user.organization,

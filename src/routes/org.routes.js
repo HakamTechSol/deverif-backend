@@ -13,6 +13,7 @@ import {
   updateEmployee,
   deleteEmployee,
   resendEmployeeInvite,
+  promoteEmployeeToPlatformUsers,
   archiveReference,
   createReference,
 } from "../controllers/admin/employees.controller.js";
@@ -117,6 +118,9 @@ router.get("/employees/:uuid", empMgmt, asyncHandler(getEmployee));
 router.put("/employees/:uuid", empMgmt, asyncHandler(updateEmployee));
 router.delete("/employees/:uuid", empMgmtOwner, asyncHandler(deleteEmployee));
 router.post("/employees/:uuid/resend-invite", userMgmtStaff, asyncHandler(resendEmployeeInvite));
+// Bulk "Add as Platform User": requires user_management module (creates real
+// logins + invites), so it sits under the userMgmtStaff gate.
+router.post("/employees/promote", userMgmtStaff, asyncHandler(promoteEmployeeToPlatformUsers));
 
 // Reference records (ex-employees / learned_reference): create a standalone
 // record directly, or archive an existing roster row into the reference list.

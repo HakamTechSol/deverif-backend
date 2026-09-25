@@ -28,13 +28,21 @@ export async function recordSubscriptionPayment(
   const numericAmount = Number(amount);
   if (!Number.isFinite(numericAmount) || numericAmount <= 0) return null;
 
+  // Payment rows are deduplicated by transaction_reference (UNIQUE key
+  // uq_payment_txn_ref). A missing reference must never be papered over with a
+  // generated PAY-<now> value — that would falsely look unique and defeat the
+  // dedup boundary — so an empty reference is rejected outright.
+  const reference = typeof transactionReference === "string" ? transactionReference.trim() : "";
+  if (!reference) {
+    throw new ApiError(400, "Transaction reference is required to record a payment");
+  }
+
   const [userRows] = await connection.query(
     "SELECT id, organization FROM users WHERE organization=? ORDER BY created_at ASC LIMIT 1",
     [organizationId]
   );
   if (!userRows.length) return null;
 
-  const fallbackReference = `PAY-${Date.now()}`;
   const fallbackPurpose = "Org subscription";
 
   const [result] = await connection.query(
@@ -45,7 +53,7 @@ export async function recordSubscriptionPayment(
       userRows[0].organization,
       numericAmount,
       method,
-      transactionReference || fallbackReference,
+      reference,
       purpose || fallbackPurpose,
     ]
   );
@@ -63,6 +71,16 @@ export async function finalizeSuccessfulCheckout({ checkoutId, eventId }) {
     );
     if (!checkoutRows.length) throw new ApiError(404, "Checkout not found");
     const checkout = checkoutRows[0];
+
+    // Serialize on the organization row BEFORE deciding whether this delivery
+    // was already processed, so a concurrent duplicate webhook — or a competing
+    // activation from the manual admin path for the same org — queues behind
+    // the first commit instead of both extending the subscription.
+    const [[org]] = await connection.query(
+      "SELECT id FROM organizations WHERE id=? FOR UPDATE",
+      [checkout.organization_id]
+    );
+    if (!org) throw new ApiError(404, "Organization for checkout not found");
 
     if (checkout.status === "completed") {
       await connection.commit();
@@ -88,13 +106,36 @@ export async function finalizeSuccessfulCheckout({ checkoutId, eventId }) {
       [eventId, checkoutId]
     );
 
-    await recordSubscriptionPayment(connection, {
-      organizationId: checkout.organization_id,
-      amount: Number(plan.monthly_price),
-      transactionReference: `SFPY-${plan.name.replace(/\s+/g, "-").toUpperCase()}-${Date.now()}`,
-      method: "safepay",
-      purpose: `Org subscription: ${plan.name}`,
-    });
+    // The Safepay tracker is the stable, replay-stable gateway reference for
+    // this payment, so every re-delivery of the same webhook maps to the same
+    // transaction_reference (UNIQUE uq_payment_txn_ref). A delivery without a
+    // reference is rejected instead of being assigned a unique-looking
+    // generated value.
+    const transactionReference =
+      typeof checkout.gateway_tracker_id === "string" ? checkout.gateway_tracker_id.trim() : "";
+    if (!transactionReference) {
+      throw new ApiError(400, "Transaction reference missing from payment webhook");
+    }
+
+    try {
+      await recordSubscriptionPayment(connection, {
+        organizationId: checkout.organization_id,
+        amount: Number(plan.monthly_price),
+        transactionReference,
+        method: "safepay",
+        purpose: `Org subscription: ${plan.name}`,
+      });
+    } catch (error) {
+      // The payment row already exists (UNIQUE uq_payment_txn_ref): a different
+      // concurrent delivery recorded this payment first. Treat it as already
+      // processed and roll back THIS attempt's subscription extension so it is
+      // never extended a second time.
+      if (error?.errno === 1062 || error?.code === "ER_DUP_ENTRY") {
+        await connection.rollback();
+        return { already_processed: true, subscription: null };
+      }
+      throw error;
+    }
 
     // A paid PLAN CHANGE grants the org a fresh daily quota starting today
     // under the new plan — reset today's usage bucket to zero in the same

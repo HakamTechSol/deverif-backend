@@ -75,11 +75,14 @@ export async function forgotPassword(req, res) {
     [email]
   );
 
-  if (!rows.length || rows[0].status !== "active") {
-    return ok(res, {}, "If an account exists with this email, a reset link has been generated");
+  if (!rows.length) {
+    throw new ApiError(404, "This email is not registered in this system");
   }
 
   const user = rows[0];
+  if (user.status !== "active") {
+    throw new ApiError(400, "This account is not active. Contact your administrator to regain access.");
+  }
 
   // Invalidate all previous unused tokens for this user
   await pool.query(
@@ -178,6 +181,25 @@ export async function resetPassword(req, res) {
   return ok(res, {}, "Password reset successful");
 }
 
+export async function validateInviteToken(req, res) {
+  const token = req.query.token || req.body?.token;
+  if (!token) throw new ApiError(400, "Token is required");
+
+  const tokenHash = crypto.createHash("sha256").update(String(token)).digest("hex");
+
+  const [rows] = await pool.query(
+    "SELECT used_at, expires_at FROM invite_tokens WHERE token_hash=?",
+    [tokenHash]
+  );
+
+  if (!rows.length) return ok(res, { valid: false, reason: "not_found" });
+  const record = rows[0];
+  if (record.used_at) return ok(res, { valid: false, reason: "used" });
+  if (new Date(record.expires_at) < new Date()) return ok(res, { valid: false, reason: "expired" });
+
+  return ok(res, { valid: true });
+}
+
 export async function setPassword(req, res) {
   const { token, newPassword } = req.body;
   if (!token || !newPassword) throw new ApiError(400, "Token and newPassword are required");
@@ -212,7 +234,10 @@ export async function setPassword(req, res) {
   try {
     await conn.beginTransaction();
 
-    await conn.query("UPDATE users SET password=?, status='active' WHERE id=?", [hashed, user.id]);
+    await conn.query(
+      "UPDATE users SET password=?, status='active', is_verified='yes' WHERE id=?",
+      [hashed, user.id]
+    );
 
     await conn.query(
       "UPDATE invite_tokens SET used_at=NOW() WHERE user_uuid=? AND used_at IS NULL",

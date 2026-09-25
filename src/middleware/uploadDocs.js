@@ -15,6 +15,22 @@ const storage = multer.diskStorage({
 });
 
 function fileFilter(req, file, cb) {
+  const ok = isDocumentAllowed(file.originalname, file.mimetype);
+  if (ok) return cb(null, true);
+  const err = new Error("Unsupported file type. Allowed: PDF, images, Word, Excel, TXT, CSV, ZIP");
+  err.statusCode = 400;
+  cb(err);
+}
+
+/**
+ * Allow-list decision for verification-document uploads. Require BOTH a
+ * recognized extension AND a plausible mime — a client can lie about either
+ * one, so accepting on extension alone lets HTML/SVG through as
+ * application/pdf, and accepting on mime alone lets x.html through as
+ * application/pdf. Generic browser blob markers (application/octet-stream)
+ * are tolerated only for allow-listed extensions.
+ */
+export function isDocumentAllowed(filename, mimetype) {
   const allowedMime = [
     "application/pdf",
     "image/jpeg", "image/png", "image/webp", "image/gif", "image/bmp",
@@ -29,12 +45,9 @@ function fileFilter(req, file, cb) {
     ".pdf", ".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp",
     ".doc", ".docx", ".xls", ".xlsx", ".txt", ".csv", ".zip",
   ];
-  const ext = path.extname(file.originalname || "").toLowerCase();
-  // Accept by extension (reliable) or by a known mime; allow empty mime if ext matches.
-  if (allowedExt.includes(ext) || (file.mimetype && allowedMime.includes(file.mimetype))) {
-    return cb(null, true);
-  }
-  cb(new Error("Unsupported file type. Allowed: PDF, images, Word, Excel, TXT, CSV, ZIP"));
+  const ext = path.extname(filename || "").toLowerCase();
+  return allowedExt.includes(ext) && Boolean(mimetype) &&
+    (allowedMime.includes(mimetype) || mimetype === "application/octet-stream");
 }
 
 export const uploadDocs = multer({

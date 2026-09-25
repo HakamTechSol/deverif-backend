@@ -34,21 +34,19 @@ async function finalizeSuccessfulPayment(callbackResult) {
     throw new ApiError(400, "Payment amount does not match selected plan");
   }
 
-  const transactionReference = callbackResult.transactionReference || `PAY-${Date.now()}`;
+  // transaction_reference is the deduplication identity for a payment row
+  // (UNIQUE uq_payment_txn_ref). A reference-less callback is rejected rather
+  // than assigned a generated PAY-<now> value that would falsely look unique.
+  const transactionReference =
+    typeof callbackResult.transactionReference === "string" ? callbackResult.transactionReference.trim() : "";
+  if (!transactionReference) {
+    throw new ApiError(400, "Transaction reference missing from payment callback");
+  }
+
   const connection = await pool.getConnection();
 
   try {
     await connection.beginTransaction();
-
-    const [existingPayments] = await connection.query(
-      "SELECT * FROM payment WHERE transaction_reference=? LIMIT 1",
-      [transactionReference]
-    );
-
-    if (existingPayments.length) {
-      await connection.commit();
-      return { payment: existingPayments[0], already_recorded: true, payment_meta: paymentMeta };
-    }
 
     const [userRows] = await connection.query(
       `SELECT id, organization
@@ -85,6 +83,20 @@ async function finalizeSuccessfulPayment(callbackResult) {
     }
     const org = orgRows[0];
 
+    // "Already processed?" is checked AFTER acquiring the organization lock, so
+    // concurrent duplicate callbacks for the same reference serialize behind the
+    // first commit instead of racing past the lookup and double-extending the
+    // subscription.
+    const [existingPayments] = await connection.query(
+      "SELECT * FROM payment WHERE transaction_reference=? LIMIT 1",
+      [transactionReference]
+    );
+
+    if (existingPayments.length) {
+      await connection.commit();
+      return { payment: existingPayments[0], already_recorded: true, payment_meta: paymentMeta };
+    }
+
     const nextExpiry = calculatePlanExpiry(org.subscription_expiry, expectedPlan.duration_days);
 
     // Assign a plan row when the purchasable plan matches one by name
@@ -106,20 +118,37 @@ async function finalizeSuccessfulPayment(callbackResult) {
       [org.subscription_status !== "active", formatSqlDateTime(nextExpiry), planId, organizationId]
     );
 
-    const [insertResult] = await connection.query(
-      `INSERT INTO payment (user_id, organization_id, amount, payment_method, transaction_reference, paid_at, purpose)
-       VALUES (?, ?, ?, ?, ?, NOW(), ?)`,
-      [
-        userRows[0].id,
-        organizationId,
-        expectedPlan.amount,
-        callbackResult.provider,
-        transactionReference,
-        paymentMeta.purpose
-      ]
-    );
+    let insertId;
+    try {
+      const [insertResult] = await connection.query(
+        `INSERT INTO payment (user_id, organization_id, amount, payment_method, transaction_reference, paid_at, purpose)
+         VALUES (?, ?, ?, ?, ?, NOW(), ?)`,
+        [
+          userRows[0].id,
+          organizationId,
+          expectedPlan.amount,
+          callbackResult.provider,
+          transactionReference,
+          paymentMeta.purpose
+        ]
+      );
+      insertId = insertResult.insertId;
+    } catch (error) {
+      // UNIQUE uq_payment_txn_ref: a concurrent delivery recorded this payment
+      // first. Roll back THIS attempt's subscription extension so the payment is
+      // recorded exactly once, and respond idempotently.
+      if (error?.errno === 1062 || error?.code === "ER_DUP_ENTRY") {
+        await connection.rollback();
+        const [duplicateRows] = await pool.query(
+          "SELECT * FROM payment WHERE transaction_reference=? LIMIT 1",
+          [transactionReference]
+        );
+        return { payment: duplicateRows[0] ?? null, already_recorded: true, payment_meta: paymentMeta };
+      }
+      throw error;
+    }
 
-    const [paymentRows] = await connection.query("SELECT * FROM payment WHERE id=?", [insertResult.insertId]);
+    const [paymentRows] = await connection.query("SELECT * FROM payment WHERE id=?", [insertId]);
 
     await connection.commit();
 

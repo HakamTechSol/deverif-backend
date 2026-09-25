@@ -26,6 +26,7 @@ import adminAuditLog from "./admin/auditLog.routes.js";
 import dashboardRoutes from "./dashboard.routes.js";
 import orgRoutes from "./org.routes.js";
 import verifyRoutes from "./verify.routes.js";
+import documentsRoutes from "./documents.routes.js";
 import leavesRoutes from "./leaves.routes.js";
 import attendanceRoutes from "./attendance.routes.js";
 import salarySelfRoutes from "./salary.routes.js";
@@ -74,6 +75,8 @@ router.use("/auth", refreshAuth);
 router.use("/auth/user", userAuth);
 router.use("/users", userRoutes);
 router.use("/verification-requests", verificationRoutes);
+// Authenticated document downloads (ownership-checked; replaces the old public /uploads static mount).
+router.use("/documents", documentsRoutes);
 router.use("/payment", paymentRoutes);
 router.use("/notifications", notificationRoutes);
 router.use("/leaves", leavesRoutes);

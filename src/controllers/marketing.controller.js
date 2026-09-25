@@ -9,10 +9,10 @@ import { normalizePlanFeatures } from "../utils/planFeatures.js";
 export async function listPublicPlans(req, res) {
   const [rows] = await pool.query(
     `SELECT uuid, name, monthly_price, daily_request_quota, description, features,
-            billing_period, is_recommended
+            billing_period, is_recommended, is_free
      FROM subscription_plans
      WHERE is_public = 1 AND is_custom = 0
-     ORDER BY is_recommended DESC, monthly_price ASC, id ASC`
+     ORDER BY monthly_price ASC, id ASC`
   );
   const plans = rows.map((r) => ({
     uuid: r.uuid,
@@ -23,6 +23,7 @@ export async function listPublicPlans(req, res) {
     features: normalizePlanFeatures(r.features),
     billing_period: r.billing_period,
     is_recommended: Number(r.is_recommended ?? 0),
+    is_free: Number(r.is_free ?? 0),
   }));
   return ok(res, { items: plans }, "Public plans");
 }

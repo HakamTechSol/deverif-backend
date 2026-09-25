@@ -37,7 +37,7 @@ export class DocumentServiceError extends ApiError {
   }
 }
 
-async function request(endpoint, fields) {
+async function request(endpoint, files, textFields = {}) {
   const serviceKey = apiKey();
   if (!serviceKey) {
     throw new DocumentServiceError(
@@ -47,12 +47,17 @@ async function request(endpoint, fields) {
   }
 
   const form = new FormData();
-  for (const [field, filePath] of Object.entries(fields)) {
+  for (const [field, filePath] of Object.entries(files)) {
     if (!fs.existsSync(filePath)) {
       throw new DocumentServiceError(400, `File not found: ${filePath}`);
     }
     const blob = new Blob([fs.readFileSync(filePath)], { type: "application/octet-stream" });
     form.append(field, blob, path.basename(filePath));
+  }
+  for (const [field, value] of Object.entries(textFields)) {
+    if (value !== undefined && value !== null && value !== "") {
+      form.append(field, String(value));
+    }
   }
 
   const controller = new AbortController();
@@ -110,12 +115,33 @@ export function validate(filePath) {
   return request("/validate", { file: filePath });
 }
 
-/** OCR identity extraction. UseResult: data.name, data.cnic (may be null). */
-export function ocrExtract(filePath) {
-  return request("/ocr/extract", { file: filePath });
+/**
+ * Schema-driven OCR identity extraction.
+ * UseResult: data.document_type (canonical key) and data.fields, where each
+ * canonical field is {value, confidence: "high"|"low"|"not_visible"}.
+ * documentType is the verification request's document_type; unknown or omitted
+ * types fall back to the generic (name + cnic) schema.
+ */
+export function ocrExtract(filePath, documentType) {
+  return request(
+    "/ocr/extract",
+    { file: filePath },
+    documentType ? { document_type: documentType } : {}
+  );
 }
 
-/** Compare two documents. UseResult: data.match, data.confidence, data.reasons. */
-export function match(pathA, pathB) {
-  return request("/match", { file_a: pathA, file_b: pathB });
+/**
+ * Compare two documents (canonical-field only). UseResult: data.match,
+ * data.confidence, data.reasons. documentTypeA/documentTypeB select each
+ * file's field schema.
+ */
+export function match(pathA, pathB, { documentTypeA, documentTypeB } = {}) {
+  return request(
+    "/match",
+    { file_a: pathA, file_b: pathB },
+    {
+      document_type_a: documentTypeA,
+      document_type_b: documentTypeB,
+    }
+  );
 }

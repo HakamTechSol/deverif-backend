@@ -66,54 +66,14 @@ export async function runAutoMatchChecks({ orgId = null, requestId = null } = {}
 }
 
 async function processOne(vr) {
-  const submittedPath = path.join(DOCS_DIR, path.basename(vr.document_path || ""));
-  if (!fs.existsSync(submittedPath)) {
-    console.warn(`Auto-match skipped: submitted file missing for request ${vr.uuid}`);
+  const confidence = await computeMatchConfidence(vr);
+  if (confidence === null) {
+    // File missing, reference gone, or the service is down: leave
+    // match_status='not_attempted' so the request stays reviewable.
     return;
   }
 
-  const [refRows] = await pool.query(
-    "SELECT document_hash, file_path FROM employee_documents WHERE id=?",
-    [vr.matched_employee_document_id]
-  );
-  if (!refRows.length) {
-    console.warn(`Auto-match skipped: reference document ${vr.matched_employee_document_id} no longer exists`);
-    return;
-  }
-  const ref = refRows[0];
-  const refPath = path.join(DOCS_DIR, path.basename(ref.file_path || ""));
-  if (!fs.existsSync(refPath)) {
-    console.warn(`Auto-match skipped: reference file missing for document ${vr.matched_employee_document_id}`);
-    return;
-  }
-
-  // 1. Exact-hash fast path — identical file, skip OCR entirely.
-  let confidence;
-  if (vr.document_hash && ref.document_hash && vr.document_hash === ref.document_hash) {
-    confidence = 100;
-  } else {
-    // 2. Fuzzy match via the document service (OCR extraction + scoring).
-    try {
-      const { data } = await matchDocuments(submittedPath, refPath);
-      confidence = round2(data?.confidence);
-    } catch (e) {
-      // 4. Service down/timeout/bad payload: leave match_status='not_attempted'
-      // so the request falls through to normal manual review, never blocked.
-      if (e instanceof DocumentServiceError) {
-        console.warn(`Auto-match deferred for request ${vr.uuid} (${e.kind || "service"}): ${e.message}`);
-      } else {
-        console.error(`Auto-match unexpected error for request ${vr.uuid}:`, e.message);
-      }
-      return;
-    }
-  }
-
-  if (!Number.isFinite(confidence)) {
-    console.warn(`Auto-match: invalid confidence for request ${vr.uuid}, deferring`);
-    return;
-  }
-
-  // 3. Decision tree.
+  // Decision tree.
   if (confidence >= AUTO_APPROVE_THRESHOLD) {
     await autoApprove(vr, confidence);
   } else {
@@ -129,7 +89,70 @@ async function processOne(vr) {
   }
 }
 
-async function autoApprove(vr, confidence) {
+/**
+ * Compute the document match confidence for a request against its staged
+ * reference employee document. Fast path skips OCR when the submitted hash
+ * equals the reference hash (confidence=100). Otherwise it runs the Python
+ * document service's fuzzy match.
+ * Returns null when it must defer (missing file, missing reference, service
+ * down/timeout, non-finite score) — never throws.
+ */
+export async function computeMatchConfidence(vr) {
+  const submittedPath = path.join(DOCS_DIR, path.basename(vr.document_path || ""));
+  if (!fs.existsSync(submittedPath)) {
+    console.warn(`Auto-match skipped: submitted file missing for request ${vr.uuid}`);
+    return null;
+  }
+
+  const [refRows] = await pool.query(
+    "SELECT document_hash, file_path, document_type FROM employee_documents WHERE id=?",
+    [vr.matched_employee_document_id]
+  );
+  if (!refRows.length) {
+    console.warn(`Auto-match skipped: reference document ${vr.matched_employee_document_id} no longer exists`);
+    return null;
+  }
+  const ref = refRows[0];
+  const refPath = path.join(DOCS_DIR, path.basename(ref.file_path || ""));
+  if (!fs.existsSync(refPath)) {
+    console.warn(`Auto-match skipped: reference file missing for document ${vr.matched_employee_document_id}`);
+    return null;
+  }
+
+  // 1. Exact-hash fast path — identical file, skip OCR entirely.
+  let confidence;
+  if (vr.document_hash && ref.document_hash && vr.document_hash === ref.document_hash) {
+    confidence = 100;
+  } else {
+    // 2. Canonical-field match via the document service (schema-driven OCR
+    //    extraction + scoring, using each file's own document type).
+    try {
+      const { data } = await matchDocuments(submittedPath, refPath, {
+        documentTypeA: vr.document_type,
+        documentTypeB: ref.document_type,
+      });
+      confidence = round2(data?.confidence);
+    } catch (e) {
+      // 4. Service down/timeout/bad payload: leave match_status='not_attempted'
+      // so the request falls through to normal manual review, never blocked.
+      if (e instanceof DocumentServiceError) {
+        console.warn(`Auto-match deferred for request ${vr.uuid} (${e.kind || "service"}): ${e.message}`);
+      } else {
+        console.error(`Auto-match unexpected error for request ${vr.uuid}:`, e.message);
+      }
+      return null;
+    }
+  }
+
+  if (!Number.isFinite(confidence)) {
+    console.warn(`Auto-match: invalid confidence for request ${vr.uuid}, deferring`);
+    return null;
+  }
+
+  return confidence;
+}
+
+export async function autoApprove(vr, confidence) {
   const [u] = await pool.query(
     `UPDATE verification_requests
        SET match_status='auto_matched', match_confidence=?,

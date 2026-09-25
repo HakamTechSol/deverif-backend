@@ -130,8 +130,9 @@ export async function uploadEmployeeDocuments(req, res) {
   for (const file of files) {
     const diskPath = path.join(DOCS_DIR, file.filename);
 
-    // Corrupt-file guard per file. Fails open (warn-only) if the document
-    // service is unreachable; throws 400 on a definite corruption verdict.
+    // Corrupt-file guard per file. Fails open (warn-only) only when the
+    // service is unreachable (timeout / connection refused); other service
+    // failures — and a definite corruption verdict — throw a 400.
     await assertDocumentValid(diskPath);
 
     // Exact-file fingerprint for the auto-verification fast path. Only PDF and

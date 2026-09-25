@@ -3,8 +3,6 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 
-import ApiError from "../src/utils/ApiError.js";
-
 vi.mock("../src/config/db.js", () => ({ pool: { query: vi.fn() } }));
 vi.mock("../src/services/documentService.js", async (importOriginal) => {
   const original = await importOriginal();
@@ -12,7 +10,7 @@ vi.mock("../src/services/documentService.js", async (importOriginal) => {
 });
 
 import { pool } from "../src/config/db.js";
-import { validate } from "../src/services/documentService.js";
+import { validate, DocumentServiceError } from "../src/services/documentService.js";
 import { uploadEmployeeDocuments } from "../src/controllers/org/employeeMeta.controller.js";
 import { DOCS_DIR } from "../src/config/uploadPaths.js";
 
@@ -89,10 +87,12 @@ describe("uploadEmployeeDocuments — corrupt-file guard (document service up/do
     expect(insertCall).toBeUndefined();
   });
 
-  it("fails open (proceeds with the upload) when the document service is down", async () => {
-    const serviceDown = new ApiError(502, "Document service unreachable at http://localhost:5001/validate");
-    serviceDown.name = "DocumentServiceError";
-    validate.mockRejectedValue(serviceDown);
+  it("fails open (proceeds with the upload) when the document service is unreachable", async () => {
+    // The client reports unreachability as kind "connection" (refused/unreachable)
+    // or "timeout" — those are the ONLY kinds allowed to fail open.
+    validate.mockRejectedValue(
+      new DocumentServiceError(502, "Document service unreachable at http://localhost:5001/validate", { kind: "connection" })
+    );
 
     pool.query
       .mockResolvedValueOnce([[{ uuid: EMP_UUID }]])
@@ -111,6 +111,53 @@ describe("uploadEmployeeDocuments — corrupt-file guard (document service up/do
       typeof sql === "string" && sql.includes("INSERT INTO employee_documents")
     );
     expect(insertCall).toBeTruthy();
+  });
+
+  it("fails closed (rejects the upload) when the service responds with an HTTP error", async () => {
+    // Service is UP but answered 422 (e.g. "cannot parse file") — an unvalidated
+    // file must NOT slip through just because it happens to be reachable.
+    validate.mockRejectedValue(
+      new DocumentServiceError(422, "Document service could not parse the file", { kind: "http" })
+    );
+    pool.query.mockResolvedValue([[{ uuid: EMP_UUID }]]);
+
+    const req = makeReq({
+      files: [{ filename: "weird.pdf", originalname: "weird.pdf", mimetype: "application/pdf", size: 5 }],
+    });
+    const res = mockRes();
+
+    await expect(uploadEmployeeDocuments(req, res)).rejects.toMatchObject({
+      statusCode: 400,
+      message: "Document could not be validated — please try again.",
+    });
+
+    const insertCall = pool.query.mock.calls.find(([sql]) =>
+      typeof sql === "string" && sql.includes("INSERT INTO employee_documents")
+    );
+    expect(insertCall).toBeUndefined();
+  });
+
+  it("fails closed (rejects the upload) when the service returns an unexpected payload", async () => {
+    // 2xx but the {success,data} envelope was malformed — also NOT unreachability.
+    validate.mockRejectedValue(
+      new DocumentServiceError(502, "Document service returned an unexpected payload", { kind: "generic" })
+    );
+    pool.query.mockResolvedValue([[{ uuid: EMP_UUID }]]);
+
+    const req = makeReq({
+      files: [{ filename: "broken.pdf", originalname: "broken.pdf", mimetype: "application/pdf", size: 6 }],
+    });
+    const res = mockRes();
+
+    await expect(uploadEmployeeDocuments(req, res)).rejects.toMatchObject({
+      statusCode: 400,
+      message: "Document could not be validated — please try again.",
+    });
+
+    const insertCall = pool.query.mock.calls.find(([sql]) =>
+      typeof sql === "string" && sql.includes("INSERT INTO employee_documents")
+    );
+    expect(insertCall).toBeUndefined();
   });
 });
 

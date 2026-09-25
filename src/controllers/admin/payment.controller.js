@@ -74,18 +74,30 @@ export async function createPayment(req, res) {
   const [users] = await pool.query("SELECT id, organization FROM users WHERE uuid=?", [user_uuid]);
   if (!users.length) throw new ApiError(404, "User not found");
 
-  const [result] = await pool.query(
-    `INSERT INTO payment (user_id, organization_id, amount, payment_method, transaction_reference, paid_at, purpose)
-     VALUES (?, ?, ?, ?, ?, NOW(), ?)`,
-    [users[0].id, users[0].organization, amount, payment_method || "manual", transaction_reference || null, purpose || null]
-  );
+  let insertId;
+  try {
+    const [result] = await pool.query(
+      `INSERT INTO payment (user_id, organization_id, amount, payment_method, transaction_reference, paid_at, purpose)
+       VALUES (?, ?, ?, ?, ?, NOW(), ?)`,
+      [users[0].id, users[0].organization, amount, payment_method || "manual", transaction_reference || null, purpose || null]
+    );
+    insertId = result.insertId;
+  } catch (error) {
+    // transaction_reference is UNIQUE (uq_payment_txn_ref): a payment for this
+    // reference already exists. NULL references are exempt from the unique key
+    // (multiple manual records without a gateway reference are still allowed).
+    if ((error?.errno === 1062 || error?.code === "ER_DUP_ENTRY") && transaction_reference) {
+      throw new ApiError(409, "A payment with this transaction reference already exists");
+    }
+    throw error;
+  }
 
   const [rows] = await pool.query(
     `SELECT p.*, u.uuid AS user_uuid, u.full_name, u.email
      FROM payment p
      JOIN users u ON u.id = p.user_id
      WHERE p.id=?`,
-    [result.insertId]
+    [insertId]
   );
 
   logAudit({

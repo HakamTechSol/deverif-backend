@@ -7,7 +7,7 @@ import path from "path";
 import routes from "./routes/index.js";
 import notFound from "./middleware/notFound.js";
 import errorHandler from "./middleware/errorHandler.js";
-import { UPLOAD_ROOT, DOCS_DIR, ensureUploadDirs } from "./config/uploadPaths.js";
+import { PROFILES_DIR, ORGS_DIR, ensureUploadDirs } from "./config/uploadPaths.js";
 
 const app = express();
 
@@ -56,9 +56,12 @@ app.use(
 app.use(express.urlencoded({ extended: true }));
 app.use(morgan("dev"));
 
-// Static uploads
-app.use("/uploads", express.static(UPLOAD_ROOT));
-app.use("/documents", express.static(DOCS_DIR));
+// Static uploads — only profile images and org logos remain public. Uploaded
+// request/employee documents are served exclusively via the authenticated
+// /api/v1/documents/* route (unless a request is VERIFIED and its QR token +
+// signature are presented, handled in verify.routes.js).
+app.use("/uploads/profiles", express.static(PROFILES_DIR));
+app.use("/uploads/organizations", express.static(ORGS_DIR));
 
 // Public assets (logos for emails etc.)
 app.use("/public", express.static(path.resolve("public")));

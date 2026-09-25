@@ -13,7 +13,7 @@ import { resolveUnmatchedOrg } from "../utils/unmatchedOrg.js";
 import { logAudit, getActorFromReq } from "../utils/auditLog.js";
 import { generateQrForRequest } from "../utils/qrCertificate.js";
 import { runSlaChecks } from "../utils/slaChecks.js";
-import { runAutoMatchChecks, hasMatchMismatchRisk } from "../utils/autoMatch.js";
+import { runAutoMatchChecks, hasMatchMismatchRisk, computeMatchConfidence, autoApprove } from "../utils/autoMatch.js";
 import { buildDocumentCrossCheck } from "../utils/documentConsistency.js";
 import { sendVerificationResultEmailToOrg } from "../utils/mailer.js";
 import { firstFrontendUrl } from "../utils/frontendUrl.js";
@@ -116,7 +116,8 @@ export async function createRequest(req, res) {
   const documentHash = generateFileHash(fullPath);
 
   // Corrupt-file guard: reject definitively corrupt uploads before they reach
-  // the DB. Fails open (warn-only) if the document service is unreachable.
+  // the DB. Fails open (warn-only) only when the service is unreachable
+  // (timeout / connection refused); any other service failure rejects with 400.
   await assertDocumentValid(fullPath);
 
   // Resolve unmatched organization if "Other" was selected
@@ -146,7 +147,7 @@ export async function createRequest(req, res) {
       document_path, document_format, document_hash,
       organization_conserned_for_future, submission_remarks,
       verification_method, verified_at, document_owner_name, created_at)
-     VALUES (?, ?, ?, ?, ?, NOW(), ?, ?, ?, 'no', ?, ?, ?, ?, NOW())`,
+     VALUES (?, ?, ?, ?, ?, NOW(), ?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
     [
       req.user.id,
       document_type,
@@ -156,6 +157,9 @@ export async function createRequest(req, res) {
       docPath,
       docFormat,
       documentHash,
+      // An exact-hash match anchors future copies of the same document so they
+      // auto-verify instantly too; a fresh submission stays marked 'no'.
+      autoVerify ? "yes" : "no",
       remarks,
       autoVerify ? "auto" : "manual",
       autoVerify ? new Date() : null,
@@ -209,15 +213,17 @@ export async function createRequest(req, res) {
   // Case A: no matching person yet -> create one (full_name taken from the
   // unverified claim; never trusted over an existing record).
   // Case B: person already exists -> reuse it, keep the original name.
+  let linkedPersonId = null;
+  let personExists = false;
   if (documentOwnerCnicHash) {
     const [personRows] = await pool.query(
       `SELECT id FROM persons WHERE cnic_hash=? LIMIT 1`,
       [documentOwnerCnicHash]
     );
 
-    let linkedPersonId;
     if (personRows.length) {
       linkedPersonId = personRows[0].id;
+      personExists = true;
     } else {
       const [personInsert] = await pool.query(
         `INSERT INTO persons (cnic_encrypted, cnic_hash, full_name, is_nadra_verified, created_at)
@@ -235,20 +241,99 @@ export async function createRequest(req, res) {
 
   const [rows] = await pool.query(
     `SELECT vr.*, o.uuid AS issuing_organization_uuid, o.name AS issuing_org_name,
-            uo.uuid AS unmatched_org_uuid, uo.name AS unmatched_org_name
+            uo.uuid AS unmatched_org_uuid, uo.name AS unmatched_org_name,
+            requester.uuid AS requester_uuid,
+            requester.organization AS requester_organization
      FROM verification_requests vr
      LEFT JOIN organizations o ON o.id = vr.issuing_organization_id
      LEFT JOIN unmatched_organizations uo ON uo.id = vr.unmatched_org_id
+     JOIN users requester ON requester.id = vr.user_id
      WHERE vr.id=?`,
     [result.insertId]
   );
 
-  // Auto-verified requests also get a public QR certificate
-  if (autoVerify) {
-    await generateQrForRequest(rows[0]);
+  // Person identity context for the submitter side. A CNIC hash that already
+  // existed before this submission means a "known" identity; any verified
+  // person_documents row (from any organization) means the person has been
+  // verified before. Both are informational context only and never drive the
+  // verification status or auto-verify eligibility.
+  rows[0].person_known = Boolean(personExists);
+  rows[0].person_has_prior_verification = false;
+  rows[0].person_prior_verified_at = null;
+
+  if (linkedPersonId) {
+    const [priorPersonDocs] = await pool.query(
+      `SELECT verified_at
+       FROM person_documents
+       WHERE person_id=? AND status='verified'
+       ORDER BY verified_at DESC
+       LIMIT 1`,
+      [linkedPersonId]
+    );
+    if (priorPersonDocs.length) {
+      rows[0].person_has_prior_verification = true;
+      rows[0].person_prior_verified_at = priorPersonDocs[0].verified_at;
+    }
   }
 
-  if (orgId && !autoVerify) {
+  // Ledger completeness: a creation-time auto-verification is a successful
+  // verification and must leave a person_documents row exactly like every
+  // portal / auto-match / admin approval does. The anchoring issuing org is
+  // the verifying organization; no identity cross-check runs at this point,
+  // so match_status keeps its 'not_checked' DEFAULT.
+  if (autoVerify && linkedPersonId) {
+    await recordPersonDocument(rows[0], orgId, null);
+  }
+
+  // Auto-verified requests also get a public QR certificate. Capture the
+  // generated token/signature so the response exposes the QR link to the
+  // submitter instead of leaving them null in the payload.
+  if (autoVerify) {
+    const qr = await generateQrForRequest(rows[0]);
+    if (qr && qr.qr_token) {
+      rows[0].qr_token = qr.qr_token;
+      rows[0].qr_signature = qr.qr_signature;
+    }
+  }
+
+  // Inline reference match: when a reference employee document was staged for
+  // the target org, run the actual document match right now at submission. A
+  // 100% match auto-verifies immediately — the request never lands in the
+  // target org's inbox — and the submitter is shown an "Auto Verified" modal.
+  let autoMatched = false;
+  if (orgId && !autoVerify && matchStatus === "not_attempted" && matchedEmployeeDocumentId) {
+    let confidence = null;
+    try {
+      confidence = await computeMatchConfidence(rows[0]);
+    } catch (e) {
+      console.error(`Inline auto-match failed for request ${rows[0].uuid}:`, e.message);
+    }
+    if (confidence === 100) {
+      const personContext = {
+        person_known: rows[0].person_known,
+        person_has_prior_verification: rows[0].person_has_prior_verification,
+        person_prior_verified_at: rows[0].person_prior_verified_at,
+      };
+      await autoApprove(rows[0], confidence);
+      const [freshRows] = await pool.query(
+        `SELECT vr.*, o.uuid AS issuing_organization_uuid, o.name AS issuing_org_name,
+                uo.uuid AS unmatched_org_uuid, uo.name AS unmatched_org_name
+         FROM verification_requests vr
+         LEFT JOIN organizations o ON o.id = vr.issuing_organization_id
+         LEFT JOIN unmatched_organizations uo ON uo.id = vr.unmatched_org_id
+         WHERE vr.id=?`,
+        [result.insertId]
+      );
+      if (freshRows.length) {
+        rows[0] = freshRows[0];
+        Object.assign(rows[0], personContext);
+      }
+      rows[0].auto_verified = true;
+      autoMatched = true;
+    }
+  }
+
+  if (orgId && !autoVerify && !autoMatched) {
     const senderName = req.user.full_name || "Someone";
     createNotificationForOrgUsers({
       orgId,
@@ -456,7 +541,8 @@ export async function updateMySentRequest(req, res) {
     docFormat = docFormatFromMime(req.file.mimetype);
     const fullPath = path.join(DOCS_DIR, req.file.filename);
     documentHash = generateFileHash(fullPath);
-    // Corrupt-file guard on the re-upload path (fails open if service down).
+    // Corrupt-file guard on the re-upload path (fails open only on
+    // timeout / connection-refused; other service failures reject with 400).
     await assertDocumentValid(fullPath);
   }
 
@@ -555,7 +641,14 @@ export async function myInboxRequests(req, res) {
             med.file_name AS matched_document_name,
             med.file_path AS matched_document_path,
             med.document_type AS matched_document_type,
-            memp.full_name AS matched_employee_name
+            memp.full_name AS matched_employee_name,
+            (SELECT MAX(pd.verified_at)
+               FROM person_documents pd
+              WHERE pd.person_id = vr.linked_person_id
+                AND pd.status = 'verified'
+                AND (pd.verified_by_verification_request_id IS NULL
+                     OR pd.verified_by_verification_request_id <> vr.id)
+            ) AS person_prior_verified_at
      FROM verification_requests vr
      JOIN users requester ON requester.id = vr.user_id
      LEFT JOIN organizations requester_org ON requester_org.id = requester.organization
@@ -570,7 +663,12 @@ export async function myInboxRequests(req, res) {
     [...params, limit, offset]
   );
 
-  const enriched = rows.map(r => ({ ...r, match_mismatch_risk: hasMatchMismatchRisk(r) }));
+  const enriched = rows.map(r => ({
+    ...r,
+    person_known: Boolean(r.linked_person_id),
+    person_has_prior_verification: r.person_prior_verified_at != null,
+    match_mismatch_risk: hasMatchMismatchRisk(r),
+  }));
   return ok(res, paginatedResponse(enriched, total, page, limit), "Inbox requests");
 }
 
@@ -637,6 +735,31 @@ export async function getMyInboxRequestDetail(req, res) {
     if (priorRows.length) {
       detail.has_prior_verification = true;
       detail.prior_verified_at = priorRows[0].verified_at;
+    }
+  }
+
+  // Person-level prior-verification context: has this person (by CNIC) been
+  // verified for ANY document before, at any organization? The current
+  // request's own ledger row is excluded so this reads as a true prior-history
+  // signal. Informational context only — never an approval signal.
+  detail.person_known = Boolean(vr.linked_person_id);
+  detail.person_has_prior_verification = false;
+  detail.person_prior_verified_at = null;
+
+  if (vr.linked_person_id) {
+    const [personPriorRows] = await pool.query(
+      `SELECT verified_at
+       FROM person_documents
+       WHERE person_id=? AND status='verified'
+         AND (verified_by_verification_request_id IS NULL
+              OR verified_by_verification_request_id <> ?)
+       ORDER BY verified_at DESC
+       LIMIT 1`,
+      [vr.linked_person_id, vr.id]
+    );
+    if (personPriorRows.length) {
+      detail.person_has_prior_verification = true;
+      detail.person_prior_verified_at = personPriorRows[0].verified_at;
     }
   }
 

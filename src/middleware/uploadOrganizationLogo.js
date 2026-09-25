@@ -15,9 +15,11 @@ const storage = multer.diskStorage({
 });
 
 function fileFilter(req, file, cb) {
-  const allowed = ["image/png", "image/jpeg", "image/jpg", "image/svg+xml"];
+  const allowed = ["image/png", "image/jpeg", "image/jpg"];
   if (!allowed.includes(file.mimetype)) {
-    return cb(new Error("Only image files allowed"));
+    const err = new Error("Only image files allowed");
+    err.statusCode = 400;
+    return cb(err);
   }
   cb(null, true);
 }

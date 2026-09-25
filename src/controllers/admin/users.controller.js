@@ -253,8 +253,11 @@ export async function cancelInvite(req, res) {
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
+    // Delete EVERY invite token for this user (pending AND superseded ones).
+    // Only deleting unused rows would leave behind tokens that a previous
+    // resend had marked "used", which then blocks a later resend after cancel.
     await conn.query(
-      "DELETE FROM invite_tokens WHERE user_uuid=? AND used_at IS NULL",
+      "DELETE FROM invite_tokens WHERE user_uuid=?",
       [user.uuid]
     );
     await conn.query(
@@ -336,11 +339,28 @@ export async function resendInvite(req, res) {
   const { uuid } = req.params;
   assertUuid(uuid, "User UUID");
 
-  const [userRows] = await pool.query("SELECT id, uuid, email, full_name, status FROM users WHERE uuid=?", [uuid]);
+  const [userRows] = await pool.query(
+    "SELECT id, uuid, email, full_name, status, is_verified FROM users WHERE uuid=?",
+    [uuid]
+  );
   if (!userRows.length) throw new ApiError(404, "User not found");
 
   const user = userRows[0];
-  if (user.status === "active") throw new ApiError(400, "User is already active. Use forgot password instead.");
+
+  // Block only if the account was actually accepted (password already set).
+  // is_verified is flipped to 'yes' on set-password; for older rows we also
+  // treat a used invite token as acceptance, so a fresh-but-unused invite can
+  // always be resent even when the user row is status='active'.
+  if (user.is_verified === "yes") {
+    throw new ApiError(400, "Invitation already accepted. Use forgot password instead.");
+  }
+  const [[{ used }]] = await pool.query(
+    "SELECT COUNT(*) AS used FROM invite_tokens WHERE user_uuid=? AND used_at IS NOT NULL",
+    [user.uuid]
+  );
+  if (used > 0) {
+    throw new ApiError(400, "Invitation already accepted. Use forgot password instead.");
+  }
 
   await pool.query(
     "UPDATE invite_tokens SET used_at=NOW() WHERE user_uuid=? AND used_at IS NULL",

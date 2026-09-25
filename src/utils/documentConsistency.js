@@ -89,7 +89,7 @@ export async function buildDocumentCrossCheck(vr) {
 
   let extracted;
   try {
-    const { data } = await ocrExtract(submittedPath);
+    const { data } = await ocrExtract(submittedPath, vr.document_type);
     extracted = data || {};
   } catch (e) {
     const r = result();
@@ -106,8 +106,9 @@ export async function buildDocumentCrossCheck(vr) {
   );
   const formCnicHash = personRows.length ? personRows[0].cnic_hash : null;
 
-  const ocrName = typeof extracted.name === "string" ? extracted.name.trim() : "";
-  const ocrCnic = typeof extracted.cnic === "string" ? extracted.cnic.trim() : "";
+  const ocrFields = (extracted && typeof extracted === "object" && extracted.fields) || {};
+  const ocrName = typeof ocrFields.name?.value === "string" ? ocrFields.name.value.trim() : "";
+  const ocrCnic = typeof ocrFields.cnic?.value === "string" ? ocrFields.cnic.value.trim() : "";
   const formName = typeof vr.document_owner_name === "string" ? vr.document_owner_name.trim() : "";
 
   const extractedCnicHash = ocrCnic ? hashCnic(ocrCnic) : null;
