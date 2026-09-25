@@ -3,6 +3,7 @@ import { pool } from "../../config/db.js";
 import { ok } from "../../utils/response.js";
 import { assertUuid } from "../../utils/publicResponse.js";
 import { parsePagination, paginatedResponse } from "../../utils/pagination.js";
+import { resetDailyRequestUsage } from "../../utils/requestQuota.js";
 import { createNotificationForOrgUsers } from "../notification.controller.js";
 import { logAudit, getActorFromReq } from "../../utils/auditLog.js";
 import {
@@ -110,6 +111,11 @@ export async function approveCustomPlanRequest(req, res) {
        WHERE id=?`,
       [dailyQuota, price.toFixed(2), req.admin?.uuid ?? null, planReq.id]
     );
+
+    // The new plan is a new entitlement: clear today's usage so the customer
+    // gets the full approved daily quota (e.g. 100) instead of inheriting what
+    // was already consumed under the previous plan (e.g. 100 - 10 = 90).
+    await resetDailyRequestUsage(planReq.organization_id, connection);
 
     await connection.commit();
 

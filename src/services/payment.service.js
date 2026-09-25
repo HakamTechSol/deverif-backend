@@ -1,6 +1,6 @@
 import { pool } from "../config/db.js";
 import ApiError from "../utils/ApiError.js";
-import { todayStr } from "../utils/requestQuota.js";
+import { todayStr, resetDailyRequestUsage } from "../utils/requestQuota.js";
 
 /**
  * Shared subscription activation service. Used by BOTH the Safepay webhook path
@@ -18,6 +18,12 @@ export async function activateOrgSubscription(connection, { organizationId, plan
      WHERE id=?`,
     [now, expiry, plan.id, organizationId]
   );
+
+  // Activating a plan grants a new entitlement, so today's usage is cleared:
+  // the customer starts on the full daily quota of the plan they just bought
+  // rather than the new quota minus whatever the previous plan already used.
+  await resetDailyRequestUsage(organizationId, connection);
+
   return { expiry, duration_months: durationMonths };
 }
 

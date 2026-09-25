@@ -21,7 +21,13 @@ function safeDocumentFilename(raw) {
   return name;
 }
 
-/** Serve a verified document filename from DOCS_DIR with an attachment disposition. */
+/**
+ * Serve a verified document filename from DOCS_DIR.
+ *
+ * Always sent as an attachment: the browser-facing View action fetches these
+ * through XHR (the API is Bearer-token authenticated) and then re-types the
+ * blob client-side, which is what decides whether it renders or saves.
+ */
 function streamDocument(res, filename) {
   const filePath = path.join(DOCS_DIR, filename);
   if (!filePath.startsWith(DOCS_DIR + path.sep)) {

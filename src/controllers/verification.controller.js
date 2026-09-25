@@ -23,10 +23,35 @@ import path from "path";
 import { DOCS_DIR } from "../config/uploadPaths.js";
 import { requirePermission } from "../utils/permissions.js";
 
-function docFormatFromMime(m) {
-  if (m === "application/pdf") return "pdf";
-  if (m === "image/jpeg") return "jpeg";
-  return "jpeg";
+// Map an upload's mime onto the short format label stored in
+// verification_requests.document_format and shown in the Format column. Kept in
+// step with the upload allow-list in middleware/uploadDocs.js; previously every
+// non-PDF was labelled "jpeg", so a PNG or DOCX request displayed a wrong type.
+function docFormatFromMime(m, originalname = "") {
+  const map = {
+    "application/pdf": "pdf",
+    "image/jpeg": "jpeg",
+    "image/png": "png",
+    "image/webp": "webp",
+    "image/gif": "gif",
+    "image/bmp": "bmp",
+    "application/msword": "doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+    "application/vnd.ms-excel": "xls",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+    "text/plain": "txt",
+    "text/csv": "csv",
+    "application/zip": "zip",
+  };
+  if (map[m]) return map[m];
+  // Browsers and older clients send a generic blob marker for some types. The
+  // allow-list tolerates it for known extensions, so derive the label from the
+  // declared extension rather than degrading every such file to "file".
+  if (m === "application/octet-stream" || !m) {
+    const ext = String(originalname || "").toLowerCase().match(/\.[a-z0-9]+$/);
+    if (ext && map[`application/${ext[0].slice(1)}`]) return ext[0].slice(1);
+  }
+  return "file";
 }
 
 function generateFileHash(filePath) {
@@ -112,7 +137,7 @@ export async function createRequest(req, res) {
 
   const docPath = `/uploads/documents/${req.file.filename}`;
   const fullPath = path.join(DOCS_DIR, req.file.filename);
-  const docFormat = docFormatFromMime(req.file.mimetype);
+  const docFormat = docFormatFromMime(req.file.mimetype, req.file.originalname);
   const documentHash = generateFileHash(fullPath);
 
   // Corrupt-file guard: reject definitively corrupt uploads before they reach
@@ -126,6 +151,20 @@ export async function createRequest(req, res) {
     unmatchedOrgId = await resolveUnmatchedOrg(otherOrgName, otherEmail, otherPhone, otherWebsite);
   }
 
+  // Repeat submission of a document this organization has already verified.
+  //
+  // Keyed purely on the SHA-256 of the uploaded file plus the same issuing org
+  // and a prior 'verified' outcome. Identical hash means byte-for-byte the same
+  // file the org already signed off on, so there is nothing left to re-check and
+  // the re-verification is safe: the document is the exact artifact previously
+  // approved. A different scan of the same document has a different hash and
+  // falls through to the normal reference-match flow instead.
+  //
+  // This used to additionally require organization_conserned_for_future='yes',
+  // but that column was only ever written on an auto-verified insert — never on
+  // the ordinary approve paths — so the condition could never become true and
+  // the whole path was dead. Matching on the verified outcome itself is both
+  // simpler and what the behavior was always meant to be.
   let autoVerify = false;
   if (orgId) {
     const [previousVerified] = await pool.query(
@@ -134,7 +173,7 @@ export async function createRequest(req, res) {
        WHERE document_hash=?
          AND issuing_organization_id=?
          AND status='verified'
-         AND organization_conserned_for_future='yes'
+       ORDER BY verified_at DESC, id DESC
        LIMIT 1`,
       [documentHash, orgId]
     );
@@ -157,8 +196,9 @@ export async function createRequest(req, res) {
       docPath,
       docFormat,
       documentHash,
-      // An exact-hash match anchors future copies of the same document so they
-      // auto-verify instantly too; a fresh submission stays marked 'no'.
+      // No longer the auto-verify gate (see the lookup above). It now simply
+      // records that this particular row was itself created by a repeat
+      // auto-verification rather than by a fresh submission.
       autoVerify ? "yes" : "no",
       remarks,
       autoVerify ? "auto" : "manual",
@@ -331,6 +371,14 @@ export async function createRequest(req, res) {
       rows[0].auto_verified = true;
       autoMatched = true;
     }
+  }
+
+  // A repeat submission of an already-verified file is also auto-verified from
+  // the submitter's point of view: it is born 'verified' and never reaches the
+  // target org's inbox. Flag it so the client shows the same "Auto Verified"
+  // confirmation instead of a generic "request submitted" toast.
+  if (autoVerify) {
+    rows[0].auto_verified = true;
   }
 
   if (orgId && !autoVerify && !autoMatched) {
@@ -538,7 +586,7 @@ export async function updateMySentRequest(req, res) {
 
   if (req.file) {
     docPath = `/uploads/documents/${req.file.filename}`;
-    docFormat = docFormatFromMime(req.file.mimetype);
+    docFormat = docFormatFromMime(req.file.mimetype, req.file.originalname);
     const fullPath = path.join(DOCS_DIR, req.file.filename);
     documentHash = generateFileHash(fullPath);
     // Corrupt-file guard on the re-upload path (fails open only on
@@ -782,6 +830,158 @@ export async function myInboxCount(req, res) {
   );
 
   return ok(res, { count }, "Inbox count");
+}
+
+/**
+ * Auto-verified requests for the caller's own organization.
+ *
+ * These are the requests this organization auto-verified itself: the reference
+ * match scored 100% against a stored employee document, so the request was
+ * approved at submission time and never appeared in the inbox. This is the
+ * read-only ledger of those outcomes.
+ *
+ * doc_verification_count is a cross-organization total: how many times this
+ * same person's document of this type has been verified anywhere on the
+ * platform (2 by one company + 3 by another = 5).
+ *
+ * Results are grouped by (person, document type) so a document verified ten
+ * times occupies a single row showing "10", rather than ten near-identical rows.
+ */
+export async function myAutoVerifiedRequests(req, res) {
+  requirePermission(req.user, "approve_request");
+  if (!req.user.organization) throw new ApiError(400, "User has no organization");
+
+  const { page, limit, offset } = parsePagination(req.query);
+  const search = typeof req.query.search === "string" ? req.query.search.trim() : "";
+  const dateFrom = typeof req.query.dateFrom === "string" ? req.query.dateFrom.trim() : "";
+  const dateTo = typeof req.query.dateTo === "string" ? req.query.dateTo.trim() : "";
+
+  // Both automatic outcomes count as "auto verified" for this ledger: the
+  // reference match ('automatic_match') and the repeat-of-an-already-verified
+  // file ('auto'). Neither ever appears in the inbox, so both belong here —
+  // otherwise they would be invisible in the product.
+  let whereClause =
+    "WHERE vr2.issuing_organization_id = ? AND vr2.status = 'verified' AND vr2.verification_method IN ('automatic_match', 'auto')";
+  const params = [req.user.organization];
+
+  if (search) {
+    whereClause += ` AND (vr2.document_type LIKE ? OR vr2.document_owner_name LIKE ? OR requester.full_name LIKE ? OR requester_org.name LIKE ?)`;
+    const like = `%${search}%`;
+    params.push(like, like, like, like);
+  }
+  if (dateFrom) {
+    whereClause += ` AND vr2.verified_at >= ?`;
+    params.push(dateFrom);
+  }
+  if (dateTo) {
+    whereClause += ` AND vr2.verified_at <= ?`;
+    params.push(`${dateTo} 23:59:59`);
+  }
+
+  // One row per (person, document type): repeated verifications of the same
+  // document collapse into a single line whose doc_verification_count reports
+  // the total. `latest_id` is the newest request in the group and supplies all
+  // the row-level detail (requester, owner, QR, timestamps).
+  const groupedSql = `
+    SELECT MAX(vr2.id) AS latest_id, vr2.linked_person_id, vr2.document_type
+    FROM verification_requests vr2
+    JOIN users requester ON requester.id = vr2.user_id
+    LEFT JOIN organizations requester_org ON requester_org.id = requester.organization
+    ${whereClause}
+    GROUP BY vr2.linked_person_id, vr2.document_type`;
+
+  const [[{ total }]] = await pool.query(
+    `SELECT COUNT(*) AS total FROM (${groupedSql}) grouped`,
+    params
+  );
+
+  const [rows] = await pool.query(
+    `SELECT vr.*,
+            requester.uuid AS requester_uuid,
+            requester.full_name AS requester_name,
+            requester.email AS requester_email,
+            requester_org.uuid AS requester_organization_uuid,
+            requester_org.name AS requester_organization,
+            requester_org.logo AS requester_org_logo,
+            issuing_org.uuid AS issuing_organization_uuid,
+            issuing_org.name AS issuing_org_name,
+            issuing_org.logo AS issuing_org_logo,
+            (SELECT COUNT(*) FROM person_documents pd
+              WHERE pd.person_id = vr.linked_person_id
+                AND pd.document_type = vr.document_type
+                AND pd.status = 'verified'
+            ) AS doc_verification_count
+     FROM verification_requests vr
+     JOIN (${groupedSql}) g ON g.latest_id = vr.id
+     JOIN users requester ON requester.id = vr.user_id
+     LEFT JOIN organizations requester_org ON requester_org.id = requester.organization
+     LEFT JOIN organizations issuing_org ON issuing_org.id = vr.issuing_organization_id
+     ORDER BY vr.verified_at DESC, vr.id DESC
+     LIMIT ? OFFSET ?`,
+    [...params, limit, offset]
+  );
+
+  return ok(res, paginatedResponse(rows, total, page, limit), "Auto-verified requests");
+}
+
+/**
+ * Full verification history for one auto-verified request's document.
+ *
+ * Reads the person_documents ledger for the same person + document type across
+ * EVERY organization, newest first, so the caller can see which companies have
+ * verified this document and how many times. Read-only: no delete, no mutation.
+ */
+export async function getAutoVerifiedRequestHistory(req, res) {
+  requirePermission(req.user, "approve_request");
+  const { uuid } = req.params;
+  assertUuid(uuid, "Request UUID");
+  if (!req.user.organization) throw new ApiError(400, "User has no organization");
+
+  const [rows] = await pool.query(
+    `SELECT vr.id, vr.uuid, vr.issuing_organization_id, vr.linked_person_id,
+            vr.document_type, vr.document_owner_name, p.uuid AS person_uuid
+     FROM verification_requests vr
+     LEFT JOIN persons p ON p.id = vr.linked_person_id
+     WHERE vr.uuid = ?`,
+    [uuid]
+  );
+  if (!rows.length) throw new ApiError(404, "Request not found");
+
+  const vr = rows[0];
+  if (vr.issuing_organization_id !== req.user.organization) {
+    throw new ApiError(403, "You are not allowed to view this request");
+  }
+  if (!vr.linked_person_id) {
+    return ok(res, { history: [], total_verifications: 0 }, "Verification history");
+  }
+
+  const [history] = await pool.query(
+    `SELECT pd.id, pd.uuid, pd.document_type, pd.document_hash, pd.verified_at, pd.status,
+            pd.match_status AS cross_check_status,
+            org.uuid AS verified_by_organization_uuid,
+            org.name AS verified_by_organization,
+            org.logo AS verified_by_organization_logo,
+            vr.uuid AS verification_request_uuid,
+            vr.verification_method
+     FROM person_documents pd
+     LEFT JOIN organizations org ON org.id = pd.verified_by_organization_id
+     LEFT JOIN verification_requests vr ON vr.id = pd.verified_by_verification_request_id
+     WHERE pd.person_id = ? AND pd.document_type <=> ? AND pd.status = 'verified'
+     ORDER BY pd.verified_at DESC, pd.id DESC`,
+    [vr.linked_person_id, vr.document_type]
+  );
+
+  return ok(
+    res,
+    {
+      person_uuid: vr.person_uuid,
+      document_type: vr.document_type,
+      document_owner_name: vr.document_owner_name,
+      total_verifications: history.length,
+      history,
+    },
+    "Verification history"
+  );
 }
 
 export async function verifyRequest(req, res) {

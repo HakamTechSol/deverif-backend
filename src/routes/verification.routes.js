@@ -12,6 +12,8 @@ import {
   myInboxRequests,
   myInboxCount,
   getMyInboxRequestDetail,
+  myAutoVerifiedRequests,
+  getAutoVerifiedRequestHistory,
   verifyRequest,
   listOrganizations
 } from "../controllers/verification.controller.js";
@@ -27,6 +29,8 @@ router.delete("/my/sent/:uuid", authUser, asyncHandler(deleteMySentRequest));
 router.get("/my/inbox", authUser, asyncHandler(myInboxRequests));
 router.get("/my/inbox/count", authUser, asyncHandler(myInboxCount));
 router.get("/my/inbox/:uuid", authUser, asyncHandler(getMyInboxRequestDetail));
+router.get("/my/auto-verified", authUser, asyncHandler(myAutoVerifiedRequests));
+router.get("/my/auto-verified/:uuid/history", authUser, asyncHandler(getAutoVerifiedRequestHistory));
 router.patch("/:uuid/verify", authUser, asyncHandler(verifyRequest));
 router.get("/:uuid/certificate", authUser, asyncHandler(downloadCertificate));
 

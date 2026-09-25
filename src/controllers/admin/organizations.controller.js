@@ -7,6 +7,7 @@ import { sendExpiryReminderEmail } from "../../utils/mailer.js";
 import { createNotificationForOrgUsers } from "../notification.controller.js";
 import { logAudit, getActorFromReq } from "../../utils/auditLog.js";
 import { assignFreePlanToOrg } from "../../utils/freePlan.js";
+import { resetDailyRequestUsage } from "../../utils/requestQuota.js";
 
 const ORG_SELECT = `organizations.id, organizations.uuid, organizations.name, organizations.verified,
   organizations.logo, ot.name AS organization_type, organizations.business_email,
@@ -321,6 +322,11 @@ export async function setOrganizationSubscription(req, res) {
     `UPDATE organizations SET subscription_status='active', subscription_start=?, subscription_expiry=?, subscription_plan_id=?, reminder_2d_sent='no', reminder_2h_sent='no' WHERE id=?`,
     [now, expiry, planRow.id, orgId]
   );
+
+  // Assigning a plan is a new entitlement: clear today's usage so the org gets
+  // the full daily quota of the plan just assigned instead of the new quota
+  // minus what it already consumed today under its previous plan.
+  await resetDailyRequestUsage(orgId);
 
   // A manually-assigned plan supersedes any pending self-subscription request.
   await pool.query(

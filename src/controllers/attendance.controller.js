@@ -66,14 +66,6 @@ async function assertAllowedIp(req, orgId) {
   );
   if (!orgRows.length) throw new ApiError(404, "Organization not found");
 
-  const clientIp = normalizeIp(req.ip);
-  if (process.env.ALLOW_LOOPBACK_ATTENDANCE === "true" && isLoopbackIp(clientIp)) {
-    console.warn(
-      `[attendance] IP allow-list bypassed for loopback address ${clientIp} (ALLOW_LOOPBACK_ATTENDANCE=true)`
-    );
-    return;
-  }
-
   const [ruleRows] = await pool.query(
     "SELECT ip_address, rule_type FROM organization_ip_rules WHERE organization_id=?",
     [orgId]
@@ -83,6 +75,24 @@ async function assertAllowedIp(req, orgId) {
   for (const r of ruleRows) {
     if (r.rule_type === "deny") denyRules.push(r.ip_address);
     else allowRules.push(r.ip_address);
+  }
+
+  // No allow-list configured at all -> attendance is OFF for this organization.
+  // This is checked BEFORE the loopback dev bypass on purpose: a bypass exists
+  // to let a developer work from localhost once real IPs are configured, never
+  // to stand in for the admin never having set anything up. Without this guard
+  // an organization that configured nothing could still mark attendance, which
+  // defeats the whole point of office-IP-only attendance.
+  if (allowRules.length === 0) {
+    throw new ApiError(403, "Attendance is not enabled for your organization yet. Please contact your admin.");
+  }
+
+  const clientIp = normalizeIp(req.ip);
+  if (process.env.ALLOW_LOOPBACK_ATTENDANCE === "true" && isLoopbackIp(clientIp)) {
+    console.warn(
+      `[attendance] IP allow-list bypassed for loopback address ${clientIp} (ALLOW_LOOPBACK_ATTENDANCE=true)`
+    );
+    return;
   }
 
   if (ipMatches(clientIp, denyRules)) {

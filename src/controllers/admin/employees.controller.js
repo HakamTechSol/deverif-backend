@@ -143,7 +143,19 @@ export async function createEmployee(req, res) {
   if (dupeCnic.length) throw new ApiError(409, "An employee with this CNIC already exists");
 
   const addedByUuid = req.admin?.uuid || req.user?.uuid || null;
+  // An employee that carries an email is created as a platform user straight
+  // away and a set-password link is emailed to them.
+  //
+  // This is deliberately NOT gated on the organization's subscription. The
+  // invite is how the employee gets in the door; what they can then see is
+  // decided per-request by the plan, so an unsubscribed org's employee still
+  // signs in and simply sees the plan-gated screens in their locked state.
+  // Gating the invite itself would instead produce an account-less employee who
+  // cannot be invited later without re-entering their details.
+  const wantsPlatformUser = !!data.email;
   let createdEmployeeUuid = null;
+  let linkedUserUuid = null;
+  let rawToken = null;
 
   const conn = await pool.getConnection();
   try {
@@ -175,6 +187,39 @@ export async function createEmployee(req, res) {
       [createdEmployeeUuid, Number(effFrom.slice(0, 4)), data.current_salary, effFrom]
     );
 
+    if (wantsPlatformUser) {
+      const [existingUser] = await conn.query("SELECT uuid FROM users WHERE email=?", [data.email]);
+      if (existingUser.length) throw new ApiError(409, "A platform user with this email already exists");
+      const [orgExists] = await conn.query("SELECT id FROM organizations WHERE id=?", [orgId]);
+      if (!orgExists.length) throw new ApiError(400, "Organization no longer exists");
+
+      const orgRole = "employee";
+      const dummyHash = await hashPassword(crypto.randomBytes(16).toString("hex"));
+      const [userRes] = await conn.query(
+        `INSERT INTO users
+         (full_name, email, phone, password, cnic, status, org_role, feature_access,
+          organization, profile_image, is_verified, created_at)
+         VALUES (?, ?, ?, ?, ?, 'inactive', ?, NULL, ?, NULL, 'no', NOW())`,
+        [data.full_name, data.email, data.phone || null, dummyHash, data.cnic, orgRole, orgId]
+      );
+      const [[newUser]] = await conn.query("SELECT uuid FROM users WHERE id=?", [userRes.insertId]);
+      linkedUserUuid = newUser.uuid;
+
+      rawToken = crypto.randomBytes(32).toString("hex");
+      const tokenHash = crypto.createHash("sha256").update(rawToken).digest("hex");
+      const expiresInHours = parseInt(process.env.INVITE_EXPIRES_IN_HOURS || "72", 10);
+      await conn.query(
+        "INSERT INTO invite_tokens (user_uuid, token_hash, expires_at) VALUES (?, ?, DATE_ADD(NOW(), INTERVAL ? HOUR))",
+        [newUser.uuid, tokenHash, expiresInHours]
+      );
+
+      const promotedByUuid = req.admin?.uuid || req.user?.uuid || null;
+      await conn.query(
+        `UPDATE employees SET is_platform_user='yes', linked_user_uuid=?, promoted_by_uuid=?, promoted_at=NOW() WHERE uuid=?`,
+        [newUser.uuid, promotedByUuid, createdEmployeeUuid]
+      );
+    }
+
     await conn.commit();
   } catch (err) {
     await conn.rollback();
@@ -186,6 +231,23 @@ export async function createEmployee(req, res) {
 
   const [employeeRow] = await pool.query(`${EMPLOYEE_SELECT} WHERE e.uuid=?`, [createdEmployeeUuid]);
 
+  // Sent after the transaction commits so a mail failure can never roll back a
+  // successfully created employee.
+  let emailSent = false;
+  let emailError = null;
+  if (wantsPlatformUser && rawToken) {
+    const setLinkBase = firstFrontendUrl(process.env.FRONTEND_SET_PASSWORD_URL, "http://localhost:8080/set-password");
+    const setLink = `${setLinkBase}?token=${encodeURIComponent(rawToken)}`;
+    const invitedByName = req.admin?.full_name || req.user?.full_name || "Org Admin";
+    try {
+      await sendInviteEmail({ to: data.email, setLink, invitedByName });
+      emailSent = true;
+    } catch (e) {
+      emailError = e.message;
+      console.error("Failed to send invite email:", e.message);
+    }
+  }
+
   logAudit({
     ...getActorFromReq(req),
     action: "employee.create",
@@ -195,136 +257,24 @@ export async function createEmployee(req, res) {
       full_name: data.full_name,
       email: data.email,
       organization_id: orgId,
+      created_platform_user: !!linkedUserUuid,
+      email_sent: emailSent,
     },
     req,
   });
 
   const payload = { employee: employeeRow[0] };
-
-  return created(res, payload, "Employee created successfully");
-}
-
-export async function promoteEmployeeToPlatformUsers(req, res) {
-  assertRole(req.user, STAFF_ROLES);
-  const orgId = req.scopeOrgId ?? req.user?.organization;
-  if (!orgId) throw new ApiError(403, "User has no organization");
-
-  const rawUuids = Array.isArray(req.body?.employee_uuids) ? req.body.employee_uuids : [];
-  if (!rawUuids.length) throw new ApiError(400, "employee_uuids is required");
-  if (rawUuids.length > 50) throw new ApiError(400, "Maximum 50 employees per request");
-  const uuids = [...new Set(rawUuids.map((u) => String(u)))];
-  for (const u of uuids) assertUuid(u, "Employee UUID");
-
-  const actorUuid = req.admin?.uuid || req.user?.uuid || null;
-  const results = [];
-
-  for (const uuid of uuids) {
-    const [empRows] = await pool.query(
-      `SELECT uuid, full_name, email, is_platform_user, linked_user_uuid
-       FROM employees WHERE uuid=? AND organization_id=?`,
-      [uuid, orgId]
-    );
-    const emp = empRows[0];
-    if (!emp) {
-      results.push({ uuid, full_name: null, email: null, status: "failed", message: "Employee not found in your organization" });
-      continue;
+  let message = "Employee created successfully";
+  if (wantsPlatformUser) {
+    message = emailSent
+      ? "Employee created. Set-password email sent."
+      : "Employee created but invite email failed.";
+    if (!emailSent) {
+      payload._email_warning = `Invite email failed: ${emailError}. The platform user cannot sign in until they set a password.`;
     }
-    if (emp.is_platform_user === "yes" || emp.linked_user_uuid) {
-      results.push({ uuid, full_name: emp.full_name, email: emp.email, status: "skipped", message: "Already a platform user" });
-      continue;
-    }
-    if (!emp.email) {
-      results.push({ uuid, full_name: emp.full_name, email: null, status: "failed", message: "Add an email to this employee first" });
-      continue;
-    }
-    const [existingUser] = await pool.query("SELECT uuid FROM users WHERE email=?", [emp.email]);
-    if (existingUser.length) {
-      results.push({ uuid, full_name: emp.full_name, email: emp.email, status: "skipped", message: "A platform account already exists for this email" });
-      continue;
-    }
-
-    let rawToken = null;
-    let emailFailed = false;
-    const conn = await pool.getConnection();
-    try {
-      await conn.beginTransaction();
-      const dummyHash = await hashPassword(crypto.randomBytes(16).toString("hex"));
-      const [userRes] = await conn.query(
-        `INSERT INTO users
-         (full_name, email, phone, password, cnic, status, org_role, feature_access,
-          organization, profile_image, is_verified, created_at)
-         VALUES (?, ?, NULL, ?, ?, 'inactive', 'employee', NULL, ?, NULL, 'no', NOW())`,
-        [emp.full_name, emp.email, dummyHash, emp.cnic, orgId]
-      );
-      const [[newUser]] = await conn.query("SELECT uuid FROM users WHERE id=?", [userRes.insertId]);
-
-      rawToken = crypto.randomBytes(32).toString("hex");
-      const tokenHash = crypto.createHash("sha256").update(rawToken).digest("hex");
-      const expiresInHours = parseInt(process.env.INVITE_EXPIRES_IN_HOURS || "72", 10);
-      await conn.query(
-        "INSERT INTO invite_tokens (user_uuid, token_hash, expires_at) VALUES (?, ?, DATE_ADD(NOW(), INTERVAL ? HOUR))",
-        [newUser.uuid, tokenHash, expiresInHours]
-      );
-
-      await conn.query(
-        `UPDATE employees SET is_platform_user='yes', linked_user_uuid=?, promoted_by_uuid=?, promoted_at=NOW() WHERE uuid=?`,
-        [newUser.uuid, actorUuid, emp.uuid]
-      );
-      await conn.commit();
-    } catch (err) {
-      await conn.rollback();
-      results.push({ uuid, full_name: emp.full_name, email: emp.email, status: "failed", message: err.message || "Failed" });
-      continue;
-    } finally {
-      conn.release();
-    }
-
-    if (rawToken) {
-      const setLinkBase = firstFrontendUrl(process.env.FRONTEND_SET_PASSWORD_URL, "http://localhost:8080/set-password");
-      const setLink = `${setLinkBase}?token=${encodeURIComponent(rawToken)}`;
-      const invitedByName = req.admin?.full_name || req.user?.full_name || "Org Admin";
-      try {
-        await sendInviteEmail({ to: emp.email, setLink, invitedByName });
-      } catch (e) {
-        emailFailed = true;
-        console.error("Failed to send invite email:", e.message);
-      }
-    }
-
-    results.push({
-      uuid,
-      full_name: emp.full_name,
-      email: emp.email,
-      status: emailFailed ? "failed" : "promoted",
-      message: emailFailed
-        ? "Platform user created but the invite email failed — use Resend"
-        : "Platform user created and invite sent",
-    });
   }
 
-  const promoted = results.filter((r) => r.status === "promoted");
-  const skipped = results.filter((r) => r.status === "skipped");
-  const failed = results.filter((r) => r.status === "failed");
-
-  logAudit({
-    ...getActorFromReq(req),
-    action: "employee.bulk_promote",
-    entityType: "employee",
-    details: {
-      organization_id: orgId,
-      requested: uuids.length,
-      promoted: promoted.length,
-      skipped: skipped.length,
-      failed: failed.length,
-    },
-    req,
-  });
-
-  return ok(
-    res,
-    { results, promoted_count: promoted.length, skipped_count: skipped.length, failed_count: failed.length },
-    promoted.length ? `Added ${promoted.length} employee(s) as platform users.` : "No employees were added."
-  );
+  return created(res, payload, message);
 }
 
 export async function resendEmployeeInvite(req, res) {

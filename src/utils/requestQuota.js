@@ -13,6 +13,30 @@ export function todayStr(date = new Date()) {
 export const FREE_DAILY_REQUESTS = 1;
 
 /**
+ * Clear today's usage bucket for an organization.
+ *
+ * Called whenever a new plan is activated for an organization (custom plan
+ * approval, admin plan change, successful upgrade payment). Without this the
+ * previous plan's consumption carried into the new plan for the rest of the day:
+ * an org that had burned the 10/day of a small plan and was then moved to a
+ * 100/day custom plan saw only 90 remaining, because the 10 already consumed
+ * were subtracted from the fresh allowance.
+ *
+ * A plan change is a new entitlement, so the customer starts the new plan with
+ * its full daily allowance. Deleting the row is safe — it has no foreign keys,
+ * and enforceRequestQuota re-creates today's bucket on the next request.
+ *
+ * Pass an open transaction connection to join the caller's transaction.
+ */
+export async function resetDailyRequestUsage(orgId, connection = null) {
+  const runner = connection || pool;
+  await runner.query(
+    `DELETE FROM daily_request_usage WHERE organization_id=? AND date=?`,
+    [orgId, todayStr()]
+  );
+}
+
+/**
  * Resolve the current plan quota for an organization.
  * Returns { quota, plan_id, plan_uuid, plan_name, is_free }.
  */

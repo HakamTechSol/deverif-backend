@@ -317,6 +317,70 @@ describe("createRequest — exact-hash auto-verification (existing fast path unc
     expect(insertCall[1][11]).toEqual(expect.any(Date)); // verified_at populated
   });
 
+  it("auto-verifies a repeat even when the earlier verified row was flagged organization_conserned_for_future='no'", async () => {
+    // Regression: the lookup used to require organization_conserned_for_future='yes',
+    // but that column was only ever written on an auto-verified insert — never on
+    // the ordinary approve paths. So a document that had been approved through the
+    // inbox (flag 'no') could never auto-verify on re-submission: the feature was
+    // dead. A prior verified outcome is now sufficient on its own.
+    pool.query
+      .mockResolvedValueOnce([[{ id: 10 }]])
+      .mockResolvedValueOnce([[{ id: 5, organization_conserned_for_future: "no" }]]);
+
+    const req = makeReq({
+      body: { document_type: "Degree", issuing_organization_uuid: ORG_UUID, ...OWNER },
+      user: { id: 1 },
+    });
+    const res = mockRes();
+
+    await createRequest(req, res);
+    expect(res.status).toHaveBeenCalledWith(201);
+
+    const insertCall = pool.query.mock.calls.find(([sql]) =>
+      typeof sql === "string" && sql.includes("INSERT INTO verification_requests")
+    );
+    expect(insertCall[1][4]).toBe("verified");
+    expect(insertCall[1][10]).toBe("auto");
+  });
+
+  it("does not depend on organization_conserned_for_future in the prior-verified lookup", async () => {
+    pool.query
+      .mockResolvedValueOnce([[{ id: 10 }]])
+      .mockResolvedValueOnce([[{ id: 5 }]]);
+
+    const req = makeReq({
+      body: { document_type: "Degree", issuing_organization_uuid: ORG_UUID, ...OWNER },
+      user: { id: 1 },
+    });
+    const res = mockRes();
+
+    await createRequest(req, res);
+
+    const lookupCall = pool.query.mock.calls.find(
+      ([sql]) => typeof sql === "string" && sql.includes("FROM verification_requests") && sql.includes("document_hash=?")
+    );
+    expect(lookupCall).toBeDefined();
+    expect(lookupCall[0]).not.toContain("organization_conserned_for_future");
+  });
+
+  it("flags the response auto_verified so the client shows the Auto Verified confirmation", async () => {
+    pool.query
+      .mockResolvedValueOnce([[{ id: 10 }]])
+      .mockResolvedValueOnce([[{ id: 5 }]]);
+
+    const req = makeReq({
+      body: { document_type: "Degree", issuing_organization_uuid: ORG_UUID, ...OWNER },
+      user: { id: 1 },
+    });
+    const res = mockRes();
+
+    await createRequest(req, res);
+
+    const payload = res.json.mock.calls[0][0];
+    const request = payload?.data?.request ?? payload?.request;
+    expect(request.auto_verified).toBe(true);
+  });
+
   it("stays under_review when the hash was never verified before (no auto-verify)", async () => {
     pool.query.mockResolvedValueOnce([[{ id: 10 }]]); // org lookup; previous-verified check returns nothing
 
