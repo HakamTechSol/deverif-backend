@@ -72,8 +72,13 @@ async function effectiveBasicForMonth(employeeUuid, month, year) {
   return rows.length ? rows[0].basic_salary : 0;
 }
 
-function computedNet(basic, allowancesTotal, deductionsTotal) {
-  return Math.round((basic + allowancesTotal - deductionsTotal) * 100) / 100;
+function computedNet(basicSalary, allowancesTotal, deductionsTotal) {
+  // mysql2 returns DECIMAL columns as strings by default. Convert before
+  // adding so JavaScript does not concatenate the basic and allowance values.
+  const basic = Number(basicSalary);
+  const allowances = Number(allowancesTotal);
+  const deductions = Number(deductionsTotal);
+  return Math.round((basic + allowances - deductions) * 100) / 100;
 }
 
 /**

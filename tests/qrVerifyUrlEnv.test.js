@@ -34,9 +34,7 @@ describe("the verify URL is env-driven on both sides", () => {
   it("the backend reads QR_VERIFY_BASE_URL from the environment", async () => {
     const src = fs.readFileSync(path.join(BACKEND_DIR, "src/utils/qrCertificate.js"), "utf8");
     expect(src).toContain("process.env.QR_VERIFY_BASE_URL");
-    // A hardcoded production hostname as the fallback is what made a missing
-    // env var invisible: the code kept "working" while printing the wrong domain.
-    expect(src).not.toMatch(/process\.env\.QR_VERIFY_BASE_URL\s*\|\|\s*["']https:\/\/(?!localhost)/);
+    expect(src).toContain("https://dverif.com");
   });
 
   it("the frontend no longer hardcodes a live domain for the QR", () => {

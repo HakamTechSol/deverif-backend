@@ -7,6 +7,7 @@ import { match as matchDocuments, DocumentServiceError } from "../services/docum
 import { generateQrForRequest } from "./qrCertificate.js";
 import { recordPersonDocument } from "./personDocuments.js";
 import { buildDocumentCrossCheck } from "./documentConsistency.js";
+import { parseExtractedData } from "./referenceExtraction.js";
 import { createNotificationForUsers } from "../controllers/notification.controller.js";
 import { sendVerificationResultEmailToOrg } from "./mailer.js";
 import { firstFrontendUrl } from "./frontendUrl.js";
@@ -22,23 +23,47 @@ function round2(value) {
 /**
  * Lazy reference-match engine (same pattern as runSlaChecks): processes requests
  * that were staged with match_status='not_attempted' and a matched reference
- * document. Fast path skips OCR when the submitted hash equals the reference
- * hash (confidence=100). Otherwise it runs the Python document service's fuzzy
- * match (OCR extraction + scoring) and applies the decision tree:
+ * document. Fast path skips comparison when the submitted hash equals the
+ * reference hash (confidence=100). Otherwise the two documents are compared on
+ * their CANONICAL extracted fields — the reference's cached field map when it
+ * has one, its live file otherwise — and the decision tree is applied:
  *   >=90  -> auto_matched + auto-approve (verified, QR, person doc, notifications)
  *   60-89 -> manual_review (badge in inbox, normal human flow)
  *   <60   -> manual_review (mismatch-risk hint via match_confidence)
- * Never throws — service outages/timouts leave match_status='not_attempted' and
+ * Never throws — service outages/timeouts leave match_status='not_attempted' and
  * the request stays reviewable. Conditional UPDATEs make concurrent runs safe.
+ *
+ * TENANT BOUNDARY: a reference document is private to the organization that
+ * uploaded it, so every read of one here is filtered on the request's own
+ * issuing_organization_id. An organization is only ever compared against ITS
+ * OWN reference pool. A document another organization uploaded or verified
+ * must never be able to produce an automatic outcome here: that organization
+ * holds no prior reference for this person, so a match would be a decision made
+ * with someone else's private data, and it is exactly the cross-tenant leak
+ * that org-scoping the staging lookup is meant to prevent.
  */
 export async function runAutoMatchChecks({ orgId = null, requestId = null } = {}) {
   try {
-    const where = ["vr.status='under_review'", "vr.match_status='not_attempted'", "vr.matched_employee_document_id IS NOT NULL"];
+    // A request addressed to an unmatched organization has no target org, so
+    // it can never legitimately hold a reference. Excluding those rows means
+    // the sweep can never treat one as matchable even if a stale
+    // matched_employee_document_id were somehow attached to it.
+    const where = [
+      "vr.status='under_review'",
+      "vr.match_status='not_attempted'",
+      "vr.matched_employee_document_id IS NOT NULL",
+      "vr.issuing_organization_id IS NOT NULL",
+    ];
     const params = [];
     if (orgId) {
       where.push("vr.issuing_organization_id = ?");
       params.push(orgId);
     }
+    if (requestId) {
+      where.push("vr.id = ?");
+      params.push(requestId);
+    }
+
     if (requestId) {
       where.push("vr.id = ?");
       params.push(requestId);
@@ -66,22 +91,43 @@ export async function runAutoMatchChecks({ orgId = null, requestId = null } = {}
 }
 
 async function processOne(vr) {
-  const confidence = await computeMatchConfidence(vr);
-  if (confidence === null) {
-    // File missing, reference gone, or the service is down: leave
-    // match_status='not_attempted' so the request stays reviewable.
+  const outcome = await evaluateMatch(vr);
+
+  if (outcome.noReference) {
+    // The staged reference is not available to this request's target
+    // organization — it was deleted, or it belongs to a different org. Either
+    // way this organization holds no reference for the person, which is exactly
+    // what 'no_reference_found' means, and it is a permanent condition worth
+    // recording (unlike a service outage). Clearing the pointer also stops the
+    // request being reconsidered against a reference it may not use.
+    const [u] = await pool.query(
+      `UPDATE verification_requests
+         SET match_status='no_reference_found', matched_employee_document_id=NULL, match_confidence=NULL
+       WHERE id=? AND match_status='not_attempted' AND status='under_review'`,
+      [vr.id]
+    );
+    if (u.affectedRows === 0) {
+      console.warn(`Auto-match skipped: request ${vr.uuid} already processed elsewhere`);
+    }
+    return;
+  }
+
+  if (outcome.confidence === null) {
+    // File missing, or the service is down/timeout: leave match_status
+    // 'not_attempted' so the request stays reviewable and a later run can still
+    // decide it. Never resolved to a final state on a transient failure.
     return;
   }
 
   // Decision tree.
-  if (confidence >= AUTO_APPROVE_THRESHOLD) {
-    await autoApprove(vr, confidence);
+  if (outcome.confidence >= AUTO_APPROVE_THRESHOLD) {
+    await autoApprove(vr, outcome.confidence);
   } else {
     const [u] = await pool.query(
       `UPDATE verification_requests
          SET match_status='manual_review', match_confidence=?
        WHERE id=? AND match_status='not_attempted' AND status='under_review'`,
-      [confidence, vr.id]
+      [outcome.confidence, vr.id]
     );
     if (u.affectedRows === 0) {
       console.warn(`Auto-match skipped: request ${vr.uuid} already processed elsewhere`);
@@ -90,74 +136,135 @@ async function processOne(vr) {
 }
 
 /**
- * Compute the document match confidence for a request against its staged
- * reference employee document. Fast path skips OCR when the submitted hash
- * equals the reference hash (confidence=100). Otherwise it runs the Python
- * document service's fuzzy match.
- * Returns null when it must defer (missing file, missing reference, service
- * down/timeout, non-finite score) — never throws.
+ * Decide a request against its staged reference, distinguishing a PERMANENT
+ * "there is no reference for this organization" from a TRANSIENT "could not
+ * compare right now".
+ *
+ * Returns one of:
+ *   { confidence: number }        a score to act on
+ *   { confidence: null }          defer — leave match_status untouched
+ *   { noReference: true }         the reference is gone or belongs to another org
+ *
+ * The comparison is over CANONICAL EXTRACTED FIELDS only, never over file bytes
+ * or format, with one exception: the exact-hash fast path, which short-circuits
+ * to 100 when the two files are byte-identical. So a DOCX reference and a PDF
+ * submission of the same document — whose hashes can never be equal, and
+ * correctly so — still match on their name/CNIC fields.
  */
-export async function computeMatchConfidence(vr) {
+async function evaluateMatch(vr) {
+  const targetOrgId = vr?.issuing_organization_id ?? null;
+  if (!targetOrgId) {
+    // No target organization means no reference pool and no organization that
+    // owes a decision. Nothing can legitimately match here.
+    console.warn(`Auto-match skipped: request ${vr?.uuid} has no target organization`);
+    return { noReference: true, confidence: null };
+  }
+
   const submittedPath = path.join(DOCS_DIR, path.basename(vr.document_path || ""));
   if (!fs.existsSync(submittedPath)) {
     console.warn(`Auto-match skipped: submitted file missing for request ${vr.uuid}`);
-    return null;
+    return { confidence: null };
   }
 
+  // TENANT BOUNDARY. The reference is read through the employee it belongs to,
+  // filtered on the SAME organization this request is addressed to. Looking the
+  // document up by id alone would let any request match against a reference
+  // belonging to a different organization, which is both a cross-tenant data
+  // leak (another org's document content and employee name) and a
+  // data-integrity failure (an organization auto-approving on a reference it
+  // never held).
   const [refRows] = await pool.query(
-    "SELECT document_hash, file_path, document_type FROM employee_documents WHERE id=?",
-    [vr.matched_employee_document_id]
+    `SELECT ed.id, ed.document_hash, ed.file_path, ed.document_type,
+            ed.extracted_data, ed.extraction_status
+       FROM employee_documents ed
+       JOIN employees e ON e.uuid = ed.employee_uuid
+      WHERE ed.id = ?
+        AND e.organization_id = ?
+      LIMIT 1`,
+    [vr.matched_employee_document_id, targetOrgId]
   );
   if (!refRows.length) {
-    console.warn(`Auto-match skipped: reference document ${vr.matched_employee_document_id} no longer exists`);
-    return null;
+    console.warn(
+      `Auto-match skipped: reference document ${vr.matched_employee_document_id} is not available to organization ${targetOrgId} (request ${vr.uuid})`
+    );
+    return { noReference: true, confidence: null };
   }
   const ref = refRows[0];
-  const refPath = path.join(DOCS_DIR, path.basename(ref.file_path || ""));
-  if (!fs.existsSync(refPath)) {
-    console.warn(`Auto-match skipped: reference file missing for document ${vr.matched_employee_document_id}`);
-    return null;
-  }
 
-  // 1. Exact-hash fast path — identical file, skip OCR entirely.
+  // 1. Exact-hash fast path — byte-identical file, no comparison needed. This
+  //    is the ONLY place file bytes influence the outcome.
   let confidence;
   if (vr.document_hash && ref.document_hash && vr.document_hash === ref.document_hash) {
     confidence = 100;
   } else {
-    // 2. Canonical-field match via the document service (schema-driven OCR
-    //    extraction + scoring, using each file's own document type).
+    // 2. Canonical-field match. Prefer the reference's cached field map (built
+    //    at upload time), so the reference file is neither re-read nor
+    //    re-OCR'd per match and a non-image reference (DOCX) compares exactly
+    //    like an image one. Only a reference with no usable cache (a row that
+    //    predates the column, or whose extraction failed) falls back to sending
+    //    the file itself.
+    const cached = parseExtractedData(ref.extracted_data);
+    const refType = cached?.documentType || ref.document_type || null;
+
+    let refPath = null;
+    if (!cached) {
+      refPath = path.join(DOCS_DIR, path.basename(ref.file_path || ""));
+      if (!fs.existsSync(refPath)) {
+        console.warn(
+          `Auto-match skipped: reference file missing for document ${vr.matched_employee_document_id}`
+        );
+        return { confidence: null };
+      }
+    }
+
     try {
       const { data } = await matchDocuments(submittedPath, refPath, {
         documentTypeA: vr.document_type,
-        documentTypeB: ref.document_type,
+        documentTypeB: refType,
+        fieldsB: cached ? cached.fields : undefined,
       });
       confidence = round2(data?.confidence);
     } catch (e) {
-      // 4. Service down/timeout/bad payload: leave match_status='not_attempted'
+      // Service down/timeout/bad payload: leave match_status='not_attempted'
       // so the request falls through to normal manual review, never blocked.
       if (e instanceof DocumentServiceError) {
         console.warn(`Auto-match deferred for request ${vr.uuid} (${e.kind || "service"}): ${e.message}`);
       } else {
         console.error(`Auto-match unexpected error for request ${vr.uuid}:`, e.message);
       }
-      return null;
+      return { confidence: null };
     }
   }
 
   if (!Number.isFinite(confidence)) {
     console.warn(`Auto-match: invalid confidence for request ${vr.uuid}, deferring`);
-    return null;
+    return { confidence: null };
   }
 
-  return confidence;
+  return { confidence };
+}
+
+/**
+ * Public, score-only view of evaluateMatch: a number when a decision can be
+ * taken, null when the request must be deferred for now. Used by the inline
+ * creation-time match, which only acts on a definitive 100.
+ */
+export async function computeMatchConfidence(vr) {
+  const outcome = await evaluateMatch(vr);
+  return outcome.confidence ?? null;
 }
 
 export async function autoApprove(vr, confidence) {
+  // The tenant invariant is restated on the write as well as the read: an
+  // automatic outcome may only ever be recorded for a request that is addressed
+  // to a real organization. Costless belt-and-braces on the one statement that
+  // flips a request to 'verified' without a human.
   const [u] = await pool.query(
     `UPDATE verification_requests
        SET match_status='auto_matched', match_confidence=?,
            status='verified', verified_at=NOW(), verification_method='automatic_match'
-     WHERE id=? AND match_status='not_attempted' AND status='under_review'`,
+     WHERE id=? AND match_status='not_attempted' AND status='under_review'
+       AND issuing_organization_id IS NOT NULL`,
     [confidence, vr.id]
   );
   if (u.affectedRows === 0) {

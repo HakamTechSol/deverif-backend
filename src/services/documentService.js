@@ -134,14 +134,21 @@ export function ocrExtract(filePath, documentType) {
  * Compare two documents (canonical-field only). UseResult: data.match,
  * data.confidence, data.reasons. documentTypeA/documentTypeB select each
  * file's field schema.
+ *
+ * `fieldsB` supplies side B as a canonical field map that was extracted
+ * earlier (an employee reference document processed at upload time) instead of
+ * a file. Only the extracted fields take part in the decision, so a DOCX
+ * reference and a PDF submission of the same document compare on name/CNIC even
+ * though their hashes can never be equal. Omit it to send both files and have
+ * the service extract both.
  */
-export function match(pathA, pathB, { documentTypeA, documentTypeB } = {}) {
-  return request(
-    "/match",
-    { file_a: pathA, file_b: pathB },
-    {
-      document_type_a: documentTypeA,
-      document_type_b: documentTypeB,
-    }
-  );
+export function match(pathA, pathB, { documentTypeA, documentTypeB, fieldsB } = {}) {
+  const files = pathA ? { file_a: pathA } : {};
+  if (pathB) files.file_b = pathB;
+  const textFields = {
+    document_type_a: documentTypeA,
+    document_type_b: documentTypeB,
+  };
+  if (fieldsB) textFields.file_b_fields = JSON.stringify({ fields: fieldsB });
+  return request("/match", files, textFields);
 }

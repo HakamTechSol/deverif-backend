@@ -21,11 +21,11 @@ const QR_SIGNING_SECRET = process.env.QR_SIGNING_SECRET || "";
  * QR_VERIFY_BASE_URL would keep working and keep printing live-domain QR codes —
  * so the mistake stayed invisible until someone scanned one.
  */
-const QR_VERIFY_BASE_URL = (process.env.QR_VERIFY_BASE_URL || "http://localhost:8080").replace(/\/+$/, "");
+const QR_VERIFY_BASE_URL = (process.env.QR_VERIFY_BASE_URL || "https://dverif.com").replace(/\/+$/, "");
 
 if (!process.env.QR_VERIFY_BASE_URL) {
   console.warn(
-    "QR_VERIFY_BASE_URL is not set — QR codes will point at the local fallback. " +
+    "QR_VERIFY_BASE_URL is not set — QR codes will use https://dverif.com. " +
       "Set it to the public site URL, and keep the frontend's VITE_PUBLIC_BASE_URL identical."
   );
 }

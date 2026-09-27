@@ -1,6 +1,6 @@
 import ApiError from "../utils/ApiError.js";
 import { pool } from "../config/db.js";
-import { encryptCnic, hashCnic } from "../utils/personCrypto.js";
+import { encryptCnic, decryptCnic, hashCnic } from "../utils/personCrypto.js";
 import { recordPersonDocument } from "../utils/personDocuments.js";
 import { assertDocumentValid, VALIDATION_FLAGGED, VALIDATION_PASSED } from "../utils/documentValidate.js";
 import { created, ok } from "../utils/response.js";
@@ -60,6 +60,83 @@ function generateFileHash(filePath) {
   }
   const buffer = fs.readFileSync(filePath);
   return crypto.createHash("sha256").update(buffer).digest("hex");
+}
+
+/**
+ * Resolve the reference document a request should be matched against, for the
+ * TARGET organization only.
+ *
+ * A reference document is private to the organization that uploaded it, so both
+ * lookups below are filtered on organization_id. There is deliberately no
+ * platform-wide fallback: an organization that holds no reference for a person
+ * owes a human decision on that request, and borrowing another organization's
+ * reference would both leak that organization's document and let it approve on
+ * evidence it never had. Requests that end up with no reference are recorded as
+ * 'manual_review' when the org knows the person (a human can confirm quickly)
+ * and 'no_reference_found' when it does not.
+ *
+ * `executor` is the transaction connection on the create path (so it reads its
+ * own uncommitted INSERT) and the pool elsewhere.
+ *
+ * @returns {{matchStatus: string, matchedEmployeeDocumentId: number|null}}
+ */
+async function stageReferenceMatch(executor, orgId, normalizedCnic) {
+  if (!orgId) {
+    return { matchStatus: "no_reference_found", matchedEmployeeDocumentId: null };
+  }
+
+  const [refRows] = await executor.query(
+    `SELECT e.uuid AS employee_uuid, ed.id AS doc_id, ed.document_hash
+     FROM employees e
+     JOIN employee_documents ed ON ed.employee_uuid = e.uuid
+     WHERE e.organization_id = ?
+       AND REPLACE(REPLACE(e.cnic, '-', ''), ' ', '') = ?
+     ORDER BY (e.record_type = 'roster') DESC
+     LIMIT 1`,
+    [orgId, normalizedCnic]
+  );
+  if (refRows.length) {
+    return { matchStatus: "not_attempted", matchedEmployeeDocumentId: refRows[0].doc_id };
+  }
+
+  const [empRows] = await executor.query(
+    `SELECT emp.uuid FROM employees emp
+     WHERE emp.organization_id = ?
+       AND REPLACE(REPLACE(emp.cnic, '-', ''), ' ', '') = ?
+     ORDER BY (emp.record_type = 'roster') DESC
+     LIMIT 1`,
+    [orgId, normalizedCnic]
+  );
+  return {
+    matchStatus: empRows.length ? "manual_review" : "no_reference_found",
+    matchedEmployeeDocumentId: null,
+  };
+}
+
+/**
+ * The document owner's CNIC as the 13 bare digits the employee lookup compares
+ * against, read back from the request's linked person.
+ *
+ * The request row itself stores no CNIC by design (only the encrypted copy on
+ * `persons`), and re-addressing a request has to re-resolve its reference
+ * against the new target org using the SAME identity it was created with.
+ * Returns null — rather than throwing — when there is no linked person or the
+ * payload cannot be decrypted (missing/rotated PERSON_DATA_ENCRYPTION_KEY);
+ * callers treat that as "cannot stage", which resolves to a human decision.
+ */
+async function readOwnerCnicNormalized(linkedPersonId) {
+  if (!linkedPersonId) return null;
+  const [rows] = await pool.query(
+    "SELECT cnic_encrypted FROM persons WHERE id=?",
+    [linkedPersonId]
+  );
+  if (!rows.length || !rows[0].cnic_encrypted) return null;
+  try {
+    return String(decryptCnic(rows[0].cnic_encrypted)).replace(/\D/g, "") || null;
+  } catch (e) {
+    console.warn(`Could not read the document owner's CNIC for person ${linkedPersonId}: ${e.message}`);
+    return null;
+  }
 }
 
 async function resolveOrganizationUuid(uuid, required = false) {
@@ -262,37 +339,14 @@ export async function createRequest(req, res) {
     );
 
     // Reference-match setup: after the request is saved, locate a roster (or, as a
-    // fallback, learned_reference) employee in the target org whose CNIC matches
-    // the document owner, and stage the document match. The actual document match
+    // fallback, learned_reference) employee in the TARGET org whose CNIC matches
+    // the document owner, and stage the document match. The lookup is scoped to
+    // that one org — see stageReferenceMatch. The actual document match
     // (auto-approve/manual-review decision) happens lazily, not here.
-    if (orgId) {
-      const [refRows] = await connection.query(
-        `SELECT e.uuid AS employee_uuid, ed.id AS doc_id, ed.document_hash
-         FROM employees e
-         JOIN employee_documents ed ON ed.employee_uuid = e.uuid
-         WHERE e.organization_id = ?
-           AND REPLACE(REPLACE(e.cnic, '-', ''), ' ', '') = ?
-         ORDER BY (e.record_type = 'roster') DESC
-         LIMIT 1`,
-        [orgId, normalized]
-      );
-      if (refRows.length) {
-        matchStatus = "not_attempted";
-        matchedEmployeeDocumentId = refRows[0].doc_id;
-      } else {
-        const [empRows] = await connection.query(
-          `SELECT emp.uuid FROM employees emp
-           WHERE emp.organization_id = ?
-             AND REPLACE(REPLACE(emp.cnic, '-', ''), ' ', '') = ?
-           ORDER BY (emp.record_type = 'roster') DESC
-           LIMIT 1`,
-          [orgId, normalized]
-        );
-        matchStatus = empRows.length ? "manual_review" : "no_reference_found";
-      }
-    } else {
-      matchStatus = "no_reference_found";
-    }
+    ({
+      matchStatus,
+      matchedEmployeeDocumentId,
+    } = await stageReferenceMatch(connection, orgId, normalized));
 
     await connection.query(
       `UPDATE verification_requests
@@ -598,7 +652,9 @@ export async function updateMySentRequest(req, res) {
   assertUuid(uuid, "Request UUID");
 
   const [allRows] = await pool.query(
-    `SELECT id, status, user_id, document_path, document_format, document_hash, document_owner_name
+    `SELECT id, status, user_id, document_path, document_format, document_hash, document_owner_name,
+            issuing_organization_id, unmatched_org_id, linked_person_id, match_status,
+            matched_employee_document_id
      FROM verification_requests WHERE uuid=?`,
     [uuid]
   );
@@ -703,15 +759,48 @@ export async function updateMySentRequest(req, res) {
     unmatchedOrgId = await resolveUnmatchedOrg(otherOrgName, otherEmail, otherPhone, otherWebsite);
   }
 
+  // Re-addressing a request invalidates whatever reference was staged for it.
+  //
+  // The target organization is what decides WHICH reference pool a request may
+  // be matched against, so a staged matched_employee_document_id belongs to the
+  // PREVIOUS target's employee files. Keeping it would let the new target
+  // auto-approve against another organization's reference — both a cross-tenant
+  // leak and a decision made on evidence the new target never held. The
+  // staging is therefore recomputed from scratch, scoped to the new target.
+  //
+  // A document re-upload alone does NOT invalidate the staging: staging is
+  // resolved from the owner's CNIC, not from the file, so it stays correct.
+  const targetChanged = (allRows[0].issuing_organization_id ?? null) !== (orgId ?? null);
+  let matchStatus = allRows[0].match_status ?? "not_attempted";
+  let matchedEmployeeDocumentId = allRows[0].matched_employee_document_id ?? null;
+
+  if (targetChanged) {
+    const normalizedOwnerCnic = await readOwnerCnicNormalized(allRows[0].linked_person_id);
+    if (orgId && normalizedOwnerCnic) {
+      ({ matchStatus, matchedEmployeeDocumentId } = await stageReferenceMatch(
+        pool,
+        orgId,
+        normalizedOwnerCnic
+      ));
+    } else {
+      // No target org, or the owner's CNIC can no longer be read: there is
+      // nothing to stage against, which is honestly 'no_reference_found'.
+      matchStatus = "no_reference_found";
+      matchedEmployeeDocumentId = null;
+    }
+  }
+
   await pool.query(
     `UPDATE verification_requests
      SET document_type=?, issuing_organization_id=?, unmatched_org_id=?,
          submission_remarks=?, document_owner_name=?,
          document_path=?, document_format=?, document_hash=?,
-         document_validation_status=?, document_validation_reason=?
+         document_validation_status=?, document_validation_reason=?,
+         match_status=?, matched_employee_document_id=?
      WHERE uuid=?`,
     [document_type, orgId, unmatchedOrgId, remarks, documentOwnerName,
-      docPath, docFormat, documentHash, validationStatus, validationReason, uuid]
+      docPath, docFormat, documentHash, validationStatus, validationReason,
+      matchStatus, matchedEmployeeDocumentId, uuid]
   );
 
   const [rows] = await pool.query(
@@ -821,7 +910,13 @@ export async function myInboxRequests(req, res) {
      LEFT JOIN organizations issuing_org ON issuing_org.id = vr.issuing_organization_id
      LEFT JOIN unmatched_organizations uo ON uo.id = vr.unmatched_org_id
      LEFT JOIN users verifier ON verifier.id = vr.verified_by
+     -- The matched reference is exposed only when it belongs to the request's
+     -- OWN target organization. matched_employee_document_id is a plain int
+     -- with no cross-table guarantee, so without this predicate a stale pointer
+     -- would render another organization's reference file name and employee
+     -- name in this organization's inbox.
      LEFT JOIN employee_documents med ON med.id = vr.matched_employee_document_id
+          AND med.employee_uuid IN (SELECT e.uuid FROM employees e WHERE e.organization_id = vr.issuing_organization_id)
      LEFT JOIN employees memp ON memp.uuid = med.employee_uuid
      ${whereClause}
      ORDER BY vr.created_at DESC
@@ -870,6 +965,7 @@ export async function getMyInboxRequestDetail(req, res) {
      LEFT JOIN unmatched_organizations uo ON uo.id = vr.unmatched_org_id
      LEFT JOIN users verifier ON verifier.id = vr.verified_by
      LEFT JOIN employee_documents med ON med.id = vr.matched_employee_document_id
+          AND med.employee_uuid IN (SELECT e.uuid FROM employees e WHERE e.organization_id = vr.issuing_organization_id)
      LEFT JOIN employees memp ON memp.uuid = med.employee_uuid
      WHERE vr.uuid=?`,
     [req.params.uuid]
@@ -881,8 +977,11 @@ export async function getMyInboxRequestDetail(req, res) {
     throw new ApiError(403, "You are not allowed to view this request");
   }
 
-  // Lazy reference-match check on read (fire-and-forget; results appear on next fetch)
-  runAutoMatchChecks({ requestId: vr.id }).catch(() => {});
+  // Lazy reference-match check on read (fire-and-forget; results appear on next fetch).
+  // Scoped to the caller's own organization as well as the request: the sweep must
+  // never be able to act on this organization's behalf on a reference that belongs
+  // to another one.
+  runAutoMatchChecks({ requestId: vr.id, orgId: req.user.organization }).catch(() => {});
 
   const detail = { ...vr, has_prior_verification: false, prior_verified_at: null };
 

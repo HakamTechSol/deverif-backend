@@ -11,10 +11,18 @@ import { hashCnic } from "./personCrypto.js";
  * (document_owner_name + linked persons.cnic_hash) and the identity fields
  * actually OCR'd off the submitted document.
  *
- * This is an additional DATA-QUALITY signal — never a blocker. It runs once at
- * approval time, caches document_extracted_name / document_extracted_cnic_hash
- * on the person_documents row, and records a matched/mismatched flag so a
- * future NADRA bulk-verification script can re-verify WITHOUT re-running OCR.
+ * This is an additional DATA-QUALITY signal — never a blocker, and never part
+ * of the auto-match decision. It runs once at approval time, caches
+ * document_extracted_name / document_extracted_cnic_hash on the person_documents
+ * row, and records a matched/mismatched flag so a future NADRA bulk-verification
+ * script can re-verify WITHOUT re-running OCR.
+ *
+ * The typed `document_owner_name` is an unverified human claim and is treated as
+ * one: it is used here only to report whether the document agrees with the form,
+ * and it is compared FUZZILY (>= 88% after normalization), never by string
+ * equality. The auto-verify decision itself is made solely on OCR-vs-OCR
+ * canonical fields (see utils/autoMatch.js), so a typo on the form can neither
+ * cause nor prevent an automatic outcome.
  *
  * It deliberately does NOT touch persons.is_nadra_verified (that stays 'no'
  * until real NADRA integration exists).
@@ -44,11 +52,26 @@ function lcsLength(a, b) {
  *       indel = len_a + len_b - 2 * lcs
  * Case + whitespace normalized before comparing so the 3-way form/document
  * check uses the same >=88% semantics as document-vs-document matching.
+ *
+ * Punctuation is turned into a space (not removed) because this is a free-text
+ * field: "Muhammad, Ali" and "Muhammad Ali" must converge, while gluing the
+ * words together would invent a token nothing else produces. Exact fields such
+ * as the CNIC instead have punctuation REMOVED; that asymmetry lives in the
+ * document service's match_service._norm_exact / _norm_text pair.
  */
+export function normalizeNameForMatch(value) {
+  return String(value ?? "")
+    .toUpperCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 export function nameSimilarityRatio(a, b) {
-  const sa = String(a ?? "").toUpperCase().replace(/\s+/g, " ").trim();
-  const sb = String(b ?? "").toUpperCase().replace(/\s+/g, " ").trim();
+  const sa = normalizeNameForMatch(a);
+  const sb = normalizeNameForMatch(b);
   if (!sa.length && !sb.length) return 100;
+  if (!sa.length || !sb.length) return 0;
   const lcs = lcsLength(sa, sb);
   const indel = sa.length + sb.length - 2 * lcs;
   return 100 - (100 * indel) / (sa.length + sb.length);

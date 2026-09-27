@@ -6,11 +6,11 @@ import crypto from "node:crypto";
 vi.mock("../src/config/db.js", () => ({ pool: { query: vi.fn() } }));
 vi.mock("../src/services/documentService.js", async (importOriginal) => {
   const original = await importOriginal();
-  return { ...original, validate: vi.fn() };
+  return { ...original, validate: vi.fn(), ocrExtract: vi.fn() };
 });
 
 import { pool } from "../src/config/db.js";
-import { validate, DocumentServiceError } from "../src/services/documentService.js";
+import { validate, ocrExtract, DocumentServiceError } from "../src/services/documentService.js";
 import { uploadEmployeeDocuments } from "../src/controllers/org/employeeMeta.controller.js";
 import { DOCS_DIR } from "../src/config/uploadPaths.js";
 
@@ -35,6 +35,13 @@ beforeEach(() => {
   vi.clearAllMocks();
   // Document service is "up" and happy by default; individual tests override.
   validate.mockResolvedValue({ success: true, data: { valid: true } });
+  ocrExtract.mockResolvedValue({
+    success: true,
+    data: {
+      document_type: "education_certificate",
+      fields: { name: { value: "Asim Khan", confidence: "high" } },
+    },
+  });
 });
 
 function writeTempFile(name, bytes) {
@@ -248,19 +255,26 @@ describe("uploadEmployeeDocuments — document_hash storage", () => {
     expect(insertCall[1][6]).toMatch(/^[0-9a-f]{64}$/);
   });
 
-  it("stores null hash for non-PDF/image files (office/zip formats skipped)", async () => {
-    const bytes = Buffer.from("PK\x03\x04 not a real docx, skipped for hashing");
-    writeTempFile("hash_skip.docx.bin", bytes);
+  it("stores a SHA-256 hash for a DOCX too, exactly as a request upload does", async () => {
+    // Regression: the hash used to be computed for PDF/image uploads only, so a
+    // DOCX reference permanently carried a NULL document_hash. Nothing matched
+    // on it (correct — a DOCX and a PDF of the same document can never be
+    // byte-identical), but the NULL also erased the difference between "this
+    // reference was never fingerprinted" and "fingerprinted and differs". A
+    // verification-request upload hashes every file, and so does this one now.
+    const bytes = Buffer.from("PK\x03\x04 not a real docx, but hashed like any upload");
+    writeTempFile("hash_docx.docx.bin", bytes);
+    const expected = crypto.createHash("sha256").update(bytes).digest("hex");
 
     pool.query
       .mockResolvedValueOnce([[{ uuid: EMP_UUID }]])
       .mockResolvedValueOnce([{ insertId: 2 }])
-      .mockResolvedValueOnce([[{ uuid: "doc-uuid-2", employee_uuid: EMP_UUID, document_type: "Degree", file_name: "skip.docx", file_path: "documents/skip.docx", file_size: bytes.length }]]);
+      .mockResolvedValueOnce([[{ uuid: "doc-uuid-2", employee_uuid: EMP_UUID, document_type: "Degree", file_name: "ref.docx", file_path: "documents/ref.docx", file_size: bytes.length }]]);
 
     const req = makeReq({
       files: [{
-        filename: "hash_skip.docx.bin",
-        originalname: "skip.docx",
+        filename: "hash_docx.docx.bin",
+        originalname: "ref.docx",
         mimetype: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         size: bytes.length,
       }],
@@ -272,6 +286,7 @@ describe("uploadEmployeeDocuments — document_hash storage", () => {
     const insertCall = pool.query.mock.calls.find(([sql]) =>
       typeof sql === "string" && sql.includes("INSERT INTO employee_documents")
     );
-    expect(insertCall[1][6]).toBeNull();
+    expect(insertCall[1][6]).toBe(expected);
+    expect(insertCall[1][6]).toMatch(/^[0-9a-f]{64}$/);
   });
 });

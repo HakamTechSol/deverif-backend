@@ -8,6 +8,10 @@ import { assertUuid } from "../../utils/publicResponse.js";
 import { DOCS_DIR } from "../../config/uploadPaths.js";
 import { getActorFromReq, logAudit } from "../../utils/auditLog.js";
 import { assertDocumentValid } from "../../utils/documentValidate.js";
+import {
+  extractCanonicalFields,
+  EXTRACTION_SUCCEEDED,
+} from "../../utils/referenceExtraction.js";
 
 function requireOrgId(req) {
   const orgId = req.scopeOrgId;
@@ -104,7 +108,8 @@ export async function listEmployeeDocuments(req, res) {
   const { uuid } = req.params;
   assertUuid(uuid, "Employee UUID");
   const [rows] = await pool.query(
-    `SELECT d.uuid, d.employee_uuid, d.document_type, d.file_name, d.file_path, d.file_size, d.uploaded_at, d.created_at
+    `SELECT d.uuid, d.employee_uuid, d.document_type, d.file_name, d.file_path, d.file_size, d.uploaded_at, d.created_at,
+            d.document_hash, d.extraction_status, d.extracted_at
      FROM employee_documents d
      JOIN employees e ON e.uuid = d.employee_uuid
      WHERE d.employee_uuid = ? AND e.organization_id = ?`,
@@ -143,22 +148,47 @@ export async function uploadEmployeeDocuments(req, res) {
     // requests and wrong for the reference pool.
     await assertDocumentValid(diskPath, { treatHeuristicAsFatal: true });
 
-    // Exact-file fingerprint for the auto-verification fast path. Only PDF and
-    // image files get hashed — office/zip formats are skipped on purpose.
+    // Exact-file fingerprint for the auto-verification fast path. Hashed for
+    // EVERY upload, exactly as a verification-request upload is — the previous
+    // PDF/image-only restriction meant a DOCX reference could never take the
+    // fast path, which is the correct outcome anyway (two different formats
+    // never hash alike) but it also left the column permanently NULL for those
+    // rows, hiding "never fingerprinted" behind "fingerprinted, differs".
     let documentHash = null;
-    const isPdfOrImage = file.mimetype === "application/pdf" || (file.mimetype && file.mimetype.startsWith("image/"));
-    if (isPdfOrImage && fs.existsSync(diskPath)) {
+    if (fs.existsSync(diskPath)) {
       documentHash = crypto.createHash("sha256").update(fs.readFileSync(diskPath)).digest("hex");
     }
 
+    // Canonical identity fields, extracted ONCE here rather than on every later
+    // match. The document service dispatches on the file's real content type:
+    // PDF/image go through the OCR path and a DOCX is read directly out of
+    // word/document.xml with python-docx, both yielding the same canonical
+    // field map. That cache is what lets a DOCX reference and a PDF submission
+    // of the same document match on content instead of falling to manual review.
+    // Never throws — a failure is recorded as a status and matching falls back
+    // to comparing the files live.
+    const extraction = await extractCanonicalFields(diskPath, documentType, file);
+
     const [r] = await pool.query(
       `INSERT INTO employee_documents
-        (uuid, employee_uuid, document_type, file_name, file_path, file_size, uploaded_by_uuid, document_hash)
-       VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?)`,
-      [uuid, documentType, file.originalname, `documents/${file.filename}`, file.size, uploadedBy, documentHash]
+        (uuid, employee_uuid, document_type, file_name, file_path, file_size, uploaded_by_uuid, document_hash,
+         extracted_data, extraction_status, extraction_error, extracted_at)
+       VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ${extraction.status === EXTRACTION_SUCCEEDED ? "NOW()" : "NULL"})`,
+      [
+        uuid,
+        documentType,
+        file.originalname,
+        `documents/${file.filename}`,
+        file.size,
+        uploadedBy,
+        documentHash,
+        extraction.data ? JSON.stringify(extraction.data) : null,
+        extraction.status,
+        extraction.error,
+      ]
     );
     const [[row]] = await pool.query(
-      "SELECT uuid, employee_uuid, document_type, file_name, file_path, file_size, uploaded_at, created_at FROM employee_documents WHERE id=?",
+      "SELECT uuid, employee_uuid, document_type, file_name, file_path, file_size, uploaded_at, created_at, document_hash, extracted_data, extraction_status, extracted_at FROM employee_documents WHERE id=?",
       [r.insertId]
     );
     inserted.push(row);

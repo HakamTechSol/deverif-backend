@@ -1,4 +1,5 @@
 import PDFDocument from "pdfkit";
+import { fileURLToPath } from "node:url";
 import QRCode from "qrcode";
 import { buildVerifyUrl } from "./qrCertificate.js";
 
@@ -6,6 +7,7 @@ const PRIMARY = "#0d9488"; // teal-600
 const DARK = "#134e4a"; // teal-900
 const MUTED = "#64748b";
 const SUCCESS = "#15803d";
+const LOGO_PATH = fileURLToPath(new URL("../assets/logo-full.png", import.meta.url));
 
 function formatCertDate(value) {
   if (!value) return "—";
@@ -25,7 +27,7 @@ function labelValueRow(doc, label, value, y, valueColor = "#0f172a") {
 
 /**
  * Builds a printable verification certificate PDF (A4) with the public
- * QR embedded. The QR points to https://portal.dverif.com/verify/<qr_token>.
+ * QR embedded. The QR points to the public Dverif verification page.
  */
 export async function generateCertificatePdf({ request, organizationName, requesterName }) {
   const verifyUrl = buildVerifyUrl(request.qr_token);
@@ -40,8 +42,9 @@ export async function generateCertificatePdf({ request, organizationName, reques
 
   // Header band
   doc.rect(0, 0, pageWidth, 96).fill(DARK);
-  doc.fillColor("#ffffff").font("Helvetica-Bold").fontSize(22).text("Dverif", 50, 30);
-  doc.font("Helvetica").fontSize(11).fillColor("#99f6e4").text("Document Verification Certificate", 50, 58);
+  doc.roundedRect(36, 16, 168, 62, 6).fill("#ffffff");
+  doc.image(LOGO_PATH, 44, 24, { fit: [152, 46], align: "center", valign: "center" });
+  doc.font("Helvetica").fontSize(11).fillColor("#99f6e4").text("Document Verification Certificate", 222, 40, { width: pageWidth - 260 });
 
   // Title
   doc.fillColor("#0f172a").font("Helvetica-Bold").fontSize(17).text("Verification Certificate", 50, 128);
@@ -49,16 +52,14 @@ export async function generateCertificatePdf({ request, organizationName, reques
 
   // Details
   let y = 172;
-  labelValueRow(doc, "Reference", request.uuid, y);
-  y = 194;
   labelValueRow(doc, "Document type", request.document_type, y);
-  y = 216;
+  y = 194;
   labelValueRow(doc, "Issued by", organizationName || "—", y);
-  y = 238;
+  y = 216;
   labelValueRow(doc, "Verified on", formatCertDate(request.verified_at), y);
-  y = 260;
+  y = 238;
   labelValueRow(doc, "Submitted by", requesterName || "—", y);
-  y = 286;
+  y = 264;
 
   // Status badge
   doc.roundedRect(50, y, 130, 24, 12).fill(SUCCESS);
