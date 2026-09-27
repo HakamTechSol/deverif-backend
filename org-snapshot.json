@@ -1,0 +1,22 @@
+[
+  {
+    "id": 1,
+    "uuid": "3f107b8a-b8f5-11f1-ac00-9840bb468dc0",
+    "name": "HakamTechSol",
+    "subscription_status": "none",
+    "subscription_start": "2026-09-25T19:27:41.000Z",
+    "subscription_expiry": "2026-10-25T19:27:41.000Z",
+    "subscription_plan_id": null,
+    "pending_plan_id": null
+  },
+  {
+    "id": 2,
+    "uuid": "3318ceb4-b8f9-11f1-ac00-9840bb468dc0",
+    "name": "Pixel2Pro",
+    "subscription_status": "none",
+    "subscription_start": "2026-09-25T19:11:22.000Z",
+    "subscription_expiry": null,
+    "subscription_plan_id": null,
+    "pending_plan_id": null
+  }
+]

@@ -1,6 +1,7 @@
 import { pool } from "../../config/db.js";
 import { ok } from "../../utils/response.js";
 import { parsePagination, paginatedResponse } from "../../utils/pagination.js";
+import { ROLE_ORG_ADMIN } from "../../utils/roles.js";
 
 const ORG_USER_SELECT = `SELECT u.id, u.uuid, u.full_name, u.email, u.phone, u.cnic,
         u.status, u.org_role, u.feature_access, u.created_at,
@@ -19,10 +20,15 @@ export async function listOrgUsers(req, res) {
   const conditions = ["u.organization = ?"];
   const params = [req.scopeOrgId];
 
-  // Business rule: org-admins only see platform accounts created from employees
-  // THEY personally added (per-admin visibility within one organization).
-  conditions.push("e.added_by_uuid = ?");
-  params.push(req.user.uuid);
+  // Per-admin visibility: each org_admin sees only the platform accounts created
+  // from employees THEY personally added. Not applied to sub-admins — they share
+  // the org_admin's operational access, and this filter left them with an empty
+  // list for a permission they had been granted. See the same note in
+  // listEmployees (admin/employees.controller.js).
+  if (req.user.org_role === ROLE_ORG_ADMIN) {
+    conditions.push("e.added_by_uuid = ?");
+    params.push(req.user.uuid);
+  }
 
   if (search) {
     conditions.push("(u.full_name LIKE ? OR u.email LIKE ? OR u.phone LIKE ? OR u.cnic LIKE ? OR dg.name LIKE ? OR dp.name LIKE ?)");

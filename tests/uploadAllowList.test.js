@@ -51,11 +51,7 @@ describe("isDocumentAllowed — representative uploads", () => {
     ["photo.jpeg", "image/jpeg", true],
     ["doc.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", true],
     ["doc.doc", "application/msword", true],
-    ["sheet.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", true],
-    ["sheet.xls", "application/vnd.ms-excel", true],
     ["notes.txt", "text/plain", true],
-    ["data.csv", "text/csv", true],
-    ["bundle.zip", "application/zip", true],
     ["photo.webp", "image/webp", true],
     ["photo.gif", "image/gif", true],
     ["photo.bmp", "image/bmp", true],
@@ -79,5 +75,96 @@ describe("isDocumentAllowed — representative uploads", () => {
 
   it("rejects an allowed extension with no mime at all", () => {
     expect(isDocumentAllowed("cv.pdf", "")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Archives and spreadsheets must not be uploadable, under ANY mime label.
+//
+// The AND-check is the whole defence, so these cases have to sweep the mime
+// space rather than test one "typical" spoof. A single matrix entry that
+// slipped through would mean a client could pick the filename and the label
+// together and walk an arbitrary archive past the filter.
+// ---------------------------------------------------------------------------
+
+describe("isDocumentAllowed — zip/Excel/CSV are rejected regardless of the claimed mime", () => {
+  const BANNED_EXTENSIONS = [".zip", ".xlsx", ".xls", ".csv"];
+
+  // Every mime that could plausibly be attached to a banned extension, plus the
+  // ones an attacker would reach for to disguise it.
+  const SPOOF_MIMES = [
+    "application/zip",
+    "application/x-zip-compressed",
+    "application/octet-stream",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.ms-excel",
+    "text/csv",
+    "application/csv",
+    "text/plain",
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/pdf",
+    "image/png",
+    "", // no mime at all
+  ];
+
+  for (const ext of BANNED_EXTENSIONS) {
+    for (const mime of SPOOF_MIMES) {
+      it(`rejects "report${ext}" claiming "${mime || "(no mime)"}"`, () => {
+        expect(isDocumentAllowed(`report${ext}`, mime)).toBe(false);
+      });
+    }
+  }
+
+  it("rejects the banned extensions even with a correctly-matching mime", () => {
+    // The honest case, not just the spoofed ones: these formats are simply not
+    // supported, so the "right" mime does not earn them a pass.
+    expect(isDocumentAllowed("archive.zip", "application/zip")).toBe(false);
+    expect(isDocumentAllowed("sheet.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")).toBe(false);
+    expect(isDocumentAllowed("sheet.xls", "application/vnd.ms-excel")).toBe(false);
+    expect(isDocumentAllowed("data.csv", "text/csv")).toBe(false);
+  });
+
+  it("rejects banned extensions in mixed case and with extra dots", () => {
+    // path.extname + toLowerCase normalise both, so these must not be a bypass.
+    expect(isDocumentAllowed("ARCHIVE.ZIP", "application/zip")).toBe(false);
+    expect(isDocumentAllowed("data.CsV", "text/csv")).toBe(false);
+    expect(isDocumentAllowed("report.final.ZIP", "application/octet-stream")).toBe(false);
+  });
+
+  it("still accepts a real .docx, so restricting the container did not break Word", () => {
+    // The counterweight to every rejection above: the format that IS a zip has
+    // to keep working, otherwise the filter has removed a supported type.
+    expect(isDocumentAllowed("letter.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")).toBe(true);
+    // And with the generic blob marker, which real browsers do send.
+    expect(isDocumentAllowed("letter.docx", "application/octet-stream")).toBe(true);
+  });
+});
+
+describe("the banned extensions are absent from both allow-lists", () => {
+  it("backend allow-list excludes them", () => {
+    for (const ext of [".zip", ".xlsx", ".xls", ".csv"]) {
+      expect(backendAllowedExtensions()).not.toContain(ext);
+    }
+  });
+
+  it("frontend picker list excludes them", () => {
+    for (const ext of [".zip", ".xlsx", ".xls", ".csv"]) {
+      expect(frontendAllowedExtensions()).not.toContain(ext);
+    }
+  });
+
+  it("the human-readable label no longer advertises them", () => {
+    const src = fs.readFileSync(
+      path.join(FRONTEND_ROOT, "src/lib/documentTypes.ts"),
+      "utf8"
+    );
+    const label = src.match(/UPLOADABLE_DOC_LABEL = "([^"]+)"/);
+    expect(label).toBeTruthy();
+    // A label still saying "CSV or ZIP" would promise users a picker that then
+    // rejects their file.
+    for (const word of ["ZIP", "CSV", "Excel", "XLS"]) {
+      expect(label[1]).not.toContain(word);
+    }
   });
 });

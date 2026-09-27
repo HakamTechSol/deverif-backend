@@ -2,7 +2,7 @@ import ApiError from "../utils/ApiError.js";
 import { pool } from "../config/db.js";
 import { encryptCnic, hashCnic } from "../utils/personCrypto.js";
 import { recordPersonDocument } from "../utils/personDocuments.js";
-import { assertDocumentValid } from "../utils/documentValidate.js";
+import { assertDocumentValid, VALIDATION_FLAGGED, VALIDATION_PASSED } from "../utils/documentValidate.js";
 import { created, ok } from "../utils/response.js";
 import { assertUuid } from "../utils/publicResponse.js";
 import { parsePagination, paginatedResponse } from "../utils/pagination.js";
@@ -86,10 +86,9 @@ export async function createRequest(req, res) {
   if (!document_type) throw new ApiError(400, "document_type is required");
   if (!req.file) throw new ApiError(400, "document file is required");
 
-  if (req.user.organization) {
-    await enforceRequestQuota(req.user.organization);
-  }
-
+  // NOTE: daily quota is deliberately NOT consumed here. It is consumed inside
+  // the single transaction below, together with the request INSERT, so a
+  // rejected document rolls the counter back instead of burning it.
   const orgId = await resolveOrganizationUuid(issuing_organization_uuid || null);
 
   const otherOrgName = other_organization_name ? String(other_organization_name).trim() : null;
@@ -143,7 +142,30 @@ export async function createRequest(req, res) {
   // Corrupt-file guard: reject definitively corrupt uploads before they reach
   // the DB. Fails open (warn-only) only when the service is unreachable
   // (timeout / connection refused); any other service failure rejects with 400.
-  await assertDocumentValid(fullPath);
+  //
+  // Runs BEFORE the transaction opens, not inside it. This call renders the
+  // document and runs OCR, so it can take seconds; running it inside would hold
+  // the organization's FOR UPDATE row locks (taken by enforceRequestQuota) for
+  // that whole window, serializing every concurrent request from the org and
+  // blocking the lifecycle job, which locks the same org rows.
+  //
+  // The ordering requirement is still fully met: validation is a pure external
+  // check that touches no database state, so when it rejects here the quota
+  // counter has not been touched at all. This is the strongest form of the
+  // guarantee -- rollback-inside-a-transaction would merely undo the increment,
+  // whereas this never performs it.
+  //
+  // Throws only for a STRUCTURAL failure (unparseable / truncated /
+  // extension-or-mimetype-spoofed) or a fail-closed service error. A heuristic
+  // quality flag resolves instead, and is stored on the request row below so
+  // the reviewing organization sees a warning rather than losing a valid
+  // submission over a tuning-sensitive threshold.
+  const { status: validationStatus, reason: validationReason } = await assertDocumentValid(fullPath);
+  if (validationStatus === VALIDATION_FLAGGED) {
+    console.warn(
+      `[createRequest] Document flagged by a heuristic check for requester ${req.user.id} (${docPath}): ${validationReason}`
+    );
+  }
 
   // Resolve unmatched organization if "Other" was selected
   let unmatchedOrgId = null;
@@ -180,117 +202,159 @@ export async function createRequest(req, res) {
     autoVerify = previousVerified.length > 0;
   }
 
-  const [result] = await pool.query(
-    `INSERT INTO verification_requests
-     (user_id, document_type, issuing_organization_id, unmatched_org_id, status, submitted_at,
-      document_path, document_format, document_hash,
-      organization_conserned_for_future, submission_remarks,
-      verification_method, verified_at, document_owner_name, created_at)
-     VALUES (?, ?, ?, ?, ?, NOW(), ?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
-    [
-      req.user.id,
-      document_type,
-      orgId,
-      unmatchedOrgId,
-      autoVerify ? "verified" : "under_review",
-      docPath,
-      docFormat,
-      documentHash,
-      // No longer the auto-verify gate (see the lookup above). It now simply
-      // records that this particular row was itself created by a repeat
-      // auto-verification rather than by a fresh submission.
-      autoVerify ? "yes" : "no",
-      remarks,
-      autoVerify ? "auto" : "manual",
-      autoVerify ? new Date() : null,
-      documentOwnerName
-    ]
-  );
-
-  // Reference-match setup: after the request is saved, locate a roster (or, as a
-  // fallback, learned_reference) employee in the target org whose CNIC matches
-  // the document owner, and stage the document match. The actual document match
-  // (auto-approve/manual-review decision) happens lazily, not here.
+  // ── Single atomic block: quota consumption + request creation ──────────────
+  //
+  // Everything from the quota decrement to the fully-formed request row shares
+  // one transaction on one connection. If ANY step here throws -- the quota
+  // being exhausted, the INSERT failing, a constraint violation on the person
+  // link -- the rollback unwinds the daily_request_usage increment too. The
+  // counter is therefore permanently decremented only when the request row is
+  // genuinely committed.
+  //
+  // Note the SELECT at the end MUST run on this connection, not on `pool`: it
+  // has to see the uncommitted INSERT above (read-your-writes), which a second
+  // connection's snapshot would not.
+  const connection = await pool.getConnection();
+  let result;
+  let rows;
   let matchStatus;
   let matchedEmployeeDocumentId = null;
-  if (orgId) {
-    const [refRows] = await pool.query(
-      `SELECT e.uuid AS employee_uuid, ed.id AS doc_id, ed.document_hash
-       FROM employees e
-       JOIN employee_documents ed ON ed.employee_uuid = e.uuid
-       WHERE e.organization_id = ?
-         AND REPLACE(REPLACE(e.cnic, '-', ''), ' ', '') = ?
-       ORDER BY (e.record_type = 'roster') DESC
-       LIMIT 1`,
-      [orgId, normalized]
+  let linkedPersonId = null;
+  let personExists = false;
+  try {
+    await connection.beginTransaction();
+
+    if (req.user.organization) {
+      await enforceRequestQuota(req.user.organization, connection);
+    }
+
+    [result] = await connection.query(
+      `INSERT INTO verification_requests
+       (user_id, document_type, issuing_organization_id, unmatched_org_id, status, submitted_at,
+        document_path, document_format, document_hash,
+        document_validation_status, document_validation_reason,
+        organization_conserned_for_future, submission_remarks,
+        verification_method, verified_at, document_owner_name, created_at)
+       VALUES (?, ?, ?, ?, ?, NOW(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
+      [
+        req.user.id,
+        document_type,
+        orgId,
+        unmatchedOrgId,
+        autoVerify ? "verified" : "under_review",
+        docPath,
+        docFormat,
+        documentHash,
+        // Which tier of the automated document check spoke, and why. 'flagged'
+        // means a heuristic quality signal fired and the request was allowed
+        // through anyway; the reviewing org is shown a warning from these.
+        validationStatus,
+        validationReason,
+        // No longer the auto-verify gate (see the lookup above). It now simply
+        // records that this particular row was itself created by a repeat
+        // auto-verification rather than by a fresh submission.
+        autoVerify ? "yes" : "no",
+        remarks,
+        autoVerify ? "auto" : "manual",
+        autoVerify ? new Date() : null,
+        documentOwnerName
+      ]
     );
-    if (refRows.length) {
-      matchStatus = "not_attempted";
-      matchedEmployeeDocumentId = refRows[0].doc_id;
-    } else {
-      const [empRows] = await pool.query(
-        `SELECT emp.uuid FROM employees emp
-         WHERE emp.organization_id = ?
-           AND REPLACE(REPLACE(emp.cnic, '-', ''), ' ', '') = ?
-         ORDER BY (emp.record_type = 'roster') DESC
+
+    // Reference-match setup: after the request is saved, locate a roster (or, as a
+    // fallback, learned_reference) employee in the target org whose CNIC matches
+    // the document owner, and stage the document match. The actual document match
+    // (auto-approve/manual-review decision) happens lazily, not here.
+    if (orgId) {
+      const [refRows] = await connection.query(
+        `SELECT e.uuid AS employee_uuid, ed.id AS doc_id, ed.document_hash
+         FROM employees e
+         JOIN employee_documents ed ON ed.employee_uuid = e.uuid
+         WHERE e.organization_id = ?
+           AND REPLACE(REPLACE(e.cnic, '-', ''), ' ', '') = ?
+         ORDER BY (e.record_type = 'roster') DESC
          LIMIT 1`,
         [orgId, normalized]
       );
-      matchStatus = empRows.length ? "manual_review" : "no_reference_found";
-    }
-  } else {
-    matchStatus = "no_reference_found";
-  }
-
-  await pool.query(
-    `UPDATE verification_requests
-     SET match_status=?, matched_employee_document_id=?
-     WHERE id=?`,
-    [matchStatus, matchedEmployeeDocumentId, result.insertId]
-  );
-
-  // Link the request to a persons row when a document owner CNIC was given.
-  // Case A: no matching person yet -> create one (full_name taken from the
-  // unverified claim; never trusted over an existing record).
-  // Case B: person already exists -> reuse it, keep the original name.
-  let linkedPersonId = null;
-  let personExists = false;
-  if (documentOwnerCnicHash) {
-    const [personRows] = await pool.query(
-      `SELECT id FROM persons WHERE cnic_hash=? LIMIT 1`,
-      [documentOwnerCnicHash]
-    );
-
-    if (personRows.length) {
-      linkedPersonId = personRows[0].id;
-      personExists = true;
+      if (refRows.length) {
+        matchStatus = "not_attempted";
+        matchedEmployeeDocumentId = refRows[0].doc_id;
+      } else {
+        const [empRows] = await connection.query(
+          `SELECT emp.uuid FROM employees emp
+           WHERE emp.organization_id = ?
+             AND REPLACE(REPLACE(emp.cnic, '-', ''), ' ', '') = ?
+           ORDER BY (emp.record_type = 'roster') DESC
+           LIMIT 1`,
+          [orgId, normalized]
+        );
+        matchStatus = empRows.length ? "manual_review" : "no_reference_found";
+      }
     } else {
-      const [personInsert] = await pool.query(
-        `INSERT INTO persons (cnic_encrypted, cnic_hash, full_name, is_nadra_verified, created_at)
-         VALUES (?, ?, ?, 'no', NOW())`,
-        [documentOwnerCnic, documentOwnerCnicHash, documentOwnerName]
-      );
-      linkedPersonId = personInsert.insertId;
+      matchStatus = "no_reference_found";
     }
 
-    await pool.query(
-      `UPDATE verification_requests SET linked_person_id=? WHERE id=?`,
-      [linkedPersonId, result.insertId]
+    await connection.query(
+      `UPDATE verification_requests
+       SET match_status=?, matched_employee_document_id=?
+       WHERE id=?`,
+      [matchStatus, matchedEmployeeDocumentId, result.insertId]
     );
-  }
 
-  const [rows] = await pool.query(
-    `SELECT vr.*, o.uuid AS issuing_organization_uuid, o.name AS issuing_org_name,
-            uo.uuid AS unmatched_org_uuid, uo.name AS unmatched_org_name,
-            requester.uuid AS requester_uuid,
-            requester.organization AS requester_organization
-     FROM verification_requests vr
-     LEFT JOIN organizations o ON o.id = vr.issuing_organization_id
-     LEFT JOIN unmatched_organizations uo ON uo.id = vr.unmatched_org_id
-     JOIN users requester ON requester.id = vr.user_id
-     WHERE vr.id=?`,
-    [result.insertId]
-  );
+    // Link the request to a persons row when a document owner CNIC was given.
+    // Case A: no matching person yet -> create one (full_name taken from the
+    // unverified claim; never trusted over an existing record).
+    // Case B: person already exists -> reuse it, keep the original name.
+    if (documentOwnerCnicHash) {
+      const [personRows] = await connection.query(
+        `SELECT id FROM persons WHERE cnic_hash=? LIMIT 1`,
+        [documentOwnerCnicHash]
+      );
+
+      if (personRows.length) {
+        linkedPersonId = personRows[0].id;
+        personExists = true;
+      } else {
+        const [personInsert] = await connection.query(
+          `INSERT INTO persons (cnic_encrypted, cnic_hash, full_name, is_nadra_verified, created_at)
+           VALUES (?, ?, ?, 'no', NOW())`,
+          [documentOwnerCnic, documentOwnerCnicHash, documentOwnerName]
+        );
+        linkedPersonId = personInsert.insertId;
+      }
+
+      await connection.query(
+        `UPDATE verification_requests SET linked_person_id=? WHERE id=?`,
+        [linkedPersonId, result.insertId]
+      );
+    }
+
+    [rows] = await connection.query(
+      `SELECT vr.*, o.uuid AS issuing_organization_uuid, o.name AS issuing_org_name,
+              uo.uuid AS unmatched_org_uuid, uo.name AS unmatched_org_name,
+              requester.uuid AS requester_uuid,
+              requester.organization AS requester_organization
+       FROM verification_requests vr
+       LEFT JOIN organizations o ON o.id = vr.issuing_organization_id
+       LEFT JOIN unmatched_organizations uo ON uo.id = vr.unmatched_org_id
+       JOIN users requester ON requester.id = vr.user_id
+       WHERE vr.id=?`,
+      [result.insertId]
+    );
+
+    await connection.commit();
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+  // ── end atomic block ───────────────────────────────────────────────────────
+
+  // Everything below is post-commit enrichment: QR signing, inline auto-match
+  // and notifications. These either make no database claims that must be atomic
+  // with creation, or already carry their own failure tolerance, so they stay
+  // outside the transaction and cannot cause a committed request to be lost.
 
   // Person identity context for the submitter side. A CNIC hash that already
   // existed before this submission means a "known" identity; any verified
@@ -413,8 +477,29 @@ export async function mySentRequests(req, res) {
   const dateFrom = typeof req.query.dateFrom === "string" ? req.query.dateFrom.trim() : "";
   const dateTo = typeof req.query.dateTo === "string" ? req.query.dateTo.trim() : "";
 
-  let whereClause = "WHERE vr.user_id = ?";
-  const params = [req.user.id];
+  // An org_admin is accountable for everything their organization submitted, not
+  // just their own uploads. Scoping to user_id made a sub-admin's submissions
+  // invisible to them with no way to discover they existed — the request would
+  // simply be missing from the org's own history.
+  //
+  // The requester is identified via the joined `users` row (requester.organization),
+  // NOT via the issuing organization: "who sent it" and "who it was sent to" are
+  // different questions, and only the former decides what the sender may see.
+  //
+  // Sub-admins keep seeing only their own submissions. That is the narrower,
+  // already-shipped behaviour, and widening it is a permission-model decision
+  // rather than a bug fix, so it is deliberately not changed here.
+  const seesWholeOrg = req.user.org_role === "org_admin" && Boolean(req.user.organization);
+
+  let whereClause;
+  let params;
+  if (seesWholeOrg) {
+    whereClause = "WHERE requester.organization = ?";
+    params = [req.user.organization];
+  } else {
+    whereClause = "WHERE vr.user_id = ?";
+    params = [req.user.id];
+  }
 
   if (search) {
     whereClause += ` AND (vr.document_type LIKE ? OR o.name LIKE ? OR vr.document_format LIKE ? OR vr.status LIKE ?)`;
@@ -430,8 +515,15 @@ export async function mySentRequests(req, res) {
     params.push(`${dateTo} 23:59:59`);
   }
 
+  // The join below MUST match the row query's join exactly. Both sides run the
+  // same whereClause, so a join present in one and missing from the other would
+  // make COUNT and the page disagree and produce phantom/empty pages.
   const [[{ total }]] = await pool.query(
-    `SELECT COUNT(*) AS total FROM verification_requests vr LEFT JOIN organizations o ON o.id = vr.issuing_organization_id ${whereClause}`,
+    `SELECT COUNT(*) AS total
+       FROM verification_requests vr
+       JOIN users requester ON requester.id = vr.user_id
+       LEFT JOIN organizations o ON o.id = vr.issuing_organization_id
+     ${whereClause}`,
     params
   );
   const [rows] = await pool.query(
@@ -584,14 +676,25 @@ export async function updateMySentRequest(req, res) {
   let docFormat = allRows[0].document_format;
   let documentHash = allRows[0].document_hash;
 
+  // When no new file is uploaded the stored verdict still describes the
+  // document on disk, so it is carried over untouched.
+  let validationStatus = allRows[0].document_validation_status ?? VALIDATION_PASSED;
+  let validationReason = allRows[0].document_validation_reason ?? null;
+
   if (req.file) {
     docPath = `/uploads/documents/${req.file.filename}`;
     docFormat = docFormatFromMime(req.file.mimetype, req.file.originalname);
     const fullPath = path.join(DOCS_DIR, req.file.filename);
     documentHash = generateFileHash(fullPath);
-    // Corrupt-file guard on the re-upload path (fails open only on
-    // timeout / connection-refused; other service failures reject with 400).
-    await assertDocumentValid(fullPath);
+    // Re-upload validation guard. Structural failures throw (fails closed);
+    // only a service timeout / connection-refused fails open.
+    //
+    // A fresh verdict REPLACES the stored one: the reviewer will be looking at
+    // the newly uploaded file, so keeping the previous file's "passed" would be
+    // describing a document that is no longer there.
+    const verdict = await assertDocumentValid(fullPath);
+    validationStatus = verdict.status;
+    validationReason = verdict.reason;
   }
 
   // Resolve unmatched organization if "Other" was selected
@@ -604,10 +707,11 @@ export async function updateMySentRequest(req, res) {
     `UPDATE verification_requests
      SET document_type=?, issuing_organization_id=?, unmatched_org_id=?,
          submission_remarks=?, document_owner_name=?,
-         document_path=?, document_format=?, document_hash=?
+         document_path=?, document_format=?, document_hash=?,
+         document_validation_status=?, document_validation_reason=?
      WHERE uuid=?`,
     [document_type, orgId, unmatchedOrgId, remarks, documentOwnerName,
-      docPath, docFormat, documentHash, uuid]
+      docPath, docFormat, documentHash, validationStatus, validationReason, uuid]
   );
 
   const [rows] = await pool.query(
@@ -646,7 +750,21 @@ export async function myInboxRequests(req, res) {
   const dateFrom = typeof req.query.dateFrom === "string" ? req.query.dateFrom.trim() : "";
   const dateTo = typeof req.query.dateTo === "string" ? req.query.dateTo.trim() : "";
 
-  let whereClause = "WHERE vr.issuing_organization_id = ?";
+  // The inbox is the organization's ACTIONABLE queue. An automatic outcome has
+  // already been decided by the reference match, so listing it here meant the
+  // queue carried rows nobody could act on, mixed in with the ones that needed a
+  // human — and the automatic ones looked identical to manual ones, so a
+  // verifier could spend time "reviewing" a decision the system had made.
+  //
+  // Those outcomes are not lost: myAutoVerifiedRequests serves them as their own
+  // read-only ledger, and the frontend surfaces that as the "Auto Approved" tab on
+  // this same page. Both automatic methods are excluded, matching that ledger.
+  //
+  // NULL is kept: a request that has not been decided yet has no method.
+  let whereClause =
+    "WHERE vr.issuing_organization_id = ? " +
+    "AND (vr.verification_method IS NULL " +
+    "     OR vr.verification_method NOT IN ('automatic_match', 'auto'))";
   const params = [req.user.organization];
 
   if (search) {
@@ -991,6 +1109,29 @@ export async function verifyRequest(req, res) {
   requirePermission(req.user, "approve_request");
   assertUuid(uuid, "Request UUID");
   if (!["verified", "unverified"].includes(status)) throw new ApiError(400, "status must be verified or unverified");
+
+  // A rejection is a statement ABOUT someone's document, and the requester is
+  // entitled to know what was wrong with it. Without a reason the row is
+  // `status=unverified` and nothing else — useless to the requester, unactionable
+  // for support, and indistinguishable from an oversight. So a reason is
+  // mandatory on this one path.
+  //
+  // Approve stays optional on purpose: a clean match needs no justification, and
+  // forcing one would just collect noise. (The product intent for approve was
+  // confirmed as "keep current behaviour" — optional.)
+  const remarks = typeof verification_remarks === "string" ? verification_remarks.trim() : "";
+  if (status === "unverified" && !remarks) {
+    throw new ApiError(
+      400,
+      "Verification remarks are required when rejecting a request — please explain what is wrong with the document."
+    );
+  }
+  // verification_remarks is varchar(500); reject early with a clear message
+  // instead of letting the driver throw a truncation error.
+  if (remarks.length > 500) {
+    throw new ApiError(400, "Verification remarks must be 500 characters or fewer");
+  }
+
   if (!req.user.organization) throw new ApiError(400, "User has no organization");
 
   await assertOrganizationActive(req.user.organization);
@@ -1009,7 +1150,7 @@ export async function verifyRequest(req, res) {
      SET status=?, verified_at=NOW(), verified_by=?, verification_remarks=?,
          verification_method='portal'
      WHERE uuid=?`,
-    [status, req.user.id, verification_remarks || null, uuid]
+    [status, req.user.id, remarks || null, uuid]
   );
 
   const [updated] = await pool.query(

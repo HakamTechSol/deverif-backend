@@ -9,8 +9,10 @@ import {
 } from "../controllers/subscription.controller.js";
 import {
   createCheckout,
+  createCustomPlanCheckout,
   getSubscriptionStatus,
   getCheckout,
+  cancelPendingPlan,
 } from "../controllers/orgSubscription.controller.js";
 
 const router = Router();
@@ -25,6 +27,13 @@ router.post("/self-subscribe", orgAdminsOnly, asyncHandler(selfSubscribe));
 
 router.get("/status", orgUser, asyncHandler(getSubscriptionStatus));
 router.post("/checkout", orgAdminsOnly, asyncHandler(createCheckout));
+// Paying for an approved custom plan. Separate from /checkout on purpose: a
+// custom plan must never be self-service, so this path is the only way in and it
+// requires an approved, plan-linked request belonging to this organization.
+router.post("/custom-plan/checkout", orgAdminsOnly, asyncHandler(createCustomPlanCheckout));
 router.get("/checkout/:checkoutId", orgAdminsOnly, asyncHandler(getCheckout));
+
+// Cancel a deferred downgrade (pending_plan_id) before it takes effect.
+router.delete("/pending-plan", orgAdminsOnly, asyncHandler(cancelPendingPlan));
 
 export default router;

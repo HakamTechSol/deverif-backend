@@ -35,7 +35,30 @@ describe("resetDailyRequestUsage", () => {
 
 describe("plan activation refreshes the daily allowance", () => {
   it("clears today's usage when a subscription is activated", async () => {
-    const connection = { query: vi.fn().mockResolvedValue([[], []]) };
+    // activateOrgSubscription reads (and locks) the current subscription state
+    // so it can decide between renewal / upgrade / deferred downgrade, so the
+    // fake connection has to answer the org lookup before the UPDATE.
+    const connection = {
+      query: vi.fn(async (sql) => {
+        if (typeof sql === "string" && sql.includes("FROM organizations")) {
+          return [
+            [
+              {
+                id: 42,
+                subscription_status: "none",
+                subscription_start: null,
+                subscription_expiry: null,
+                subscription_plan_id: null,
+                pending_plan_id: null,
+                current_plan: null,
+              },
+            ],
+            [],
+          ];
+        }
+        return [[], []];
+      }),
+    };
     const plan = { id: 5, billing_period: "monthly" };
 
     await activateOrgSubscription(connection, { organizationId: 42, plan });

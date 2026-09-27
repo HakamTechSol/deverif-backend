@@ -1,5 +1,6 @@
-﻿import crypto from "crypto";
+import crypto from "crypto";
 import ApiError from "../../utils/ApiError.js";
+import { assertIdentityAvailable, rethrowIdentityDuplicate } from "../../utils/identityUniqueness.js";
 import { pool } from "../../config/db.js";
 import { ok, created } from "../../utils/response.js";
 import { assertUuid } from "../../utils/publicResponse.js";
@@ -8,7 +9,7 @@ import { parsePagination, paginatedResponse } from "../../utils/pagination.js";
 import { sendInviteEmail } from "../../utils/mailer.js";
 import { firstFrontendUrl } from "../../utils/frontendUrl.js";
 import { logAudit, getActorFromReq } from "../../utils/auditLog.js";
-import { STAFF_ROLES, assertRole } from "../../utils/roles.js";
+import { STAFF_ROLES, assertRole, ROLE_ORG_ADMIN } from "../../utils/roles.js";
 
 const EMPLOYEE_SELECT = `SELECT e.id, e.uuid, e.organization_id, e.full_name, e.email, e.phone,
         e.cnic, dg.name AS designation, dp.name AS department, e.status, e.record_type, e.is_platform_user,
@@ -195,6 +196,11 @@ export async function createEmployee(req, res) {
 
       const orgRole = "employee";
       const dummyHash = await hashPassword(crypto.randomBytes(16).toString("hex"));
+      // The employees table has its own per-organization CNIC check, but a phone
+      // number identifies the person across the whole platform, so it is checked
+      // globally here too — otherwise the same human could be onboarded into two
+      // organizations.
+      await assertIdentityAvailable({ phone: data.phone, cnic: data.cnic, executor: conn });
       const [userRes] = await conn.query(
         `INSERT INTO users
          (full_name, email, phone, password, cnic, status, org_role, feature_access,
@@ -223,7 +229,7 @@ export async function createEmployee(req, res) {
     await conn.commit();
   } catch (err) {
     await conn.rollback();
-    if (String(err.message).includes("Duplicate")) throw new ApiError(409, err.message);
+    rethrowIdentityDuplicate(err);
     throw err;
   } finally {
     conn.release();
@@ -357,10 +363,23 @@ export async function listEmployees(req, res) {
   if (scope.scoped) {
     conditions.push("e.organization_id = ?");
     params.push(scope.orgId);
-    // Business rule: org-admins only see employee records THEY personally added
-    // (per-admin visibility within one organization). Platform admins are unfiltered.
-    conditions.push("e.added_by_uuid = ?");
-    params.push(req.user.uuid);
+    // Per-admin visibility: each org_admin sees only the employee records THEY
+    // personally added. Platform admins are unfiltered.
+    //
+    // Deliberately NOT applied to sub-admins. A sub-admin is staff
+    // (STAFF_ROLES = [org_admin, sub_admin]) and is documented as sharing the
+    // org_admin's operational access, differing only in that it cannot delete
+    // anything, manage sub-admins, or touch org settings. Applying this filter to
+    // them made the Employees page permanently empty for them: the roster belongs
+    // to the org_admin who imported it, so a sub-admin's list was filtered down to
+    // nothing while their granted 'manage_employees' permission appeared to do
+    // nothing at all. A sub-admin sees the whole org roster, which is also what
+    // makes their approve/generate work meaningful — they need to see the people
+    // whose documents they are reviewing.
+    if (req.user.org_role === ROLE_ORG_ADMIN) {
+      conditions.push("e.added_by_uuid = ?");
+      params.push(req.user.uuid);
+    }
   }
 
   if (search) {

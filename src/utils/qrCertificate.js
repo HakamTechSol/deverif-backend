@@ -2,7 +2,33 @@ import crypto from "crypto";
 import { pool } from "../config/db.js";
 
 const QR_SIGNING_SECRET = process.env.QR_SIGNING_SECRET || "";
-const QR_VERIFY_BASE_URL = process.env.QR_VERIFY_BASE_URL || "https://portal.dverif.com";
+
+/**
+ * Public base URL stamped into every QR code and certificate PDF.
+ *
+ * Read once at module load, which is safe here only because config/db.js (an
+ * import of this module) runs dotenv.config() during its own evaluation, before
+ * this body executes. Removing that import would silently make this fall back.
+ *
+ * The frontend builds the SAME url from VITE_PUBLIC_BASE_URL. They are separate
+ * runtimes so they cannot share one variable, but they must be set to the same
+ * value: the backend's copy lands in the downloadable PDF, the frontend's copy
+ * lands in the QR shown on screen, and a customer scanning one while holding the
+ * other must not be sent to two different hosts.
+ *
+ * The fallback is intentionally a placeholder rather than a real domain. It used
+ * to be a hardcoded live hostname, which meant a deploy that simply forgot to set
+ * QR_VERIFY_BASE_URL would keep working and keep printing live-domain QR codes —
+ * so the mistake stayed invisible until someone scanned one.
+ */
+const QR_VERIFY_BASE_URL = (process.env.QR_VERIFY_BASE_URL || "http://localhost:8080").replace(/\/+$/, "");
+
+if (!process.env.QR_VERIFY_BASE_URL) {
+  console.warn(
+    "QR_VERIFY_BASE_URL is not set — QR codes will point at the local fallback. " +
+      "Set it to the public site URL, and keep the frontend's VITE_PUBLIC_BASE_URL identical."
+  );
+}
 
 export function qrSigningConfigured() {
   return Boolean(QR_SIGNING_SECRET);

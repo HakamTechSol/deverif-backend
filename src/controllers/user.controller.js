@@ -1,6 +1,7 @@
 import ApiError from "../utils/ApiError.js";
 import { pool } from "../config/db.js";
 import { ok } from "../utils/response.js";
+import { assertIdentityAvailable, rethrowIdentityDuplicate } from "../utils/identityUniqueness.js";
 
 export async function getMe(req, res) {
   const [rows] = await pool.query(
@@ -32,10 +33,24 @@ export async function updateMe(req, res) {
 
   if (!Object.keys(updates).length) throw new ApiError(400, "No valid fields to update");
 
+  // Self-service profile edit is a write path like any other, so it gets the same
+  // identity check. Excluding this user means re-saving an unchanged number is
+  // not reported as a clash with itself.
+  if (body.phone !== undefined) {
+    await assertIdentityAvailable({ phone: body.phone, excludeUserId: req.user.id, executor: pool });
+  }
+
   const fields = Object.keys(updates).map((k) => `${k}=?`).join(", ");
   const values = Object.values(updates);
 
-  await pool.query(`UPDATE users SET ${fields} WHERE id=?`, [...values, req.user.id]);
+  // The unique index is the guarantee; this covers the case where a request
+  // slipped past the pre-check and lost the race.
+  try {
+    await pool.query(`UPDATE users SET ${fields} WHERE id=?`, [...values, req.user.id]);
+  } catch (err) {
+    rethrowIdentityDuplicate(err);
+    throw err;
+  }
 
   const [rows] = await pool.query(
     `SELECT u.id, u.uuid, u.full_name, u.email, u.phone, u.cnic,

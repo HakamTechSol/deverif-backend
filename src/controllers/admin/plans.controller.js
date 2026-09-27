@@ -4,22 +4,13 @@ import { ok, created } from "../../utils/response.js";
 import { assertUuid } from "../../utils/publicResponse.js";
 import { logAudit, getActorFromReq } from "../../utils/auditLog.js";
 import { normalizePlanFeatures } from "../../utils/planFeatures.js";
-import { MODULE_FEATURE_KEYS } from "../../middleware/requireModuleFeature.js";
+import { assertSingleFreePlan } from "../../utils/subscriptionPlans.js";
+import { MODULE_FEATURE_KEYS, parseModuleFlags } from "../../utils/moduleFlags.js";
 
 const DEFAULT_MODULE_FLAGS = Object.fromEntries(MODULE_FEATURE_KEYS.map((k) => [k, true]));
 
 const PLAN_SELECT = `id, uuid, name, monthly_price, daily_request_quota,
   description, features, billing_period, is_public, is_custom, is_free, is_recommended, module_flags, created_at, updated_at`;
-
-function parseModuleFlags(raw) {
-  if (raw == null) return null;
-  if (typeof raw !== "string") return raw;
-  try {
-    return JSON.parse(raw);
-  } catch {
-    return {};
-  }
-}
 
 function normalizePlan(row) {
   if (!row) return row;
@@ -140,10 +131,11 @@ export async function listPlans(req, res) {
 export async function createPlan(req, res) {
   const body = validatePlanBody(req.body || {});
   if (body.is_free) {
-    const [[existingFree]] = await pool.query(
-      "SELECT id FROM subscription_plans WHERE is_free=1 LIMIT 1"
-    );
-    if (existingFree) throw new ApiError(400, "A Free plan already exists. Only one Free plan is allowed.");
+    // "Exactly one Free plan" is a hard invariant (the database enforces it
+    // too, via a unique index over a generated column -- see migration
+    // 20260927_enforce_single_free_plan.sql). This check just turns the second
+    // attempt into a readable 400 instead of a raw ER_DUP_ENTRY.
+    await assertSingleFreePlan(pool);
   }
   const [result] = await pool.query(
     `INSERT INTO subscription_plans
@@ -193,13 +185,9 @@ export async function updatePlan(req, res) {
   }
 
   if (body.is_free === 1) {
-    const [[otherFree]] = await pool.query(
-      "SELECT id FROM subscription_plans WHERE is_free=1 AND uuid<>? LIMIT 1",
-      [uuid]
-    );
-    if (otherFree) {
-      throw new ApiError(400, `Another plan "${existing.name}" is already the Free plan. Only one Free plan is allowed.`);
-    }
+    // Same single-Free-plan invariant as createPlan, but excluding the row being
+    // edited so an admin can freely re-save the existing Free plan.
+    await assertSingleFreePlan(pool, { excludePlanUuid: uuid });
   }
 
   const sets = [];

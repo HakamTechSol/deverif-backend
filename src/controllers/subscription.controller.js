@@ -4,6 +4,7 @@ import { ok, created } from "../utils/response.js";
 import { getOrgQuotaStatus } from "../utils/requestQuota.js";
 import { assertUuid } from "../utils/publicResponse.js";
 import { createNotificationForUsers } from "./notification.controller.js";
+import { logAudit, getActorFromReq } from "../utils/auditLog.js";
 
 /**
  * Org user: current quota status for their organization.
@@ -27,9 +28,12 @@ export async function listOrgCustomPlanRequests(req, res) {
     `SELECT cpr.uuid, cpr.message, cpr.requested_quota, cpr.requested_price, cpr.status,
             cpr.approved_daily_quota, cpr.approved_price, cpr.created_at,
             cpr.decided_at, cpr.decided_by,
+            cpr.approved_plan_id, sp.uuid AS approved_plan_uuid, sp.name AS approved_plan_name,
+            sp.monthly_price AS approved_plan_monthly_price,
             u.full_name AS requested_by_name
      FROM custom_plan_requests cpr
      LEFT JOIN users u ON u.uuid = cpr.requested_by_uuid
+     LEFT JOIN subscription_plans sp ON sp.id = cpr.approved_plan_id
      WHERE cpr.organization_id=?
      ORDER BY cpr.created_at DESC`,
     [req.user.organization]
@@ -136,13 +140,16 @@ export async function selfSubscribe(req, res) {
   );
   if (!plan) throw new ApiError(404, "Plan not found or not available for self-subscription");
 
-  const [orgRows] = await pool.query(
-    "SELECT id, uuid, name, subscription_status FROM organizations WHERE id=?",
+  const [[org]] = await pool.query(
+    `SELECT id, uuid, name, subscription_status, subscription_plan_id
+     FROM organizations WHERE id=?`,
     [req.user.organization]
   );
-  if (!orgRows.length) throw new ApiError(404, "Organization not found");
-  const org = orgRows[0];
+  if (!org) throw new ApiError(404, "Organization not found");
 
+  // These pre-checks are only a fast, friendly rejection. The authoritative
+  // checks run again inside the transaction below, under a row lock, because
+  // two concurrent requests could both pass them here.
   if (org.subscription_status === "active") {
     throw new ApiError(400, "Your organization already has an active subscription. Use Change Plan to switch it.");
   }
@@ -166,26 +173,88 @@ export async function selfSubscribe(req, res) {
   }
 
   const now = new Date();
-  const [result] = await pool.query(
-    `INSERT INTO self_subscription_requests
-       (organization_id, plan_uuid, requested_by_uuid, amount, status)
-     VALUES (?, ?, ?, ?, 'pending')`,
-    [org.id, plan_uuid, req.user.uuid, numericAmount]
-  );
-  const requestUuid = result?.insertId;
+
+  // The request row and the organization state change MUST be atomic. Run as
+  // two separate pool queries, a failure between them left the organization
+  // stuck in 'pending_payment' with no request row for the admin to ever see --
+  // a dead end the admin could not clear. The org row is also locked so two
+  // concurrent self-subscribe requests cannot both pass the duplicate check.
+  const connection = await pool.getConnection();
+  let requestUuid;
+  try {
+    await connection.beginTransaction();
+
+    const [[lockedOrg]] = await connection.query(
+      "SELECT id, uuid, name, subscription_status FROM organizations WHERE id=? FOR UPDATE",
+      [org.id]
+    );
+    if (!lockedOrg) throw new ApiError(404, "Organization not found");
+    if (lockedOrg.subscription_status === "active") {
+      throw new ApiError(
+        400,
+        "Your organization already has an active subscription. Use Change Plan to switch it."
+      );
+    }
+    if (lockedOrg.subscription_status === "pending_payment") {
+      throw new ApiError(
+        400,
+        "You already have a subscription awaiting payment confirmation from the System Admin."
+      );
+    }
+
+    const [duplicate] = await connection.query(
+      "SELECT id FROM self_subscription_requests WHERE organization_id=? AND status='pending' LIMIT 1",
+      [org.id]
+    );
+    if (duplicate.length) {
+      throw new ApiError(400, "You already have a subscription request awaiting payment confirmation.");
+    }
+
+    const [result] = await connection.query(
+      `INSERT INTO self_subscription_requests
+         (organization_id, plan_uuid, requested_by_uuid, amount, status)
+       VALUES (?, ?, ?, ?, 'pending')`,
+      [org.id, plan_uuid, req.user.uuid, numericAmount]
+    );
+    requestUuid = result?.insertId;
+
+    await connection.query(
+      `UPDATE organizations
+       SET subscription_status='pending_payment', subscription_start=?,
+           subscription_plan_id=?, pending_plan_id=NULL,
+           reminder_2d_sent='no', reminder_2h_sent='no'
+       WHERE id=?`,
+      [now, plan.id, org.id]
+    );
+
+    await connection.commit();
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+
   const [[request]] = await pool.query(
     "SELECT uuid FROM self_subscription_requests WHERE id=?",
     [requestUuid]
   );
 
-  await pool.query(
-    `UPDATE organizations
-     SET subscription_status='pending_payment', subscription_start=?,
-         subscription_plan_id=?,
-         reminder_2d_sent='no', reminder_2h_sent='no'
-     WHERE id=?`,
-    [now, plan.id, org.id]
-  );
+  logAudit({
+    ...getActorFromReq(req),
+    action: "self_subscribe.request",
+    entityType: "organization",
+    entityId: org.uuid,
+    details: {
+      plan: plan.name,
+      plan_id: plan.id,
+      amount: numericAmount,
+      from_status: org.subscription_status,
+      from_plan_id: org.subscription_plan_id ?? null,
+      request_uuid: request?.uuid ?? null,
+    },
+    req,
+  });
 
   // Notify system admins about the new self-subscription request.
   const [adminUuids] = await pool.query(

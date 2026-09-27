@@ -1,5 +1,6 @@
 import { pool } from "../config/db.js";
 import ApiError from "./ApiError.js";
+import { isFreePlan } from "./subscriptionPlans.js";
 
 // Local date string (YYYY-MM-DD) used for the daily quota bucket.
 export function todayStr(date = new Date()) {
@@ -38,12 +39,19 @@ export async function resetDailyRequestUsage(orgId, connection = null) {
 
 /**
  * Resolve the current plan quota for an organization.
- * Returns { quota, plan_id, plan_uuid, plan_name, is_free }.
+ * Returns { quota, plan_id, plan_uuid, plan_name, is_free, is_active }.
+ *
+ * `is_active` is the single read-side definition of "this org is entitled to
+ * its paid plan right now": the subscription must be active and, for a paid
+ * plan, not yet past its expiry. The Free plan is always active (it has no
+ * expiry, which means "indefinite" rather than "expired") but contributes no
+ * paid quota.
  */
 export async function getOrgPlan(orgId) {
   const [[row]] = await pool.query(
     `SELECT o.subscription_plan_id AS plan_id,
             o.subscription_status AS subscription_status,
+            o.subscription_expiry AS subscription_expiry,
             sp.uuid AS plan_uuid, sp.name AS plan_name, sp.daily_request_quota AS quota,
             sp.is_free AS is_free
      FROM organizations o
@@ -51,17 +59,26 @@ export async function getOrgPlan(orgId) {
      WHERE o.id = ?`,
     [orgId]
   );
-  // Paid quota only applies while the subscription is ACTIVE. The FREE plan is
-  // paid-neutral: even though the org is "active", its quota stays 0 so the org
-  // keeps the 1 FREE request/day baseline. Orgs without an active subscription
-  // still get the 1 FREE request/day (quota resolved to 0).
-  const isPaidActive = row?.subscription_status === "active" && row?.is_free !== 1;
+  const isFree = isFreePlan(row);
+  // Paid quota only applies while the subscription is genuinely live. The FREE
+  // plan is paid-neutral: it is always "active" but its quota stays 0 so the org
+  // keeps the 1 FREE request/day baseline.
+  //
+  // The expiry check matters: the lifecycle job moves a lapsed paid plan onto
+  // Free within the hour, and until it does the row can still say
+  // subscription_status='active' with an expiry in the past. Honouring that flag
+  // alone would hand a lapsed org its full paid quota.
+  const expiry = row?.subscription_expiry ? new Date(row.subscription_expiry) : null;
+  const notLapsed = !row?.subscription_expiry || (expiry && !Number.isNaN(expiry.getTime()) && expiry > new Date());
+  const isActive = row?.subscription_status === "active" && !!notLapsed;
+
   return {
-    quota: isPaidActive ? Number(row?.quota ?? 0) : 0,
+    quota: isActive && !isFree ? Number(row?.quota ?? 0) : 0,
     plan_id: row?.plan_id ?? null,
     plan_uuid: row?.plan_uuid ?? null,
     plan_name: row?.plan_name ?? null,
-    is_free: row?.is_free === 1,
+    is_free: isFree,
+    is_active: isActive,
   };
 }
 
@@ -111,16 +128,34 @@ export async function getOrgQuotaStatus(orgId) {
  *
  * Throw ApiError(429, ...) with a clear message when the limit is reached.
  * Returns { is_free, requests_used, quota, allowed }.
+ *
+ * Pass `existingConnection` to make the consumption part of a caller's
+ * transaction: the FOR UPDATE locks are then held until that caller commits or
+ * rolls back, and a failure anywhere after this call (e.g. the verification
+ * request INSERT failing) unwinds the consumption with it. Without it, this
+ * function owns the connection and commits immediately, which is what let a
+ * rejected document permanently burn a daily request.
+ *
+ * When joining a caller's transaction this function deliberately does NOT
+ * commit, roll back or release: that is the caller's to decide.
  */
-export async function enforceRequestQuota(orgId) {
+export async function enforceRequestQuota(orgId, existingConnection = null) {
   const today = todayStr();
-  const connection = await pool.getConnection();
+  const ownsTransaction = !existingConnection;
+  const connection = existingConnection || (await pool.getConnection());
+
+  const reject = async (error) => {
+    if (ownsTransaction) await connection.rollback();
+    throw error;
+  };
+
   try {
-    await connection.beginTransaction();
+    if (ownsTransaction) await connection.beginTransaction();
 
     // Lock the organization row + its plan.
     const [[org]] = await connection.query(
       `SELECT o.subscription_status AS subscription_status,
+              o.subscription_expiry AS subscription_expiry,
               sp.daily_request_quota AS quota,
               sp.is_free AS is_free
        FROM organizations o
@@ -129,12 +164,16 @@ export async function enforceRequestQuota(orgId) {
        FOR UPDATE`,
       [orgId]
     );
-    // Paid quota applies only while the subscription is ACTIVE — unless the org
-    // is on the FREE plan, whose quota stays 0 so the 1 FREE request/day baseline
-    // keeps working even though the subscription is "active".
-    const quota = org?.subscription_status === "active" && org?.is_free !== 1
-      ? Number(org?.quota ?? 0)
-      : 0;
+    // Paid quota applies only while the subscription is genuinely live — and
+    // "live" includes not being past its expiry (see getOrgPlan). The FREE plan
+    // is paid-neutral: it is always active but its quota stays 0, so the
+    // 1 FREE request/day baseline keeps working.
+    const expiry = org?.subscription_expiry ? new Date(org.subscription_expiry) : null;
+    const notLapsed = !org?.subscription_expiry || (expiry && !Number.isNaN(expiry.getTime()) && expiry > new Date());
+    const quota =
+      org?.subscription_status === "active" && !!notLapsed && !isFreePlan(org)
+        ? Number(org?.quota ?? 0)
+        : 0;
     const isActive = quota > 0;
 
     // Ensure today's usage bucket exists (created on first request of the day).
@@ -160,11 +199,12 @@ export async function enforceRequestQuota(orgId) {
            WHERE organization_id=? AND date=?`,
           [orgId, today]
         );
-        await connection.commit();
+        if (ownsTransaction) await connection.commit();
         return { allowed: true, is_free: false, requests_used: used + 1, total_requests: totalRequests + 1, quota, remaining: quota - used - 1 };
       }
-      await connection.rollback();
-      throw new ApiError(429, "You have used all your requests for today. Please upgrade your plan or try again tomorrow.");
+      return reject(
+        new ApiError(429, "You have used all your requests for today. Please upgrade your plan or try again tomorrow.")
+      );
     }
 
     // No active subscription -> only the 1 FREE request per day.
@@ -174,16 +214,15 @@ export async function enforceRequestQuota(orgId) {
          WHERE organization_id=? AND date=?`,
         [orgId, today]
       );
-      await connection.commit();
+      if (ownsTransaction) await connection.commit();
       return { allowed: true, is_free: true, requests_used: 0, total_requests: 1, quota: 0, remaining: 0 };
     }
 
-    await connection.rollback();
-    throw new ApiError(429, "Daily free request used. Upgrade your plan or wait until tomorrow.");
+    return reject(new ApiError(429, "Daily free request used. Upgrade your plan or wait until tomorrow."));
   } catch (error) {
-    await connection.rollback();
+    if (ownsTransaction) await connection.rollback();
     throw error;
   } finally {
-    connection.release();
+    if (ownsTransaction) connection.release();
   }
 }

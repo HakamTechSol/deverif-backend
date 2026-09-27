@@ -133,7 +133,15 @@ export async function uploadEmployeeDocuments(req, res) {
     // Corrupt-file guard per file. Fails open (warn-only) only when the
     // service is unreachable (timeout / connection refused); other service
     // failures — and a definite corruption verdict — throw a 400.
-    await assertDocumentValid(diskPath);
+    //
+    // treatHeuristicAsFatal: unlike a request submission, a quality signal is
+    // disqualifying HERE. This file becomes the organization reference that the
+    // 100% auto-verification match compares submissions against, so a reference
+    // scan missing part of its own content (a name, an expiry, a signature)
+    // would corrupt every later match instead of merely producing a false
+    // positive. The two-tiered default — flag rather than block — is right for
+    // requests and wrong for the reference pool.
+    await assertDocumentValid(diskPath, { treatHeuristicAsFatal: true });
 
     // Exact-file fingerprint for the auto-verification fast path. Only PDF and
     // image files get hashed — office/zip formats are skipped on purpose.

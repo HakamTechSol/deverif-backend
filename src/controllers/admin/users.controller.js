@@ -8,7 +8,8 @@ import { parsePagination, paginatedResponse } from "../../utils/pagination.js";
 import { sendInviteEmail } from "../../utils/mailer.js";
 import { firstFrontendUrl } from "../../utils/frontendUrl.js";
 import { logAudit, getActorFromReq } from "../../utils/auditLog.js";
-import { assignFreePlanToOrg } from "../../utils/freePlan.js";
+import { getFreePlan } from "../../utils/subscriptionPlans.js";
+import { assertIdentityAvailable, rethrowIdentityDuplicate } from "../../utils/identityUniqueness.js";
 
 const USER_SELECT = `SELECT u.id, u.uuid, u.full_name, u.email, u.phone, u.cnic, u.status,
         u.org_role, u.profile_image,
@@ -96,18 +97,34 @@ export async function createUserWithOrganization(req, res) {
         "SELECT id FROM organization_types WHERE LOWER(name)=LOWER(?) ORDER BY id DESC LIMIT 1",
         [String(organization.organization_type || "").trim()]
       );
+      // Every organization starts on the real Free plan, written as part of the
+      // INSERT so the row is never momentarily planless. Free has no billing
+      // cycle, so subscription_expiry stays NULL ("indefinite", not "expired").
+      const freePlan = await getFreePlan(conn);
       const [orgRes] = await conn.query(
-        "INSERT INTO organizations (name, verified, logo, organization_type, business_email) VALUES (?, 'yes', ?, ?, ?)",
-        [organization.name, orgLogoPath, orgTypeRows.length ? orgTypeRows[0].id : null, businessEmail]
+        `INSERT INTO organizations
+           (name, verified, logo, organization_type, business_email,
+            subscription_plan_id, subscription_status, subscription_start, subscription_expiry)
+         VALUES (?, 'yes', ?, ?, ?, ?, 'active', NOW(), NULL)`,
+        [
+          organization.name,
+          orgLogoPath,
+          orgTypeRows.length ? orgTypeRows[0].id : null,
+          businessEmail,
+          freePlan.id,
+        ]
       );
       orgId = orgRes.insertId;
-      // Automatically subscribe the new org to the Free plan (baseline experience).
-      await assignFreePlanToOrg(conn, orgId);
     }
 
     const dummyHash = await hashPassword(crypto.randomBytes(16).toString("hex"));
     const isVerified = user.is_verified === "yes" ? "yes" : "no";
     const profileImagePath = req.file ? `uploads/profiles/${req.file.filename}` : (user.profile_image || null);
+
+    // One person, one number, one CNIC. The index is the real guarantee; this
+    // runs first so the admin is told whose phone or CNIC it already belongs to
+    // instead of receiving a driver error naming an internal index.
+    await assertIdentityAvailable({ phone: user.phone, cnic: user.cnic, executor: conn });
 
     const [userRes] = await conn.query(
       `INSERT INTO users
@@ -159,7 +176,7 @@ export async function createUserWithOrganization(req, res) {
     return created(res, payload, emailSent ? "User created. Invite email sent." : "User created but invite email failed. Use Resend Invite to retry.");
   } catch (err) {
     await conn.rollback();
-    if (String(err.message).includes("Duplicate")) throw new ApiError(409, err.message);
+    rethrowIdentityDuplicate(err);
     throw err;
   } finally {
     conn.release();
@@ -175,7 +192,7 @@ export async function updateUser(req, res) {
     throw new ApiError(400, "organization_uuid is required; integer organization IDs are not accepted");
   }
 
-  const [userExists] = await pool.query("SELECT id FROM users WHERE uuid=?", [uuid]);
+  const [userExists] = await pool.query("SELECT id, phone, cnic FROM users WHERE uuid=?", [uuid]);
   if (!userExists.length) throw new ApiError(404, "User not found");
 
   const updateFields = [];
@@ -194,6 +211,17 @@ export async function updateUser(req, res) {
   if (password !== undefined) { validatePasswordPolicy(password); updateFields.push("password = ?"); updateValues.push(await hashPassword(password)); }
 
   if (updateFields.length === 0) throw new ApiError(400, "At least one field is required to update");
+
+  // Only check identity fields that are actually changing, and exclude this user
+  // so re-saving an unchanged profile is not reported as a self-duplicate.
+  if (phone !== undefined || cnic !== undefined) {
+    await assertIdentityAvailable({
+      phone: phone !== undefined ? phone : userExists[0].phone,
+      cnic: cnic !== undefined ? cnic : userExists[0].cnic,
+      excludeUserId: userExists[0].id,
+      executor: pool,
+    });
+  }
 
   updateValues.push(uuid);
   await pool.query(`UPDATE users SET ${updateFields.join(", ")} WHERE uuid=?`, updateValues);

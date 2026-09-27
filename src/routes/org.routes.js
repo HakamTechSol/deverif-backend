@@ -45,6 +45,8 @@ import {
   createAdminUser,
   updateAdminUser,
   revokeAdminUser,
+  cancelAdminUserInvite,
+  removeAdminUserPermanently,
 } from "../controllers/org/adminUsers.controller.js";
 import {
   listSalaryComponents,
@@ -142,6 +144,15 @@ router.get("/admin-users", userMgmt, asyncHandler(listAdminUsers));
 router.post("/admin-users", userMgmt, createEmployeeLimiter, asyncHandler(createAdminUser));
 router.patch("/admin-users/:uuid", userMgmt, asyncHandler(updateAdminUser));
 router.post("/admin-users/:uuid/revoke", userMgmt, asyncHandler(revokeAdminUser));
+// Pending-invite lifecycle, mirroring /admin/users/:uuid/cancel-invite. Both are
+// org-scoped inside the controller via loadSubAdminInScope(req.scopeOrgId), and
+// both refuse once the invite has been accepted.
+router.delete(
+  "/admin-users/:uuid/cancel-invite",
+  userMgmt,
+  asyncHandler(cancelAdminUserInvite)
+);
+router.delete("/admin-users/:uuid", userMgmt, asyncHandler(removeAdminUserPermanently));
 
 // ---- Managed departments & designations (staff; delete = org_admin) ----
 router.get("/departments", staff, asyncHandler(listDepartments));

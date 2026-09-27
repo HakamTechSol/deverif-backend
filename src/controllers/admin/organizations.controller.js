@@ -7,13 +7,21 @@ import { sendExpiryReminderEmail } from "../../utils/mailer.js";
 import { createNotificationForOrgUsers } from "../notification.controller.js";
 import { logAudit, getActorFromReq } from "../../utils/auditLog.js";
 import { assignFreePlanToOrg } from "../../utils/freePlan.js";
-import { resetDailyRequestUsage } from "../../utils/requestQuota.js";
+import { getFreePlan, PLAN_SELECT_COLUMNS } from "../../utils/subscriptionPlans.js";
+import {
+  applySubscriptionChange,
+  describeSubscriptionChange,
+  loadOrganizationSubscriptionState,
+  logSubscriptionChangeApplied,
+  resolveSubscriptionChange,
+} from "../../utils/subscriptionTransition.js";
 
 const ORG_SELECT = `organizations.id, organizations.uuid, organizations.name, organizations.verified,
   organizations.logo, ot.name AS organization_type, organizations.business_email,
   organizations.subscription_status, organizations.subscription_start, organizations.subscription_expiry,
-  organizations.subscription_plan_id,
+  organizations.subscription_plan_id, organizations.pending_plan_id,
   (SELECT name FROM subscription_plans sp WHERE sp.id = organizations.subscription_plan_id) AS subscription_plan_name,
+  (SELECT name FROM subscription_plans sp WHERE sp.id = organizations.pending_plan_id) AS pending_plan_name,
   organizations.reminder_2d_sent, organizations.reminder_2h_sent, organizations.created_at`;
 
   const ORG_LIST_SELECT = `${ORG_SELECT},
@@ -95,13 +103,20 @@ export async function createOrganization(req, res) {
 
   const typeId = await resolveOrgTypeId(organization_type);
 
-  const [result] = await pool.query(
-    "INSERT INTO organizations (name, verified, logo, organization_type, business_email) VALUES (?, 'yes', ?, ?, ?)",
-    [name, logoPath, typeId, email]
-  );
+  // Every organization is on a real plan from the moment it is created: the Free
+  // plan, looked up dynamically, written as part of the INSERT so the row never
+  // exists in a NULL / 'none' limbo (which is also a window where a concurrent
+  // request would see a planless org). Free has no billing cycle, so its expiry
+  // is NULL -- meaning "indefinite", not "expired".
+  const freePlan = await getFreePlan(pool);
 
-  // Automatically subscribe new orgs to the Free plan (baseline experience).
-  await assignFreePlanToOrg(pool, result.insertId);
+  const [result] = await pool.query(
+    `INSERT INTO organizations
+       (name, verified, logo, organization_type, business_email,
+        subscription_plan_id, subscription_status, subscription_start, subscription_expiry)
+     VALUES (?, 'yes', ?, ?, ?, ?, 'active', NOW(), NULL)`,
+    [name, logoPath, typeId, email, freePlan.id]
+  );
 
   const [rows] = await pool.query(`SELECT ${ORG_SELECT} FROM organizations ${ORG_TYPE_JOIN} WHERE organizations.id=?`, [result.insertId]);
 
@@ -110,7 +125,12 @@ export async function createOrganization(req, res) {
     action: "organization.create",
     entityType: "organization",
     entityId: rows[0].uuid,
-    details: { name, organization_type: rows[0].organization_type },
+    details: {
+      name,
+      organization_type: rows[0].organization_type,
+      initial_plan: freePlan.name,
+      initial_plan_id: freePlan.id,
+    },
     req,
   });
 
@@ -275,8 +295,14 @@ export async function deleteOrganization(req, res) {
 
 export async function setOrganizationSubscription(req, res) {
   const { uuid } = req.params;
-  const { plan, amount, plan_uuid } = req.body;
+  const { plan, amount, plan_uuid, force } = req.body;
   assertUuid(uuid, "Organization UUID");
+
+  // `force: true` is an explicit admin override that always applies the change
+  // immediately on a fresh cycle. Without it the request goes through the same
+  // renewal/upgrade/downgrade logic as a paid checkout, so an admin assigning a
+  // lower-tier plan does not silently yank features the org has paid for.
+  const forceImmediate = force === true || force === "true" || force === 1 || force === "1";
 
   const [orgExists] = await pool.query("SELECT id, uuid FROM organizations WHERE uuid=?", [uuid]);
   if (!orgExists.length) throw new ApiError(404, "Organization not found");
@@ -286,69 +312,90 @@ export async function setOrganizationSubscription(req, res) {
   // plan_uuid may reference standard (is_custom=0) OR custom (is_custom=1)
   // plans, so custom plans can be (re)assigned to their own organization.
   let planRow;
-  let billingPeriod;
   if (plan_uuid) {
     assertUuid(plan_uuid, "Plan UUID");
     const [[row]] = await pool.query(
-      `SELECT id, name, monthly_price, billing_period FROM subscription_plans WHERE uuid=?`,
+      `SELECT ${PLAN_SELECT_COLUMNS} FROM subscription_plans WHERE uuid=?`,
       [plan_uuid]
     );
     if (!row) {
       throw new ApiError(404, "Plan not found");
     }
     planRow = row;
-    billingPeriod = row.billing_period;
   } else {
     if (!["monthly", "yearly"].includes(plan)) {
       throw new ApiError(400, "plan must be 'monthly' or 'yearly', or pass plan_uuid");
     }
     const planName = plan === "monthly" ? "Plan A" : "Plan B";
     const [[row]] = await pool.query(
-      "SELECT id, name, monthly_price, billing_period FROM subscription_plans WHERE name=? AND is_custom=0 ORDER BY id ASC LIMIT 1",
+      `SELECT ${PLAN_SELECT_COLUMNS} FROM subscription_plans WHERE name=? AND is_custom=0 ORDER BY id ASC LIMIT 1`,
       [planName]
     );
     if (!row) throw new ApiError(500, `Subscription plan "${planName}" is not seeded`);
     planRow = row;
-    billingPeriod = row.billing_period || plan;
   }
 
   const orgId = orgExists[0].id;
   const now = new Date();
-  const durationMonths = billingPeriod === "yearly" ? 12 : 1;
-  const expiry = new Date(now);
-  expiry.setMonth(expiry.getMonth() + durationMonths);
 
-  await pool.query(
-    `UPDATE organizations SET subscription_status='active', subscription_start=?, subscription_expiry=?, subscription_plan_id=?, reminder_2d_sent='no', reminder_2h_sent='no' WHERE id=?`,
-    [now, expiry, planRow.id, orgId]
-  );
+  // The org row is locked so a concurrent webhook / checkout completion cannot
+  // interleave with this manual change and double-apply a subscription.
+  const connection = await pool.getConnection();
+  let change;
+  let org;
+  try {
+    await connection.beginTransaction();
 
-  // Assigning a plan is a new entitlement: clear today's usage so the org gets
-  // the full daily quota of the plan just assigned instead of the new quota
-  // minus what it already consumed today under its previous plan.
-  await resetDailyRequestUsage(orgId);
+    org = await loadOrganizationSubscriptionState(connection, orgId);
+    change = resolveSubscriptionChange(org, planRow, { force: forceImmediate, now });
+    await applySubscriptionChange(connection, { organizationId: orgId, change, now });
 
-  // A manually-assigned plan supersedes any pending self-subscription request.
-  await pool.query(
-    `UPDATE self_subscription_requests SET status='cancelled', decided_by=?, decided_at=NOW()
-     WHERE organization_id=? AND status='pending'`,
-    [req.admin?.uuid ?? null, orgId]
-  );
-
-  // Record payment only if an amount was provided
-  const numericAmount = Number(amount);
-  if (numericAmount > 0) {
-    const [[firstUser]] = await pool.query(
-      "SELECT id FROM users WHERE organization=? ORDER BY created_at ASC LIMIT 1",
-      [orgId]
+    // A manually-assigned plan supersedes any pending self-subscription request.
+    await connection.query(
+      `UPDATE self_subscription_requests SET status='cancelled', decided_by=?, decided_at=NOW()
+       WHERE organization_id=? AND status='pending'`,
+      [req.admin?.uuid ?? null, orgId]
     );
-    if (firstUser) {
-      await pool.query(
-        `INSERT INTO payment (user_id, amount, payment_method, transaction_reference, paid_at, purpose) VALUES (?, ?, 'manual', ?, NOW(), ?)`,
-        [firstUser.id, numericAmount, `SUB-${planRow.name.replace(/\s+/g, "-").toUpperCase()}-${Date.now()}`, `Subscription: ${planRow.name} for organization`]
+
+    // Record payment only if an amount was provided
+    const numericAmount = Number(amount);
+    if (numericAmount > 0) {
+      const [[firstUser]] = await connection.query(
+        "SELECT id FROM users WHERE organization=? ORDER BY created_at ASC LIMIT 1",
+        [orgId]
       );
+      if (firstUser) {
+        await connection.query(
+          `INSERT INTO payment (user_id, organization_id, amount, payment_method, transaction_reference, paid_at, purpose)
+           VALUES (?, ?, ?, 'manual', ?, NOW(), ?)`,
+          [
+            firstUser.id,
+            orgId,
+            numericAmount,
+            `SUB-${planRow.name.replace(/\s+/g, "-").toUpperCase()}-${Date.now()}`,
+            `Subscription: ${planRow.name} for organization`,
+          ]
+        );
+      }
     }
+
+    await connection.commit();
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
   }
+
+  // Audit after the commit so the recorded state is the durable one.
+  logSubscriptionChangeApplied({
+    orgUuid: org.uuid,
+    organizationId: orgId,
+    change,
+    source: "admin_override",
+    actor: getActorFromReq(req),
+    extra: { plan: planRow.name, force: forceImmediate, amount: Number(amount) || null },
+  });
 
   const [rows] = await pool.query(`SELECT ${ORG_SELECT} FROM organizations ${ORG_TYPE_JOIN} WHERE organizations.uuid=?`, [uuid]);
 
@@ -357,11 +404,40 @@ export async function setOrganizationSubscription(req, res) {
     action: "subscription.set",
     entityType: "organization",
     entityId: uuid,
-    details: { plan: planRow.name, plan_uuid: plan_uuid || null, amount: numericAmount > 0 ? numericAmount : null },
+    details: {
+      plan: planRow.name,
+      plan_uuid: plan_uuid || null,
+      amount: Number(amount) > 0 ? Number(amount) : null,
+      force: forceImmediate,
+      transition: describeSubscriptionChange(change),
+      pending_plan_id: change.pending_plan_id ?? null,
+    },
     req,
   });
 
-  return ok(res, { organization: rows[0] }, `Subscription set to ${planRow.name} (expires ${expiry.toISOString().slice(0, 10)})`);
+  if (change.action === "change_scheduled") {
+    // "Scheduled" now covers a same-plan renewal as well as a downgrade: one
+    // mechanism, so the wording is chosen from `relation` rather than from a
+    // separate action name.
+    const isRenewal = change.relation === "same";
+    return ok(
+      res,
+      { organization: rows[0], subscription_change: change },
+      isRenewal
+        ? `Renewal of ${planRow.name} scheduled: your current period stays untouched and the new one starts when it ends (${new Date(
+            change.subscription_expiry
+          ).toISOString().slice(0, 10)})`
+        : `Downgrade to ${planRow.name} scheduled: your current plan stays active until ${new Date(
+            change.subscription_expiry
+          ).toISOString().slice(0, 10)}`
+    );
+  }
+
+  return ok(
+    res,
+    { organization: rows[0], subscription_change: change },
+    `Subscription set to ${planRow.name} (${describeSubscriptionChange(change)})`
+  );
 }
 
 export async function cancelOrganizationSubscription(req, res) {
@@ -371,10 +447,12 @@ export async function cancelOrganizationSubscription(req, res) {
   const [orgExists] = await pool.query("SELECT id FROM organizations WHERE uuid=?", [uuid]);
   if (!orgExists.length) throw new ApiError(404, "Organization not found");
 
-  await pool.query(
-    `UPDATE organizations SET subscription_status='none', subscription_start=NULL, subscription_expiry=NULL, subscription_plan_id=NULL WHERE id=?`,
-    [orgExists[0].id]
-  );
+  // Cancelling does NOT drop the organization into a NULL / 'none' limbo: every
+  // org is always on a real plan, so cancelling a paid subscription moves it
+  // back to the Free plan (looked up dynamically). This also voids any pending
+  // self-subscription request and any deferred downgrade, since the org now has
+  // a concrete plan and no paid period left for a scheduled change to apply to.
+  const freePlan = await assignFreePlanToOrg(pool, orgExists[0].id);
 
   // Cancelling the subscription voids any pending self-subscription request.
   await pool.query(
@@ -390,10 +468,15 @@ export async function cancelOrganizationSubscription(req, res) {
     action: "subscription.cancel",
     entityType: "organization",
     entityId: uuid,
+    details: { moved_to_plan: freePlan.name, moved_to_plan_id: freePlan.id },
     req,
   });
 
-  return ok(res, { organization: rows[0] }, "Subscription cancelled");
+  return ok(
+    res,
+    { organization: rows[0] },
+    `Subscription cancelled. The organization is now on the ${freePlan.name} plan.`
+  );
 }
 
 export async function checkAndSendExpiryReminders() {

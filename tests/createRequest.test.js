@@ -2,7 +2,29 @@ import { describe, it, expect, vi, beforeAll, afterAll, beforeEach } from "vites
 import fs from "node:fs";
 import path from "node:path";
 
-vi.mock("../src/config/db.js", () => ({ pool: { query: vi.fn() } }));
+// createRequest now performs the quota consumption AND the request INSERT inside
+// a single transaction on a dedicated connection. The connection's `query` is
+// deliberately the SAME mock as `pool.query`, so the assertions in this file
+// (which inspect pool.query.mock.calls) keep covering the queries that moved onto
+// the transaction, while beginTransaction/commit/rollback stay separately
+// observable for the rollback tests.
+const { sharedQuery, fakeConnection } = vi.hoisted(() => {
+  const q = vi.fn();
+  return {
+    sharedQuery: q,
+    fakeConnection: {
+      query: q,
+      beginTransaction: vi.fn(),
+      commit: vi.fn(),
+      rollback: vi.fn(),
+      release: vi.fn(),
+    },
+  };
+});
+
+vi.mock("../src/config/db.js", () => ({
+  pool: { query: sharedQuery, getConnection: vi.fn(async () => fakeConnection) },
+}));
 vi.mock("../src/services/documentService.js", async (importOriginal) => {
   const original = await importOriginal();
   return { ...original, validate: vi.fn() };
@@ -101,11 +123,46 @@ function sqlRouter(sql) {
 
 beforeEach(() => {
   vi.resetAllMocks();
+  // resetAllMocks clears the mockResolvedValue installed by the module factory.
+  pool.getConnection.mockResolvedValue(fakeConnection);
   knownPerson = null;
   priorPersonDoc = null;
   validate.mockResolvedValue({ success: true, data: { valid: true } });
   pool.query.mockImplementation(sqlRouter);
 });
+
+/**
+ * Read the request INSERT's bound parameters BY COLUMN NAME.
+ *
+ * Positional assertions (params[8], params[9], ...) break every time a column is
+ * added in the middle of the statement — which is exactly what happened when
+ * document_validation_status / document_validation_reason were inserted ahead of
+ * the auto-verify columns, silently shifting six unrelated assertions. Parsing
+ * the column list instead keeps these tests honest about what they claim to test.
+ */
+function insertedColumns() {
+  const call = pool.query.mock.calls.find(
+    ([sql]) => typeof sql === "string" && sql.includes("INSERT INTO verification_requests")
+  );
+  expect(call).toBeDefined();
+
+  // NOW() is the only function call in the VALUES list, but it contains
+  // parentheses, so neutralise it before splitting on commas — otherwise the
+  // simple regex stops at the first NOW() and captures a truncated value list.
+  const sql = call[0].replace(/NOW\(\)/gi, "@now");
+  const [, columnList, valueList] = sql.match(/\(([^)]*)\)\s*VALUES\s*\(([^)]*)\)/i);
+  const names = columnList.split(",").map((c) => c.trim());
+  const tokens = valueList.split(",").map((t) => t.trim());
+
+  // One value token per column, and exactly as many bound params as "?"s.
+  expect(tokens).toHaveLength(names.length);
+  expect(tokens.filter((t) => t === "?").length).toBe(call[1].length);
+
+  let next = 0;
+  return Object.fromEntries(
+    names.map((name, idx) => [name, tokens[idx] === "?" ? call[1][next++] : new Date(0)])
+  );
+}
 
 describe("createRequest — other_organization_name validation", () => {
   it("succeeds when an organization UUID is provided (other_organization_name optional)", async () => {
@@ -131,12 +188,9 @@ describe("createRequest — other_organization_name validation", () => {
     await createRequest(req, res);
     expect(res.status).toHaveBeenCalledWith(201);
 
-    const insertCall = pool.query.mock.calls.find(([sql]) =>
-      typeof sql === "string" && sql.includes("INSERT INTO verification_requests")
-    );
     // other_organization_name is normalized into an unmatched_organizations
-    // row; the request references it by id (param index 3).
-    expect(insertCall[1][3]).toBe(2);
+    // row; the request references it by id.
+    expect(insertedColumns().unmatched_org_id).toBe(2);
   });
 
   it("rejects when no org is selected and other_organization_name is missing", async () => {
@@ -179,11 +233,8 @@ describe("createRequest — other_organization_name validation", () => {
     await createRequest(req, res);
     expect(res.status).toHaveBeenCalledWith(201);
 
-    const insertCall = pool.query.mock.calls.find(([sql]) =>
-      typeof sql === "string" && sql.includes("INSERT INTO verification_requests")
-    );
-    // Name is trimmed before the unmatched_organizations lookup (id at param index 3)
-    expect(insertCall[1][3]).toBe(2);
+    // Name is trimmed before the unmatched_organizations lookup.
+    expect(insertedColumns().unmatched_org_id).toBe(2);
   });
 });
 
@@ -205,10 +256,7 @@ describe("createRequest — submission_remarks validation", () => {
     await createRequest(req, res);
     expect(res.status).toHaveBeenCalledWith(201);
 
-    const insertCall = pool.query.mock.calls.find(([sql]) =>
-      typeof sql === "string" && sql.includes("INSERT INTO verification_requests")
-    );
-    expect(insertCall[1]).toContain("Some notes");
+    expect(insertedColumns().submission_remarks).toBe("Some notes");
   });
 
   it("rejects when submission_remarks exceeds 500 characters", async () => {
@@ -243,11 +291,7 @@ describe("createRequest — submission_remarks validation", () => {
     await createRequest(req, res);
     expect(res.status).toHaveBeenCalledWith(201);
 
-    const insertCall = pool.query.mock.calls.find(([sql]) =>
-      typeof sql === "string" && sql.includes("INSERT INTO verification_requests")
-    );
-    const remarksValue = insertCall[1][9];
-    expect(remarksValue).toBeNull();
+    expect(insertedColumns().submission_remarks).toBeNull();
   });
 });
 
@@ -309,12 +353,10 @@ describe("createRequest — exact-hash auto-verification (existing fast path unc
     await createRequest(req, res);
     expect(res.status).toHaveBeenCalledWith(201);
 
-    const insertCall = pool.query.mock.calls.find(([sql]) =>
-      typeof sql === "string" && sql.includes("INSERT INTO verification_requests")
-    );
-    expect(insertCall[1][4]).toBe("verified"); // status
-    expect(insertCall[1][10]).toBe("auto"); // verification_method
-    expect(insertCall[1][11]).toEqual(expect.any(Date)); // verified_at populated
+    const cols = insertedColumns();
+    expect(cols.status).toBe("verified");
+    expect(cols.verification_method).toBe("auto");
+    expect(cols.verified_at).toEqual(expect.any(Date)); // verified_at populated
   });
 
   it("auto-verifies a repeat even when the earlier verified row was flagged organization_conserned_for_future='no'", async () => {
@@ -336,11 +378,9 @@ describe("createRequest — exact-hash auto-verification (existing fast path unc
     await createRequest(req, res);
     expect(res.status).toHaveBeenCalledWith(201);
 
-    const insertCall = pool.query.mock.calls.find(([sql]) =>
-      typeof sql === "string" && sql.includes("INSERT INTO verification_requests")
-    );
-    expect(insertCall[1][4]).toBe("verified");
-    expect(insertCall[1][10]).toBe("auto");
+    const cols = insertedColumns();
+    expect(cols.status).toBe("verified");
+    expect(cols.verification_method).toBe("auto");
   });
 
   it("does not depend on organization_conserned_for_future in the prior-verified lookup", async () => {
@@ -393,12 +433,10 @@ describe("createRequest — exact-hash auto-verification (existing fast path unc
     await createRequest(req, res);
     expect(res.status).toHaveBeenCalledWith(201);
 
-    const insertCall = pool.query.mock.calls.find(([sql]) =>
-      typeof sql === "string" && sql.includes("INSERT INTO verification_requests")
-    );
-    expect(insertCall[1][4]).toBe("under_review");
-    expect(insertCall[1][10]).toBe("manual");
-    expect(insertCall[1][11]).toBeNull();
+    const cols = insertedColumns();
+    expect(cols.status).toBe("under_review");
+    expect(cols.verification_method).toBe("manual");
+    expect(cols.verified_at).toBeNull();
   });
 
   it("anchors auto-verified copies by writing organization_conserned_for_future='yes'", async () => {
@@ -415,11 +453,7 @@ describe("createRequest — exact-hash auto-verification (existing fast path unc
     await createRequest(req, res);
     expect(res.status).toHaveBeenCalledWith(201);
 
-    const insertCall = pool.query.mock.calls.find(([sql]) =>
-      typeof sql === "string" && sql.includes("INSERT INTO verification_requests")
-    );
-    // param index 8 is the organization_conserned_for_future column value
-    expect(insertCall[1][8]).toBe("yes");
+    expect(insertedColumns().organization_conserned_for_future).toBe("yes");
   });
 
   it("leaves organization_conserned_for_future='no' for manual (non-auto) submissions", async () => {
@@ -434,10 +468,7 @@ describe("createRequest — exact-hash auto-verification (existing fast path unc
     await createRequest(req, res);
     expect(res.status).toHaveBeenCalledWith(201);
 
-    const insertCall = pool.query.mock.calls.find(([sql]) =>
-      typeof sql === "string" && sql.includes("INSERT INTO verification_requests")
-    );
-    expect(insertCall[1][8]).toBe("no");
+    expect(insertedColumns().organization_conserned_for_future).toBe("no");
   });
 
   it("returns qr_token/qr_signature in the response when generateQrForRequest yields them", async () => {

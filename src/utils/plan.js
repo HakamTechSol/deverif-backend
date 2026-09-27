@@ -1,66 +1,52 @@
-const PLAN_LABELS = {
-  free: "Free",
-  basic: "Basic",
-  premium: "Premium"
-};
-
-// Map plan names (from subscription_plans.name) back to codes.
-const PLAN_NAME_TO_CODE = {};
-for (const [code, label] of Object.entries(PLAN_LABELS)) {
-  PLAN_NAME_TO_CODE[label.toLowerCase()] = code;
-}
-
-export function normalizePlan(plan) {
-  return ["free", "basic", "premium"].includes(plan) ? plan : "free";
-}
+/**
+ * Build a plan summary for `GET /payment/plan`.
+ *
+ * Subscriptions are managed at the ORG level only, so everything here is derived
+ * from the organization's current plan row. The Free plan is identified purely by
+ * its `is_free` flag -- never by a hardcoded id, a name match ("Free") or a
+ * price check -- so renaming or recreating it needs no code change.
+ */
 
 /**
- * Build a plan summary from the organizations table (subscriptions are managed
- * at the org level only). When no `orgSubscription` is provided the user has
- * no org-managed subscription, so the summary reports the free tier.
+ * @param orgSubscription the org_subscription payload built by the controller.
+ *        Must carry `is_free` (from the joined subscription_plans row) for the
+ *        Free plan to be recognised.
  */
-export function getPlanSummary(_user, orgSubscription = null) {
-  const source = orgSubscription
-    ? {
-        subscription_plan: orgSubscription.plan ?? orgSubscription.subscription_plan ?? "free",
-        subscription_expiry: orgSubscription.expiry ?? orgSubscription.subscription_expiry ?? null,
-        plan_name: orgSubscription.plan_name ?? null,
-        status: orgSubscription.status ?? null,
-      }
-    : { subscription_plan: "free", subscription_expiry: null };
-
-  // Resolve the plan code. Plan identity comes from subscription_plans.name
-  // (via `plan`/subscription_plan_id); `plan_name` is the fallback.
-  let planCode = source.subscription_plan || "free";
-  if (planCode === "free" && source.plan_name) {
-    const derived = PLAN_NAME_TO_CODE[source.plan_name.toLowerCase()];
-    if (derived) {
-      planCode = derived;
-    } else if (source.status === "active") {
-      // Custom/unknown plan name (e.g. "Advance") but org is active — use
-      // the name directly so the summary doesn't misleadingly say "free".
-      planCode = source.plan_name;
-    }
+export function getPlanSummary(orgSubscription = null) {
+  if (!orgSubscription) {
+    // No org-managed subscription at all (orgless user): the free tier.
+    return {
+      code: "free",
+      label: null,
+      is_free: true,
+      plan_name: null,
+      plan_uuid: null,
+      expires_at: null,
+      has_expiry: false,
+      is_expired: false,
+      is_active: false,
+      status: "free",
+    };
   }
 
-  const expiry = source.subscription_expiry ? new Date(source.subscription_expiry) : null;
+  const isFree = orgSubscription.is_free === 1 || orgSubscription.is_free === true;
+  const expiry = orgSubscription.expiry ? new Date(orgSubscription.expiry) : null;
   const hasExpiry = expiry instanceof Date && !Number.isNaN(expiry.valueOf());
-  const isExpired = hasExpiry ? expiry.getTime() < Date.now() : false;
-
-  // For known plans use normalizePlan; for custom names keep as-is.
-  const purchasedPlan = PLAN_LABELS[planCode] ? normalizePlan(planCode) : planCode;
-  const activePlan = isExpired ? "free" : purchasedPlan;
-  const isKnownPlan = !!PLAN_LABELS[activePlan];
+  // A Free plan has no billing cycle, so a NULL expiry is the normal, valid
+  // state for it -- NOT an expiry. A paid plan with no expiry is a data bug, so
+  // it is reported as expired rather than treated as perpetual access.
+  const isExpired = isFree ? false : !hasExpiry || expiry.getTime() < Date.now();
 
   return {
-    code: isKnownPlan ? activePlan : activePlan,
-    label: PLAN_LABELS[activePlan] ?? activePlan,
-    purchased_plan: purchasedPlan,
-    purchased_plan_label: PLAN_LABELS[purchasedPlan] ?? purchasedPlan,
-    expires_at: source.subscription_expiry || null,
+    code: isFree ? "free" : "paid",
+    label: orgSubscription.plan_name ?? null,
+    is_free: isFree,
+    plan_name: orgSubscription.plan_name ?? null,
+    plan_uuid: orgSubscription.plan_uuid ?? null,
+    expires_at: hasExpiry ? orgSubscription.expiry : null,
     has_expiry: hasExpiry,
     is_expired: isExpired,
-    is_active: activePlan !== "free" && !isExpired,
-    status: isExpired ? "expired" : activePlan === "free" ? "free" : "active"
+    is_active: orgSubscription.status === "active" && !isExpired,
+    status: isExpired ? "expired" : isFree ? "free" : "active",
   };
 }

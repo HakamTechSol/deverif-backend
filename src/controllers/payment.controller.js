@@ -6,6 +6,13 @@ import { calculatePlanExpiry, getPurchasablePlan, getPurchasablePlans } from "..
 import { getOrgQuotaStatus } from "../utils/requestQuota.js";
 import { normalizePlanFeatures } from "../utils/planFeatures.js";
 import {
+  applySubscriptionChange,
+  loadOrganizationSubscriptionState,
+  logSubscriptionChangeApplied,
+  PLAN_SELECT_COLUMNS,
+  resolveSubscriptionChange,
+} from "../utils/subscriptionTransition.js";
+import {
   buildProviderCheckout,
   getEnabledProviders,
   getFrontendReturnUrl,
@@ -71,17 +78,7 @@ async function finalizeSuccessfulPayment(callbackResult) {
 
     // Subscriptions are org-scoped: the payment activates/extends the
     // organization's subscription, never the user's.
-    const [orgRows] = await connection.query(
-      `SELECT id, subscription_status, subscription_expiry, subscription_plan_id
-       FROM organizations
-       WHERE id=?
-       FOR UPDATE`,
-      [organizationId]
-    );
-    if (!orgRows.length) {
-      throw new ApiError(404, "Organization for payment not found");
-    }
-    const org = orgRows[0];
+    const org = await loadOrganizationSubscriptionState(connection, organizationId);
 
     // "Already processed?" is checked AFTER acquiring the organization lock, so
     // concurrent duplicate callbacks for the same reference serialize behind the
@@ -97,26 +94,39 @@ async function finalizeSuccessfulPayment(callbackResult) {
       return { payment: existingPayments[0], already_recorded: true, payment_meta: paymentMeta };
     }
 
-    const nextExpiry = calculatePlanExpiry(org.subscription_expiry, expectedPlan.duration_days);
-
     // Assign a plan row when the purchasable plan matches one by name
     // (e.g. "Basic"); otherwise keep the org's existing plan assignment.
-    let planId = org.subscription_plan_id ?? null;
     const [[planMatch]] = await connection.query(
-      "SELECT id FROM subscription_plans WHERE name=? ORDER BY id ASC LIMIT 1",
+      `SELECT ${PLAN_SELECT_COLUMNS} FROM subscription_plans WHERE name=? ORDER BY id ASC LIMIT 1`,
       [expectedPlan.label]
     );
-    if (planMatch) planId = planMatch.id;
 
-    await connection.query(
-      `UPDATE organizations
-       SET subscription_status='active',
-           subscription_start=CASE WHEN ? THEN NOW() ELSE subscription_start END,
-           subscription_expiry=?, subscription_plan_id=?,
-           reminder_2d_sent='no', reminder_2h_sent='no'
-       WHERE id=?`,
-      [org.subscription_status !== "active", formatSqlDateTime(nextExpiry), planId, organizationId]
-    );
+    let planId;
+    let appliedChange = null;
+    if (planMatch) {
+      // A real DB plan: use the shared transition logic so a JazzCash/Easypaisa
+      // renewal extends the current expiry and a downgrade is deferred, exactly
+      // like a Safepay payment.
+      appliedChange = resolveSubscriptionChange(org, planMatch);
+      await applySubscriptionChange(connection, { organizationId, change: appliedChange });
+      planId = appliedChange.subscription_plan_id;
+    } else {
+      // No matching subscription_plans row: the legacy env-configured plan
+      // (BASIC_PLAN_DURATION_DAYS etc.) is not a DB plan, so there is no plan to
+      // switch tiers to. Keep the historical "extend the current expiry" date
+      // math for this path only.
+      const nextExpiry = calculatePlanExpiry(org.subscription_expiry, expectedPlan.duration_days);
+      planId = org.subscription_plan_id ?? null;
+      await connection.query(
+        `UPDATE organizations
+         SET subscription_status='active',
+             subscription_start=CASE WHEN ? THEN NOW() ELSE subscription_start END,
+             subscription_expiry=?, subscription_plan_id=?,
+             reminder_2d_sent='no', reminder_2h_sent='no'
+         WHERE id=?`,
+        [org.subscription_status !== "active", formatSqlDateTime(nextExpiry), planId, organizationId]
+      );
+    }
 
     let insertId;
     try {
@@ -152,6 +162,18 @@ async function finalizeSuccessfulPayment(callbackResult) {
 
     await connection.commit();
 
+    // Audit after the commit so an unexplained subscription change is traceable
+    // to this callback rather than leaving no record at all.
+    if (appliedChange) {
+      logSubscriptionChangeApplied({
+        orgUuid: org.uuid,
+        organizationId,
+        change: appliedChange,
+        source: `provider_callback:${callbackResult.provider}`,
+        extra: { plan: planMatch.name, transaction_reference: transactionReference },
+      });
+    }
+
     return { payment: paymentRows[0], already_recorded: false, payment_meta: paymentMeta };
   } catch (error) {
     await connection.rollback();
@@ -183,15 +205,30 @@ export async function myPlan(req, res) {
   if (organizationId) {
     const [[org]] = await pool.query(
       `SELECT o.id, o.subscription_status, o.subscription_expiry, o.subscription_start,
-              o.subscription_plan_id, sp.name AS plan_name, sp.monthly_price, sp.daily_request_quota,
-              sp.description, sp.features, sp.module_flags
+              o.subscription_plan_id, o.pending_plan_id,
+              sp.uuid AS plan_uuid, sp.name AS plan_name, sp.is_free AS is_free,
+              sp.monthly_price, sp.daily_request_quota,
+              sp.description, sp.features, sp.module_flags,
+              pp.name AS pending_plan_name, pp.daily_request_quota AS pending_plan_daily_request_quota,
+              pp.monthly_price AS pending_plan_monthly_price
        FROM organizations o
        LEFT JOIN subscription_plans sp ON sp.id = o.subscription_plan_id
+       LEFT JOIN subscription_plans pp ON pp.id = o.pending_plan_id
        WHERE o.id=?`,
       [organizationId]
     );
     if (org) {
-      if (org.subscription_status === "active" && org.subscription_expiry && new Date(org.subscription_expiry) < new Date()) {
+      // A Free plan has no expiry, so a NULL expiry is its normal state and must
+      // never be read as "expired". For a paid plan the lazy flip keeps admin
+      // lists and the dashboard consistent; the lifecycle job then moves the org
+      // onto the Free plan rather than leaving it in 'expired' limbo.
+      const isFree = Number(org.is_free) === 1;
+      if (
+        !isFree &&
+        org.subscription_status === "active" &&
+        org.subscription_expiry &&
+        new Date(org.subscription_expiry) < new Date()
+      ) {
         org.subscription_status = "expired";
         await pool.query("UPDATE organizations SET subscription_status='expired' WHERE id=?", [org.id]);
       }
@@ -208,6 +245,9 @@ export async function myPlan(req, res) {
         status: org.subscription_status,
         plan: org.plan_name || null,
         plan_name: org.plan_name || null,
+        // The Free plan is recognised by its flag, never by name or price.
+        is_free: isFree,
+        plan_uuid: org.plan_uuid || null,
         monthly_price: org.monthly_price != null ? Number(org.monthly_price) : null,
         daily_request_quota: org.daily_request_quota != null ? Number(org.daily_request_quota) : null,
         description: org.description || null,
@@ -215,6 +255,17 @@ export async function myPlan(req, res) {
         module_flags: moduleFlags,
         expiry: org.subscription_expiry,
         start: org.subscription_start,
+        // A deferred downgrade: the lower-tier plan takes over when the current
+        // period ends, so the effective date is the current expiry.
+        pending_plan_id: org.pending_plan_id ?? null,
+        pending_plan_name: org.pending_plan_name || null,
+        pending_plan_daily_request_quota:
+          org.pending_plan_daily_request_quota != null
+            ? Number(org.pending_plan_daily_request_quota)
+            : null,
+        pending_plan_monthly_price:
+          org.pending_plan_monthly_price != null ? Number(org.pending_plan_monthly_price) : null,
+        pending_plan_effective_at: org.pending_plan_id ? org.subscription_expiry : null,
       };
       quotaStatus = await getOrgQuotaStatus(org.id);
     }
@@ -234,7 +285,7 @@ export async function myPlan(req, res) {
 
   // Build the plan summary from the org subscription (the only place the plan
   // lives); orgless users report the free tier.
-  const planSummary = getPlanSummary(user, orgSubscription);
+  const planSummary = getPlanSummary(orgSubscription);
 
   return ok(res, {
     plan: planSummary,

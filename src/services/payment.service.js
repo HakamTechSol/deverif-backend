@@ -1,30 +1,48 @@
 import { pool } from "../config/db.js";
 import ApiError from "../utils/ApiError.js";
-import { todayStr, resetDailyRequestUsage } from "../utils/requestQuota.js";
+import {
+  applySubscriptionChange,
+  billingPeriodMonths,
+  loadOrganizationSubscriptionState,
+  logSubscriptionChangeApplied,
+  resolveSubscriptionChange,
+} from "../utils/subscriptionTransition.js";
 
 /**
- * Shared subscription activation service. Used by BOTH the Safepay webhook path
- * (auto-activation) and the System-Admin manual confirmation path so that both
- * agree on exactly how an organization's subscription is activated.
+ * Shared subscription activation service. Used by the Safepay webhook path
+ * (auto-activation), the checkout-status reconciliation and the System-Admin
+ * manual confirmation path, so they all agree on exactly how an organization's
+ * subscription is activated.
+ *
+ * The renewal / upgrade / downgrade decision is NOT made here: it comes from
+ * resolveSubscriptionChange, the single shared implementation. What this
+ * function adds is that the org row is locked first, so a duplicate webhook and
+ * a competing admin activation serialize instead of both extending the plan.
+ *
+ * Returns { expiry, duration_months, action, change }.
  */
-export async function activateOrgSubscription(connection, { organizationId, plan, now = new Date() }) {
-  const durationMonths = plan.billing_period === "yearly" ? 12 : 1;
-  const expiry = new Date(now);
-  expiry.setMonth(expiry.getMonth() + durationMonths);
-  await connection.query(
-    `UPDATE organizations
-     SET subscription_status='active', subscription_start=?, subscription_expiry=?,
-         subscription_plan_id=?, reminder_2d_sent='no', reminder_2h_sent='no'
-     WHERE id=?`,
-    [now, expiry, plan.id, organizationId]
-  );
+export async function activateOrgSubscription(
+  connection,
+  { organizationId, plan, now = new Date(), org = null, source = "unknown", actor = null }
+) {
+  const lockedOrg = org || (await loadOrganizationSubscriptionState(connection, organizationId));
 
-  // Activating a plan grants a new entitlement, so today's usage is cleared:
-  // the customer starts on the full daily quota of the plan they just bought
-  // rather than the new quota minus whatever the previous plan already used.
-  await resetDailyRequestUsage(organizationId, connection);
+  const change = resolveSubscriptionChange(lockedOrg, plan, { now });
+  const { expiry } = await applySubscriptionChange(connection, {
+    organizationId,
+    change,
+    now,
+  });
 
-  return { expiry, duration_months: durationMonths };
+  return {
+    expiry,
+    duration_months: billingPeriodMonths(plan.billing_period),
+    action: change.action,
+    change,
+    orgUuid: lockedOrg.uuid,
+    source,
+    actor,
+  };
 }
 
 export async function recordSubscriptionPayment(
@@ -81,12 +99,10 @@ export async function finalizeSuccessfulCheckout({ checkoutId, eventId }) {
     // Serialize on the organization row BEFORE deciding whether this delivery
     // was already processed, so a concurrent duplicate webhook — or a competing
     // activation from the manual admin path for the same org — queues behind
-    // the first commit instead of both extending the subscription.
-    const [[org]] = await connection.query(
-      "SELECT id FROM organizations WHERE id=? FOR UPDATE",
-      [checkout.organization_id]
-    );
-    if (!org) throw new ApiError(404, "Organization for checkout not found");
+    // the first commit instead of both extending the subscription. The same
+    // load feeds resolveSubscriptionChange, so the lock and the renewal/upgrade/
+    // downgrade decision read exactly the same state.
+    const org = await loadOrganizationSubscriptionState(connection, checkout.organization_id);
 
     if (checkout.status === "completed") {
       await connection.commit();
@@ -94,15 +110,18 @@ export async function finalizeSuccessfulCheckout({ checkoutId, eventId }) {
     }
 
     const [[plan]] = await connection.query(
-      "SELECT id, name, monthly_price, billing_period FROM subscription_plans WHERE id=?",
+      `SELECT id, name, monthly_price, daily_request_quota, billing_period
+       FROM subscription_plans WHERE id=?`,
       [checkout.plan_id]
     );
     if (!plan) throw new ApiError(404, "Plan not found");
 
-    const { expiry } = await activateOrgSubscription(connection, {
+    const { expiry, action, change, orgUuid } = await activateOrgSubscription(connection, {
       organizationId: checkout.organization_id,
       plan,
       now: new Date(),
+      org,
+      source: "safepay_webhook",
     });
 
     await connection.query(
@@ -111,6 +130,26 @@ export async function finalizeSuccessfulCheckout({ checkoutId, eventId }) {
        WHERE id=?`,
       [eventId, checkoutId]
     );
+
+    // Record which scheduled change this payment PRODUCED.
+    //
+    // Only a scheduled change sets this. An immediate activation granted
+    // something straight away and there is nothing to back out of, so
+    // resulted_in_pending_plan_id stays NULL and the cancel-with-refund lookup
+    // will never point at it.
+    //
+    // This is written here, in the same transaction that created the scheduled
+    // change, so the link can never disagree with organizations.pending_plan_id.
+    // It is also what makes the refund exact: matching a checkout by
+    // (organization_id, plan_id) instead would be ambiguous after a
+    // cancel-then-reschedule cycle and could refund an older, already-closed
+    // charge.
+    if (change.action === "change_scheduled" && change.pending_plan_id != null) {
+      await connection.query(
+        "UPDATE subscription_checkouts SET resulted_in_pending_plan_id=? WHERE id=?",
+        [change.pending_plan_id, checkoutId]
+      );
+    }
 
     // The Safepay tracker is the stable, replay-stable gateway reference for
     // this payment, so every re-delivery of the same webhook maps to the same
@@ -143,17 +182,35 @@ export async function finalizeSuccessfulCheckout({ checkoutId, eventId }) {
       throw error;
     }
 
-    // A paid PLAN CHANGE grants the org a fresh daily quota starting today
-    // under the new plan — reset today's usage bucket to zero in the same
-    // transaction so the quota reflects the new plan immediately.
-    const metadata = parseMetadata(checkout.metadata);
-    if (metadata?.purpose === "change_plan") {
-      await resetTodayUsage(connection, checkout.organization_id);
-    }
+    // NOTE: the daily-usage reset for a paid plan change is NOT done here. It
+    // already happened inside applySubscriptionChange, which clears today's
+    // bucket for every immediate activation (activate_now / renew /
+    // upgrade_now) inside this same transaction.
 
     await connection.commit();
 
-    return { already_processed: false, subscription: { plan: plan.name, expiry } };
+    // Audit AFTER the commit: the row is only durable once the transaction is,
+    // and this is what makes an unexplained subscription mutation traceable to
+    // this code path instead of leaving nothing behind.
+    logSubscriptionChangeApplied({
+      orgUuid,
+      organizationId: checkout.organization_id,
+      change,
+      source: "safepay_webhook",
+      extra: { checkout_uuid: checkout.uuid, gateway_event_id: eventId, plan: plan.name },
+    });
+
+    return {
+      already_processed: false,
+      subscription: { plan: plan.name, expiry, action },
+      action,
+      change: {
+        action,
+        pending_plan_id: change.pending_plan_id ?? null,
+        previous_plan_id: change.previous_plan_id ?? null,
+        previous_expiry: change.previous_expiry ?? null,
+      },
+    };
   } catch (error) {
     await connection.rollback();
     throw error;
@@ -172,17 +229,7 @@ function parseMetadata(raw) {
   }
 }
 
-/** Reset an organization's today daily_request_usage bucket back to zero. */
-async function resetTodayUsage(connection, orgId) {
-  const today = todayStr();
-  await connection.query(
-    `INSERT INTO daily_request_usage (organization_id, date, requests_used, total_requests)
-     VALUES (?, ?, 0, 0)
-     ON DUPLICATE KEY UPDATE requests_used = 0, total_requests = 0`,
-    [orgId, today]
-  );
-}
-
+/** Mark a checkout as failed so it stops being reconciled. */
 export async function markCheckoutFailed({ checkoutId, eventId }) {
   await pool.query(
     `UPDATE subscription_checkouts

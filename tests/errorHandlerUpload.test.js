@@ -80,7 +80,19 @@ describe("uploadDocs — isDocumentAllowed rejects MIME spoofing with non-allow-
     expect(isDocumentAllowed("doc.pdf", "application/pdf")).toBe(true);
     expect(isDocumentAllowed("pic.png", "image/png")).toBe(true);
     expect(isDocumentAllowed("note.txt", "text/plain")).toBe(true);
-    expect(isDocumentAllowed("book.xlsx", "application/octet-stream")).toBe(true);
+    // The generic blob marker is tolerated, but only for a supported extension:
+    // .docx is a zip container, so this must not become a way to let a bare .zip
+    // in under an Excel/CSV name.
+    expect(isDocumentAllowed("book.docx", "application/octet-stream")).toBe(true);
+  });
+
+  it("rejects spreadsheets and archives even under the generic blob marker", () => {
+    // .xlsx was previously listed as accepted here. It is not a supported
+    // document type, and the octet-stream tolerance is scoped to the
+    // allow-list, so it cannot revive a removed extension.
+    for (const name of ["book.xlsx", "book.xls", "data.csv", "bundle.zip"]) {
+      expect(isDocumentAllowed(name, "application/octet-stream")).toBe(false);
+    }
   });
 });
 

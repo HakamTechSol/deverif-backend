@@ -3,13 +3,26 @@ import { pool } from "../../config/db.js";
 import { ok } from "../../utils/response.js";
 import { assertUuid } from "../../utils/publicResponse.js";
 import { parsePagination, paginatedResponse } from "../../utils/pagination.js";
-import { resetDailyRequestUsage } from "../../utils/requestQuota.js";
 import { createNotificationForOrgUsers } from "../notification.controller.js";
 import { logAudit, getActorFromReq } from "../../utils/auditLog.js";
+import { assignFreePlanToOrg } from "../../utils/freePlan.js";
 import {
   activateOrgSubscription,
   recordSubscriptionPayment,
 } from "../../services/payment.service.js";
+import {
+  createSafepayPaymentSession,
+  createSafepayAuthToken,
+  buildSafepayCheckoutUrl,
+} from "../../services/safepay.service.js";
+import {
+  applySubscriptionChange,
+  describeSubscriptionChange,
+  loadOrganizationSubscriptionState,
+  logSubscriptionChangeApplied,
+  PLAN_SELECT_COLUMNS,
+  resolveSubscriptionChange,
+} from "../../utils/subscriptionTransition.js";
 
 const CUSTOM_PLAN_REQ_SELECT = `SELECT cpr.id, cpr.uuid, cpr.message, cpr.requested_quota, cpr.requested_price,
         cpr.status, cpr.approved_daily_quota, cpr.approved_price, cpr.created_at, cpr.decided_at, cpr.decided_by,
@@ -47,8 +60,17 @@ export async function listCustomPlanRequests(req, res) {
 
 /**
  * Admin: approve a custom-plan request.
- * Creates an is_custom subscription_plans entry and assigns it to the org,
- * then marks the request approved and activates the org subscription.
+ *
+ * Creates an is_custom subscription_plans entry, marks the request approved, and
+ * creates a PENDING checkout for the negotiated amount so the org admin pays for
+ * it through the normal Safepay redirect.
+ *
+ * This deliberately does NOT touch organizations.subscription_*. Approval
+ * records the negotiation outcome; it does not grant the plan. Activation
+ * happens only when that checkout's webhook succeeds, and it then runs the
+ * ordinary resolveSubscriptionChange comparison — so a custom plan is subject to
+ * exactly the same upgrade-now / schedule-at-expiry rule as any other plan,
+ * rather than being special-cased to always take effect immediately.
  */
 export async function approveCustomPlanRequest(req, res) {
   const { uuid } = req.params;
@@ -64,6 +86,10 @@ export async function approveCustomPlanRequest(req, res) {
   }
 
   const connection = await pool.getConnection();
+  let approvedPlanId;
+  let checkoutUuid;
+  let organizationId;
+  let organizationName;
   try {
     await connection.beginTransaction();
 
@@ -76,6 +102,8 @@ export async function approveCustomPlanRequest(req, res) {
     );
     if (!reqRows.length) throw new ApiError(404, "Custom plan request not found");
     const planReq = reqRows[0];
+    organizationId = planReq.organization_id;
+    organizationName = planReq.organization_name;
     if (planReq.status === "approved") {
       throw new ApiError(409, "This custom plan request is already approved");
     }
@@ -83,82 +111,173 @@ export async function approveCustomPlanRequest(req, res) {
       throw new ApiError(409, "This custom plan request was already denied");
     }
 
-    // Create the custom plan.
-    const planName = `Custom Plan — ${planReq.organization_name}`;
+    // Create the custom plan. The plan row existing is NOT the same thing as the
+    // organization having it: activation is gated on payment (see below).
+    const planName = `Custom Plan — ${organizationName}`;
     const [planResult] = await connection.query(
       `INSERT INTO subscription_plans (name, monthly_price, daily_request_quota, is_custom)
        VALUES (?, ?, ?, 1)`,
       [planName, price.toFixed(2), dailyQuota]
     );
-    const planId = planResult.insertId;
+    approvedPlanId = planResult.insertId;
 
-    // Assign to the organization and activate for 1 month.
-    const now = new Date();
-    const expiry = new Date(now);
-    expiry.setMonth(expiry.getMonth() + 1);
-    await connection.query(
-      `UPDATE organizations
-       SET subscription_status='active', subscription_start=?, subscription_expiry=?,
-           subscription_plan_id=?, reminder_2d_sent='no', reminder_2h_sent='no'
-       WHERE id=?`,
-      [now, expiry, planId, planReq.organization_id]
-    );
-
-    // Mark the request approved.
+    // Mark the request approved. This records the NEGOTIATION outcome only.
+    //
+    // approved_plan_id is what makes the approval actionable: it is the edge the
+    // org admin needs to open a checkout for exactly this plan. Without it the
+    // approved request was a dead end — nothing could resolve it back to a plan,
+    // because subscription_plans has no organization_id and the generated name is
+    // not a reliable key (stored names use an em dash, this code builds a hyphen).
     await connection.query(
       `UPDATE custom_plan_requests
-       SET status='approved', approved_daily_quota=?, approved_price=?, decided_by=?, decided_at=NOW()
+       SET status='approved', approved_daily_quota=?, approved_price=?, approved_plan_id=?,
+           decided_by=?, decided_at=NOW()
        WHERE id=?`,
-      [dailyQuota, price.toFixed(2), req.admin?.uuid ?? null, planReq.id]
+      [dailyQuota, price.toFixed(2), approvedPlanId, req.admin?.uuid ?? null, planReq.id]
     );
 
-    // The new plan is a new entitlement: clear today's usage so the customer
-    // gets the full approved daily quota (e.g. 100) instead of inheriting what
-    // was already consumed under the previous plan (e.g. 100 - 10 = 90).
-    await resetDailyRequestUsage(planReq.organization_id, connection);
+    // Create a PENDING checkout for the negotiated amount and hand the org admin a
+    // payment link. From here the custom plan is an ordinary purchase: the org
+    // pays through the normal Safepay redirect, and the webhook runs the normal
+    // resolveSubscriptionChange comparison.
+    //
+    // NOTHING in organizations.subscription_* is touched on this path. That is
+    // the entire point of this change. Approval used to activate the plan
+    // directly, so an org could be moved onto a paid plan — immediately, or
+    // scheduled — that it had never paid for, and a custom plan was quietly
+    // exempt from the upgrade/schedule distinction that every other plan obeys.
+    const [[planRow]] = await connection.query(
+      "SELECT uuid, name, monthly_price FROM subscription_plans WHERE id=?",
+      [approvedPlanId]
+    );
+    if (!planRow) throw new ApiError(500, "Custom plan could not be read back after insert");
+
+    // Cancel any stale pending checkout so the org is never left holding two live
+    // payment sessions for the same plan.
+    await connection.query(
+      "UPDATE subscription_checkouts SET status='cancelled' WHERE organization_id=? AND status='pending'",
+      [organizationId]
+    );
+
+    const [checkoutResult] = await connection.query(
+      `INSERT INTO subscription_checkouts
+         (organization_id, plan_id, plan_uuid, plan_name, gateway, amount, currency, status, metadata)
+       VALUES (?, ?, ?, ?, 'safepay', ?, 'PKR', 'pending', ?)`,
+      [
+        organizationId,
+        approvedPlanId,
+        planRow.uuid,
+        planRow.name,
+        Number(planRow.monthly_price),
+        JSON.stringify({
+          organization_id: organizationId,
+          plan_uuid: planRow.uuid,
+          plan_name: planRow.name,
+          purpose: "custom_plan_payment",
+          custom_plan_request_uuid: uuid,
+        }),
+      ]
+    );
+    const [[checkoutRow]] = await connection.query(
+      "SELECT id, uuid FROM subscription_checkouts WHERE id=?",
+      [checkoutResult.insertId]
+    );
+    if (!checkoutRow) throw new ApiError(500, "Could not create the custom-plan checkout");
+    checkoutUuid = checkoutRow.uuid;
 
     await connection.commit();
-
-    const [finalReq] = await pool.query(
-      `${CUSTOM_PLAN_REQ_SELECT} WHERE cpr.uuid=?`,
-      [uuid]
-    );
-    const [planRows] = await pool.query(
-      "SELECT uuid, name, monthly_price, daily_request_quota, is_custom FROM subscription_plans WHERE id=?",
-      [planId]
-    );
 
     logAudit({
       ...getActorFromReq(req),
       action: "custom_plan.approve",
       entityType: "custom_plan_request",
       entityId: uuid,
-      details: { daily_quota: dailyQuota, price, organization_id: planReq.organization_id },
+      details: {
+        daily_quota: dailyQuota,
+        price,
+        organization_id: organizationId,
+        plan_id: approvedPlanId,
+        checkout_uuid: checkoutUuid,
+        // Explicit, because it is the whole behavioural change: approving does
+        // NOT activate. The org's subscription is untouched until this
+        // checkout's webhook succeeds.
+        subscription_activated: false,
+        awaiting_payment: true,
+      },
       req,
     });
-
-    // Notify the organization.
-    createNotificationForOrgUsers({
-      orgId: planReq.organization_id,
-      type: "custom_plan_approved",
-      title: "Custom plan approved",
-      message: `Your custom plan was approved: ${dailyQuota} requests/day.`,
-      link: "/payments",
-      referenceId: uuid,
-      orgRoles: ["org_admin"],
-    }).catch(() => {});
-
-    return ok(
-      res,
-      { request: finalReq[0], plan: planRows[0] },
-      "Custom plan approved and assigned"
-    );
   } catch (error) {
     await connection.rollback();
     throw error;
   } finally {
     connection.release();
   }
+
+  // Payment link + notification, AFTER the commit. The checkout must be durable
+  // before the org is told to go and pay for it.
+  let paymentLink = null;
+  try {
+    const amountPaisa = Math.round(price * 100);
+    const trackerSession = await createSafepayPaymentSession({
+      amount: amountPaisa,
+      currency: "PKR",
+      metadata: { order_id: checkoutUuid, source: "dverif-custom-plan-approval" },
+    });
+    await pool.query(
+      "UPDATE subscription_checkouts SET gateway_tracker_id=? WHERE uuid=?",
+      [trackerSession.token, checkoutUuid]
+    );
+    const passport = await createSafepayAuthToken();
+    const base = (process.env.FRONTEND_PUBLIC_URL || "http://localhost:5173").replace(/\/$/, "");
+    paymentLink = buildSafepayCheckoutUrl({
+      tracker: trackerSession.token,
+      tbt: passport,
+      redirectUrl: `${base}/payment/callback`,
+      cancelUrl: `${base}/payment/callback?cancelled=1`,
+    });
+  } catch (error) {
+    // The approval and its checkout are already committed and must stand: the org
+    // still owes the negotiated amount. Surface the problem loudly and let the
+    // checkout be retried or reconciled, rather than rolling back the approval
+    // and leaving the admin thinking nothing happened.
+    console.error(
+      `Custom plan ${approvedPlanId} approved (checkout ${checkoutUuid}) but the Safepay session ` +
+        `could not be created: ${error?.message}`
+    );
+  }
+
+  createNotificationForOrgUsers({
+    orgId: organizationId,
+    type: "custom_plan_awaiting_payment",
+    title: "Custom plan approved — payment required",
+    message:
+      `Your custom plan (${dailyQuota} requests/day, PKR ${price.toFixed(2)}) has been approved. ` +
+      `Your current plan is unchanged until you complete the payment.`,
+    link: paymentLink || "/payments",
+    referenceId: checkoutUuid,
+    orgRoles: ["org_admin"],
+  }).catch(() => {});
+
+  const [finalReq] = await pool.query(`${CUSTOM_PLAN_REQ_SELECT} WHERE cpr.uuid=?`, [uuid]);
+  const [planRows] = await pool.query(
+    "SELECT uuid, name, monthly_price, daily_request_quota, is_custom FROM subscription_plans WHERE id=?",
+    [approvedPlanId]
+  );
+
+  return ok(
+    res,
+    {
+      request: finalReq[0],
+      plan: planRows[0],
+      checkout_uuid: checkoutUuid,
+      payment_link: paymentLink,
+      subscription_activated: false,
+      awaiting_payment: true,
+    },
+    paymentLink
+      ? "Custom plan approved. The organization must complete payment before the plan is applied."
+      : "Custom plan approved, but the payment link could not be generated — the organization must retry payment."
+  );
 }
 
 /**
@@ -318,21 +437,26 @@ export async function confirmSelfSubscriptionRequest(req, res) {
     }
 
     const [[plan]] = await connection.query(
-      "SELECT id, name, monthly_price, billing_period FROM subscription_plans WHERE uuid=?",
+      `SELECT ${PLAN_SELECT_COLUMNS} FROM subscription_plans WHERE uuid=?`,
       [r.plan_uuid]
     );
     if (!plan) throw new ApiError(404, "Plan not found");
 
-    const [[org]] = await connection.query(
+    const [[orgExists]] = await connection.query(
       "SELECT id FROM organizations WHERE uuid=?",
       [r.organization_uuid]
     );
-    if (!org) throw new ApiError(404, "Organization not found");
+    if (!orgExists) throw new ApiError(404, "Organization not found");
 
-    const { expiry } = await activateOrgSubscription(connection, {
+    // Lock the org and let the shared transition logic decide renewal vs
+    // upgrade vs deferred downgrade, exactly as the Safepay webhook would.
+    const org = await loadOrganizationSubscriptionState(connection, orgExists.id);
+    const { expiry, action, change: appliedChange } = await activateOrgSubscription(connection, {
       organizationId: org.id,
       plan,
       now: new Date(),
+      org,
+      source: "self_subscribe_confirm",
     });
 
     await connection.query(
@@ -355,6 +479,15 @@ export async function confirmSelfSubscriptionRequest(req, res) {
 
     await connection.commit();
 
+    logSubscriptionChangeApplied({
+      orgUuid: org.uuid,
+      organizationId: org.id,
+      change: appliedChange,
+      source: "self_subscribe_confirm",
+      actor: getActorFromReq(req),
+      extra: { plan: plan.name, amount: amountReceived },
+    });
+
     const [finalReq] = await pool.query(`${SELF_SUB_SELECT} WHERE ssr.uuid=?`, [uuid]);
 
     logAudit({
@@ -362,17 +495,21 @@ export async function confirmSelfSubscriptionRequest(req, res) {
       action: "self_subscription.confirm",
       entityType: "self_subscription_request",
       entityId: uuid,
-      details: { organization_id: org.id, plan: plan.name, amount: amountReceived },
+      details: { organization_id: org.id, plan: plan.name, amount: amountReceived, transition: action },
       req,
     });
 
+    // "Scheduled" now covers a same-plan renewal as well as a downgrade: one
+    // mechanism, so the wording is chosen from `relation`.
+    const isScheduled = action === "change_scheduled";
     createNotificationForOrgUsers({
       orgId: org.id,
-      type: "self_subscription_confirmed",
-      title: "Subscription activated",
-      message: `Your subscription to ${plan.name} is now active (expires ${expiry.toISOString().slice(0, 10)}).`,
+      type: isScheduled ? "subscription_plan_change_scheduled" : "self_subscription_confirmed",
+      title: isScheduled ? "Plan change scheduled" : "Subscription activated",
+      message: isScheduled
+        ? `Your plan will change to ${plan.name} on ${expiry.toISOString().slice(0, 10)}, when your current plan ends.`
+        : `Your subscription to ${plan.name} is now active (expires ${expiry.toISOString().slice(0, 10)}).`,
       link: "/payments",
-      referenceId: uuid,
       orgRoles: ["org_admin"],
     }).catch(() => {});
 
@@ -417,14 +554,16 @@ export async function cancelSelfSubscriptionRequest(req, res) {
       [req.admin?.uuid ?? null, uuid]
     );
 
-    // Only revert the org if it is still awaiting payment for this request.
-    await connection.query(
-      `UPDATE organizations
-       SET subscription_status='none', subscription_start=NULL, subscription_expiry=NULL,
-           subscription_plan_id=NULL, reminder_2d_sent='no', reminder_2h_sent='no'
-       WHERE uuid=? AND subscription_status='pending_payment'`,
+    // Only revert the org if it is still awaiting payment for this request. A
+    // reverted org goes back onto the real Free plan rather than into a
+    // NULL / 'none' limbo, so it is never planless.
+    const [[pendingOrg]] = await connection.query(
+      "SELECT id FROM organizations WHERE uuid=? AND subscription_status='pending_payment' FOR UPDATE",
       [r.organization_uuid]
     );
+    if (pendingOrg) {
+      await assignFreePlanToOrg(connection, pendingOrg.id);
+    }
 
     await connection.commit();
 

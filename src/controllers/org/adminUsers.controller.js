@@ -9,6 +9,7 @@ import { sendInviteEmail } from "../../utils/mailer.js";
 import { firstFrontendUrl } from "../../utils/frontendUrl.js";
 import { logAudit, getActorFromReq } from "../../utils/auditLog.js";
 import { normalizedFeatureAccess } from "../../utils/permissions.js";
+import { assertIdentityAvailable, rethrowIdentityDuplicate } from "../../utils/identityUniqueness.js";
 
 /**
  * Sub-admins are organization users with org_role='sub_admin'. They are
@@ -19,9 +20,16 @@ import { normalizedFeatureAccess } from "../../utils/permissions.js";
  * requireRole("org_admin"), so only the primary org-admin can manage sub-admins.
  */
 
-const ADMIN_USER_SELECT = `SELECT id, uuid, full_name, email, phone, cnic, status,
-        org_role, feature_access, created_at
- FROM users`;
+// `is_verified` and `invitation_pending` are what let the client tell a pending
+// invite (Cancel / Remove available) from an accepted account (only the
+// active/inactive toggle). They mirror the platform /admin/users list so both
+// screens make the same distinction with the same fields.
+const ADMIN_USER_SELECT = `SELECT u.id, u.uuid, u.full_name, u.email, u.phone, u.cnic, u.status,
+        u.org_role, u.feature_access, u.is_verified, u.created_at,
+        EXISTS (
+          SELECT 1 FROM invite_tokens it WHERE it.user_uuid = u.uuid AND it.used_at IS NULL
+        ) AS invitation_pending
+ FROM users u`;
 
 export async function listAdminUsers(req, res) {
   const { page, limit, offset } = parsePagination(req.query);
@@ -73,6 +81,11 @@ export async function createAdminUser(req, res) {
   );
   if (dupeCnic.length) throw new ApiError(409, "A platform user with this CNIC already exists");
 
+  // A phone number identifies the person across the whole platform, not within
+  // one organization, so inviting a colleague who is already a user elsewhere is
+  // refused here rather than silently creating a second identity.
+  await assertIdentityAvailable({ phone, cnic: normalizedCnic, executor: pool });
+
   const dummyHash = await hashPassword(crypto.randomBytes(16).toString("hex"));
   const rawToken = crypto.randomBytes(32).toString("hex");
 
@@ -110,7 +123,7 @@ export async function createAdminUser(req, res) {
     await conn.commit();
   } catch (err) {
     await conn.rollback();
-    if (String(err.message).includes("Duplicate")) throw new ApiError(409, err.message);
+    rethrowIdentityDuplicate(err);
     throw err;
   } finally {
     conn.release();
@@ -158,7 +171,7 @@ async function loadSubAdminInScope(uuid, scopeOrgId, selfUuid) {
   assertUuid(uuid, "User UUID");
 
   const [rows] = await pool.query(
-    `SELECT id, uuid, organization, org_role, status, feature_access
+    `SELECT id, uuid, full_name, email, organization, org_role, status, feature_access, is_verified
      FROM users WHERE uuid=?`,
     [uuid]
   );
@@ -269,4 +282,120 @@ export async function revokeAdminUser(req, res) {
   });
 
   return ok(res, { user: rows[0] }, action === "deactivate" ? "Sub-admin deactivated" : "Sub-admin demoted to employee");
+}
+
+/**
+ * Cancel a pending sub-admin invitation.
+ *
+ * Mirrors the platform DELETE /admin/users/:uuid/cancel-invite, but every read
+ * and write goes through loadSubAdminInScope, so an org admin can only cancel
+ * an invite belonging to their OWN organization and only for a sub_admin. A
+ * platform admin cancelling someone is not reachable from here.
+ *
+ * "Pending" is defined by is_verified='no' — the flag flipped when the invitee
+ * sets a password. Once accepted, cancelling is meaningless and deactivating is
+ * the correct action instead, so we refuse rather than silently doing the wrong
+ * thing.
+ */
+export async function cancelAdminUserInvite(req, res) {
+  const { uuid } = req.params;
+  const target = await loadSubAdminInScope(uuid, req.scopeOrgId, req.user.uuid);
+
+  if (target.is_verified === "yes") {
+    throw new ApiError(
+      400,
+      "Cannot cancel — this sub-admin has already accepted their invitation. Use deactivate instead."
+    );
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    // Delete EVERY invite token for this user, not just the unused ones. A
+    // previous "resend" marks the old token used, and leaving it behind would
+    // block a later resend after this cancel.
+    await conn.query("DELETE FROM invite_tokens WHERE user_uuid=?", [target.uuid]);
+    await conn.query(
+      "UPDATE users SET status='inactive' WHERE uuid=? AND is_verified='no'",
+      [target.uuid]
+    );
+    await conn.commit();
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+
+  logAudit({
+    ...getActorFromReq(req),
+    action: "subadmin.invite_cancelled",
+    entityType: "user",
+    entityId: target.uuid,
+    details: { email: target.email, full_name: target.full_name },
+    req,
+  });
+
+  return ok(res, {}, "Invitation cancelled. Sub-admin marked inactive.");
+}
+
+/**
+ * Permanently delete a sub-admin who never accepted their invitation.
+ *
+ * Same shape as the platform removeUserPermanently, with the org scope check
+ * added. Refuses once accepted: an accepted account carries real history
+ * (sessions, decisions, documents) and deactivating it is the safe action.
+ */
+export async function removeAdminUserPermanently(req, res) {
+  const { uuid } = req.params;
+  const target = await loadSubAdminInScope(uuid, req.scopeOrgId, req.user.uuid);
+
+  if (target.is_verified === "yes") {
+    throw new ApiError(
+      400,
+      "Cannot permanently remove a sub-admin who has already accepted their invitation."
+    );
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    await conn.query("DELETE FROM invite_tokens WHERE user_uuid=?", [target.uuid]);
+    // employees.linked_user_uuid is a foreign key to users; unlink first or the
+    // DELETE below fails on the constraint.
+    await conn.query(
+      "UPDATE employees SET linked_user_uuid=NULL, is_platform_user='no' WHERE linked_user_uuid=?",
+      [target.uuid]
+    );
+    const [del] = await conn.query(
+      "DELETE FROM users WHERE uuid=? AND is_verified='no'",
+      [target.uuid]
+    );
+    if (del.affectedRows === 0) {
+      // Thrown, not rolled back here: the catch below owns the single rollback
+      // for every failure path. (The platform version rolls back and then rolls
+      // back again in its catch; one rollback is enough.)
+      throw new ApiError(
+        409,
+        "Sub-admin could not be removed. The record may have changed concurrently."
+      );
+    }
+    await conn.commit();
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+
+  logAudit({
+    ...getActorFromReq(req),
+    action: "subadmin.removed_permanently",
+    entityType: "user",
+    entityId: target.uuid,
+    details: { email: target.email, full_name: target.full_name },
+    req,
+  });
+
+  return ok(res, {}, "Sub-admin permanently removed");
 }

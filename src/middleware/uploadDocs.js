@@ -17,7 +17,7 @@ const storage = multer.diskStorage({
 function fileFilter(req, file, cb) {
   const ok = isDocumentAllowed(file.originalname, file.mimetype);
   if (ok) return cb(null, true);
-  const err = new Error("Unsupported file type. Allowed: PDF, images, Word, Excel, TXT, CSV, ZIP");
+  const err = new Error("Unsupported file type. Allowed: PDF, images, Word (DOC/DOCX) or TXT");
   err.statusCode = 400;
   cb(err);
 }
@@ -29,6 +29,25 @@ function fileFilter(req, file, cb) {
  * application/pdf, and accepting on mime alone lets x.html through as
  * application/pdf. Generic browser blob markers (application/octet-stream)
  * are tolerated only for allow-listed extensions.
+ *
+ * Archives and spreadsheets are deliberately NOT accepted, even though they are
+ * real document formats a user might reasonably try to upload:
+ *
+ *   - A .docx IS a zip (OOXML is a zip container). So does that make .zip safe?
+ *     No, and this is the subtle part. .docx is allowed *because of* the
+ *     extension, and the Python validator then PROVES the container really is a
+ *     Word document by requiring `[Content_Types].xml` and a `word/` entry
+ *     inside the archive. A bare .zip has no such content, so allowing the
+ *     extension would let through an arbitrary archive that can hold anything at
+ *     all. The allow-list must name the document type, not the container.
+ *   - .xlsx/.xls were accepted but Excel is not a supported document type here.
+ *   - .csv is sniffed as plain text and accepted on magic alone, so it arrived
+ *     with no parsing guarantee at all.
+ *
+ * The AND-check is what makes this robust against spoofing: an attacker who
+ * labels a zip "application/pdf" still fails the extension check, and one who
+ * names it "report.docx" is caught later by the OOXML part check. Neither half
+ * is load-bearing on its own.
  */
 export function isDocumentAllowed(filename, mimetype) {
   const allowedMime = [
@@ -36,14 +55,11 @@ export function isDocumentAllowed(filename, mimetype) {
     "image/jpeg", "image/png", "image/webp", "image/gif", "image/bmp",
     "application/msword",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    "application/vnd.ms-excel",
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    "text/plain", "text/csv",
-    "application/zip",
+    "text/plain",
   ];
   const allowedExt = [
     ".pdf", ".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp",
-    ".doc", ".docx", ".xls", ".xlsx", ".txt", ".csv", ".zip",
+    ".doc", ".docx", ".txt",
   ];
   const ext = path.extname(filename || "").toLowerCase();
   return allowedExt.includes(ext) && Boolean(mimetype) &&

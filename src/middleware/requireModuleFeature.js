@@ -1,20 +1,46 @@
-import ApiError from "../utils/ApiError.js";
+import ApiError, { ERROR_CODES } from "../utils/ApiError.js";
 import { pool } from "../config/db.js";
 import requireActiveSubscription from "./requireActiveSubscription.js";
+import { MODULE_FEATURE_KEYS, parseModuleFlags, isModuleIncluded } from "../utils/moduleFlags.js";
 
-export const MODULE_FEATURE_KEYS = [
-  "employee_management",
-  "attendance_management",
-  "user_management",
-  "leave_management",
-  "payroll_management",
-];
+// Re-exported so existing importers keep working; the canonical definition now
+// lives in utils/moduleFlags.js alongside parseModuleFlags().
+export { MODULE_FEATURE_KEYS };
 
 export const FEATURE_NOT_INCLUDED_MESSAGE =
-  "This feature is not included in your current plan. Contact your admin to upgrade.";
+  "This feature is not included in your current plan. Upgrade your plan to unlock it.";
 
 export const NO_ACTIVE_SUBSCRIPTION_MESSAGE =
   "Your organization does not have an active subscription. Please subscribe to use these modules.";
+
+/** Human labels used in the UPGRADE_REQUIRED response, keyed by module. */
+const MODULE_LABELS = {
+  employee_management: "Employee Management",
+  attendance_management: "Attendance Management",
+  user_management: "User Management",
+  leave_management: "Leave Management",
+  payroll_management: "Payroll Management",
+};
+
+/**
+ * Build the distinctive "your plan doesn't include this module" error.
+ *
+ * The `code` and `module` fields are the whole point: without them this is the
+ * same generic 403 as a dead subscription, and the frontend renders the same
+ * blanket "your subscription is not active" banner for an organization that in
+ * fact has a perfectly valid plan.
+ */
+export function upgradeRequiredError(moduleKey) {
+  const label = MODULE_LABELS[moduleKey] || moduleKey;
+  return new ApiError(403, `Upgrade your plan to access ${label}.`, {
+    code: ERROR_CODES.UPGRADE_REQUIRED,
+    module: moduleKey,
+    module_label: label,
+    // Tells the client it is safe to render an "upgrade" call to action, and
+    // that retrying the request will never help.
+    can_retry: false,
+  });
+}
 
 /**
  * Freshly read (never cached) the org's CURRENT plan and its flags.
@@ -38,28 +64,26 @@ export async function resolveOrgPlanFlags(orgId) {
   }
   let flags = row.module_flags;
   if (flags == null) return { active: true, flags: null };
-  if (typeof flags === "string") {
-    try {
-      flags = JSON.parse(flags);
-    } catch {
-      flags = {};
-    }
-  }
-  return { active: true, flags };
+  return { active: true, flags: parseModuleFlags(flags) };
 }
 
 /**
  * Programmatic gate (usable inside controllers, not only as route middleware).
  * Throws the same 403s the middleware returns:
- *   - no active subscription  → standard "subscription not active" message
- *   - plan flag false         → "not included in your current plan"
+ *   - no active subscription  -> SUBSCRIPTION_INACTIVE
+ *   - plan flag false         -> UPGRADE_REQUIRED (with `module`)
  * Silently passes for legacy plans with no module_flags.
  */
 export async function assertModuleFeature(moduleKey, orgId) {
   const { active, flags } = await resolveOrgPlanFlags(orgId);
-  if (!active) throw new ApiError(403, NO_ACTIVE_SUBSCRIPTION_MESSAGE);
+
+  if (!active) {
+    throw new ApiError(403, NO_ACTIVE_SUBSCRIPTION_MESSAGE, {
+      code: ERROR_CODES.SUBSCRIPTION_INACTIVE,
+    });
+  }
   if (flags == null) return;
-  if (flags[moduleKey] !== true) throw new ApiError(403, FEATURE_NOT_INCLUDED_MESSAGE);
+  if (!isModuleIncluded(flags, moduleKey)) throw upgradeRequiredError(moduleKey);
 }
 
 /**
@@ -103,8 +127,10 @@ export default function requireModuleFeature(moduleKey) {
       // Legacy plans without module_flags: nothing is restricted.
       if (flags == null) return next();
 
-      if (flags[moduleKey] !== true) {
-        throw new ApiError(403, FEATURE_NOT_INCLUDED_MESSAGE);
+      if (!isModuleIncluded(flags, moduleKey)) {
+        // Distinct from an inactive subscription on purpose: the org IS
+        // subscribed, this plan just does not include this module.
+        throw upgradeRequiredError(moduleKey);
       }
 
       next();

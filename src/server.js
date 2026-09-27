@@ -3,6 +3,7 @@ dotenv.config();
 import app from "./app.js";
 import { pool } from "./config/db.js";
 import { checkAndSendExpiryReminders } from "./controllers/admin/organizations.controller.js";
+import { applyDueSubscriptionChanges } from "./services/subscriptionLifecycle.service.js";
 
 const PORT = process.env.PORT || 5000;
 
@@ -33,8 +34,21 @@ const webhookSecret = String(process.env.PAYMENT_GATEWAY_WEBHOOK_SECRET || "").t
 
     app.listen(PORT, () => console.log(`✅ Server running on http://localhost:${PORT}`));
 
-    checkAndSendExpiryReminders().catch(() => {});
-    setInterval(() => checkAndSendExpiryReminders().catch(() => {}), 60 * 60 * 1000);
+    // ONE periodic subscription-maintenance timer. It runs both halves of
+    // subscription lifecycle upkeep so a second, competing interval is never
+    // introduced:
+    //   1. expiry reminders for subscriptions about to lapse
+    //   2. resolving the end of a paid period -- applying a scheduled plan
+    //      change, or falling back to the Free plan when nothing was scheduled
+    // The two are independent (one is best-effort notification, the other is a
+    // state change) so a failure in one must not stop the other.
+    const runSubscriptionMaintenance = async () => {
+      await checkAndSendExpiryReminders().catch(() => {});
+      await applyDueSubscriptionChanges().catch(() => {});
+    };
+
+    runSubscriptionMaintenance().catch(() => {});
+    setInterval(() => runSubscriptionMaintenance().catch(() => {}), 60 * 60 * 1000);
   } catch (e) {
     console.error("❌ DB connection failed:", e.message);
     process.exit(1);

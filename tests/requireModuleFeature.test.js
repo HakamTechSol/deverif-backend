@@ -78,7 +78,7 @@ describe("requireModuleFeature", () => {
     expect(next.mock.calls[0][0]).toBeUndefined();
   });
 
-  it("403s with the exact upgrade message when the flag is false", async () => {
+  it("403s with the distinct UPGRADE_REQUIRED code when the flag is false", async () => {
     orgRow.module_flags = JSON.stringify({
       employee_management: true,
       attendance_management: true,
@@ -90,9 +90,15 @@ describe("requireModuleFeature", () => {
     await requireModuleFeature("payroll_management")(reqWith(), {}, next);
     const err = next.mock.calls[0][0];
     expect(err.statusCode).toBe(403);
-    expect(err.message).toBe(
-      "This feature is not included in your current plan. Contact your admin to upgrade."
-    );
+    // The message names the module so the user knows WHAT to upgrade for, and
+    // the code lets the frontend tell this apart from a dead subscription.
+    expect(err.message).toBe("Upgrade your plan to access Payroll Management.");
+    expect(err.code).toBe("UPGRADE_REQUIRED");
+    expect(err.extra).toMatchObject({
+      module: "payroll_management",
+      module_label: "Payroll Management",
+      can_retry: false,
+    });
   });
 
   it("allows legacy plans with NULL module_flags (nothing locked out)", async () => {
@@ -121,6 +127,10 @@ describe("requireModuleFeature reuses the existing subscription lock when NO act
     expect(err.message).toBe(
       "Your organization does not have an active subscription. Please subscribe to use these modules."
     );
+    // A dead subscription is a DIFFERENT failure from "your plan does not
+    // include this module", and the client has to be able to tell them apart.
+    expect(err.code).toBe("SUBSCRIPTION_INACTIVE");
+    expect(err.extra).toBeUndefined();
   });
 
   it("stays read-only for GET like the existing lock (next through)", async () => {
@@ -136,17 +146,25 @@ describe("assertModuleFeature (programmatic helper)", () => {
   it("throws 403 with the subscription message when no active subscription", async () => {
     orgRow = { subscription_status: "expired", module_flags: FULL_TRUES };
     await expect(assertModuleFeature("employee_management", 7)).rejects.toThrow(
-      expect.objectContaining({ statusCode: 403, message: NO_ACTIVE_SUBSCRIPTION_MESSAGE })
+      expect.objectContaining({
+        statusCode: 403,
+        message: NO_ACTIVE_SUBSCRIPTION_MESSAGE,
+        code: "SUBSCRIPTION_INACTIVE",
+      })
     );
   });
 
-  it("throws 403 with the upgrade message when the flag is false", async () => {
+  it("throws 403 with the distinct upgrade error when the flag is false", async () => {
     orgRow = {
       subscription_status: "active",
       module_flags: JSON.stringify({ attendance_management: false }),
     };
     await expect(assertModuleFeature("attendance_management", 7)).rejects.toThrow(
-      expect.objectContaining({ statusCode: 403, message: FEATURE_NOT_INCLUDED_MESSAGE })
+      expect.objectContaining({
+        statusCode: 403,
+        code: "UPGRADE_REQUIRED",
+        extra: expect.objectContaining({ module: "attendance_management" }),
+      })
     );
   });
 

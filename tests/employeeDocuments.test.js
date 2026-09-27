@@ -68,7 +68,10 @@ function mockRes() {
 
 describe("uploadEmployeeDocuments — corrupt-file guard (document service up/down)", () => {
   it("rejects a definitively corrupt upload with 400 and does not insert", async () => {
-    validate.mockResolvedValue({ success: true, data: { valid: false, reason: "Corrupt PDF" } });
+    validate.mockResolvedValue({
+      success: true,
+      data: { valid: false, check_type: "structural", reason: "Corrupt PDF" },
+    });
     pool.query.mockResolvedValue([[{ uuid: EMP_UUID }]]);
 
     const req = makeReq({
@@ -78,7 +81,66 @@ describe("uploadEmployeeDocuments — corrupt-file guard (document service up/do
 
     await expect(uploadEmployeeDocuments(req, res)).rejects.toMatchObject({
       statusCode: 400,
-      message: "File is corrupt or invalid",
+      // The service's own reason is surfaced rather than a generic string, so the
+      // uploader learns WHY the file was rejected.
+      message: "Corrupt PDF",
+    });
+
+    const insertCall = pool.query.mock.calls.find(([sql]) =>
+      typeof sql === "string" && sql.includes("INSERT INTO employee_documents")
+    );
+    expect(insertCall).toBeUndefined();
+  });
+
+  it("treats a heuristic quality flag as fatal here, unlike a request submission", async () => {
+    // Reference documents are the yardstick the 100% auto-verification match
+    // compares submissions against. A reference scan missing part of its own
+    // content would corrupt every later match, so the flag-rather-than-block
+    // default used for requests must NOT apply on this path.
+    validate.mockResolvedValue({
+      success: true,
+      data: {
+        valid: false,
+        check_type: "heuristic",
+        cropped: true,
+        reason: "Content runs off the left edge of the scan — the document looks cropped",
+      },
+    });
+    pool.query.mockResolvedValue([[{ uuid: EMP_UUID }]]);
+
+    const req = makeReq({
+      files: [{ filename: "cropped.pdf", originalname: "cropped.pdf", mimetype: "application/pdf", size: 12 }],
+    });
+    const res = mockRes();
+
+    await expect(uploadEmployeeDocuments(req, res)).rejects.toMatchObject({ statusCode: 400 });
+
+    const insertCall = pool.query.mock.calls.find(([sql]) =>
+      typeof sql === "string" && sql.includes("INSERT INTO employee_documents")
+    );
+    expect(insertCall).toBeUndefined();
+  });
+
+  it("hard-blocks a MIME-spoofed reference document", async () => {
+    validate.mockResolvedValue({
+      success: true,
+      data: {
+        valid: false,
+        check_type: "structural",
+        file_type: "text",
+        reason: "File type mismatch: declared content type 'application/pdf' but content is TEXT",
+      },
+    });
+    pool.query.mockResolvedValue([[{ uuid: EMP_UUID }]]);
+
+    const req = makeReq({
+      files: [{ filename: "spoof.pdf", originalname: "spoof.pdf", mimetype: "application/pdf", size: 12 }],
+    });
+    const res = mockRes();
+
+    await expect(uploadEmployeeDocuments(req, res)).rejects.toMatchObject({
+      statusCode: 400,
+      message: expect.stringContaining("mismatch"),
     });
 
     const insertCall = pool.query.mock.calls.find(([sql]) =>
