@@ -37,6 +37,9 @@ import orgSubscriptionRoutes from "./orgSubscription.routes.js";
 import paymentWebhookRoutes from "./paymentWebhook.routes.js";
 import adminSubscription from "./admin/subscription.routes.js";
 import adminPlans from "./admin/plans.routes.js";
+import adminDocumentTypes from "./admin/documentTypes.routes.js";
+import adminDatabaseBackup from "./admin/databaseBackup.routes.js";
+import documentTypes from "./documentTypes.routes.js";
 import marketingRoutes from "./marketing.routes.js";
 
 import asyncHandler from "../utils/asyncHandler.js";
@@ -78,6 +81,7 @@ router.use("/users", userRoutes);
 router.use("/verification-requests", verificationRoutes);
 // Authenticated document downloads (ownership-checked; replaces the old public /uploads static mount).
 router.use("/documents", documentsRoutes);
+router.use("/document-types", documentTypes);
 router.use("/payment", paymentRoutes);
 router.use("/notifications", notificationRoutes);
 router.use("/leaves", leavesRoutes);
@@ -98,6 +102,8 @@ router.use("/admin/audit-logs", adminAuditLog);
 router.use("/admin/support-tickets", adminSupport);
 router.use("/admin/subscription", adminSubscription);
 router.use("/admin/plans", adminPlans);
+router.use("/admin/document-types", adminDocumentTypes);
+router.use("/admin/database", adminDatabaseBackup);
 
 // Org-internal modules (employees, leave, attendance, payroll/salary) are 100%
 // Org-Admin-scoped. The System Admin must have NO access â€” not even view-only.

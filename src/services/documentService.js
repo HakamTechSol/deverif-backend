@@ -152,3 +152,98 @@ export function match(pathA, pathB, { documentTypeA, documentTypeB, fieldsB } = 
   if (fieldsB) textFields.file_b_fields = JSON.stringify({ fields: fieldsB });
   return request("/match", files, textFields);
 }
+
+/**
+ * JSON counterpart of `request` for the endpoints that carry no file.
+ *
+ * Same failure contract as `request`: transport problems become a
+ * DocumentServiceError carrying its `kind`, never a fake success. Callers that
+ * can safely continue without the service (the catalogue sync) check `kind`.
+ */
+async function requestJson(endpoint, { method = "GET", body = null } = {}) {
+  const serviceKey = apiKey();
+  if (!serviceKey) {
+    throw new DocumentServiceError(
+      503,
+      "Document service is not configured (DOC_SERVICE_API_KEY is missing from the backend .env)"
+    );
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+
+  let response;
+  try {
+    response = await fetch(`${baseUrl()}${endpoint}`, {
+      method,
+      headers: {
+        "X-API-Key": serviceKey,
+        ...(body ? { "Content-Type": "application/json" } : {}),
+      },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (error.name === "AbortError") {
+      throw new DocumentServiceError(
+        503,
+        `Document service timed out after ${TIMEOUT_MS}ms (${endpoint})`,
+        { kind: "timeout", cause: error }
+      );
+    }
+    throw new DocumentServiceError(
+      502,
+      `Document service unreachable at ${baseUrl()}${endpoint}: ${error.message}`,
+      { kind: "connection", cause: error }
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+
+  const text = await response.text();
+  let payload = null;
+  try {
+    payload = text ? JSON.parse(text) : null;
+  } catch {
+    payload = null;
+  }
+
+  if (!response.ok) {
+    throw new DocumentServiceError(
+      response.status,
+      payload?.detail || payload?.message || `Document service returned HTTP ${response.status}`,
+      { kind: "http" }
+    );
+  }
+  if (!payload || payload.success !== true || payload.data === undefined) {
+    throw new DocumentServiceError(
+      502,
+      `Document service returned an unexpected payload for ${endpoint}`
+    );
+  }
+  return { success: true, data: payload.data };
+}
+
+/**
+ * The canonical schemas this service build can extract.
+ * UseResult: data.schemas (key -> {fields, required, auto_match_eligible}),
+ * data.generic, data.auto_match_ineligible, data.catalogue_count.
+ *
+ * The admin UI uses this to populate its schema picker, so a document type can
+ * only be pointed at a schema that will actually resolve.
+ */
+export function describeSchemas() {
+  return requestJson("/schemas", { method: "GET" });
+}
+
+/**
+ * Replace the document service's label -> schema catalogue.
+ * UseResult: data.stored, data.rejected_count, data.rejected[].
+ *
+ * Replaces rather than merges, so a type deleted in the database stops
+ * resolving. See app/core/document_schemas.py for why the catalogue is pushed
+ * rather than read from the database directly.
+ */
+export function syncSchemas(types) {
+  return requestJson("/schemas", { method: "PUT", body: { types } });
+}

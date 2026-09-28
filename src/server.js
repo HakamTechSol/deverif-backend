@@ -4,6 +4,7 @@ import app from "./app.js";
 import { pool } from "./config/db.js";
 import { checkAndSendExpiryReminders } from "./controllers/admin/organizations.controller.js";
 import { applyDueSubscriptionChanges } from "./services/subscriptionLifecycle.service.js";
+import { syncDocumentTypesOnBoot } from "./services/documentTypeSync.js";
 import { assertVerifyBaseUrlConfigured } from "./utils/qrCertificate.js";
 
 const PORT = process.env.PORT || 5000;
@@ -49,6 +50,13 @@ try {
     }
 
     app.listen(PORT, () => console.log(`✅ Server running on http://localhost:${PORT}`));
+
+    // Push the document-type catalogue to the Python document service so a type
+    // added from the admin UI resolves to a real extraction schema there. The
+    // service is a separate process that may still be starting, so this retries
+    // in the background and never blocks or fails startup — see
+    // services/documentTypeSync.js for the failure policy.
+    syncDocumentTypesOnBoot();
 
     // ONE periodic subscription-maintenance timer. It runs both halves of
     // subscription lifecycle upkeep so a second, competing interval is never

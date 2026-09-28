@@ -27,7 +27,13 @@ vi.mock("../src/config/db.js", () => ({
 }));
 vi.mock("../src/services/documentService.js", async (importOriginal) => {
   const original = await importOriginal();
-  return { ...original, validate: vi.fn() };
+  // ocrExtract is mocked because the creation-time auto-verify path now runs the
+  // form-vs-document cross-check (it used to skip it, passing null straight to
+  // recordPersonDocument). Left unmocked it would attempt a real HTTP call to the
+  // Python service, making this suite depend on whether that service happens to
+  // be running. The cross-check's own output is asserted in
+  // tests/autoVerifyIdentityBinding.test.js.
+  return { ...original, validate: vi.fn(), ocrExtract: vi.fn() };
 });
 vi.mock("../src/utils/qrCertificate.js", () => ({
   generateQrForRequest: vi.fn().mockResolvedValue(undefined),
@@ -37,7 +43,7 @@ vi.mock("../src/utils/qrCertificate.js", () => ({
 }));
 
 import { pool } from "../src/config/db.js";
-import { validate } from "../src/services/documentService.js";
+import { validate, ocrExtract } from "../src/services/documentService.js";
 import { generateQrForRequest } from "../src/utils/qrCertificate.js";
 import { createRequest } from "../src/controllers/verification.controller.js";
 import { DOCS_DIR } from "../src/config/uploadPaths.js";
@@ -131,6 +137,9 @@ beforeEach(() => {
   knownPerson = null;
   priorPersonDoc = null;
   validate.mockResolvedValue({ success: true, data: { valid: true } });
+  // OCR finds nothing readable in this suite's dummy file, which resolves the
+  // cross-check to 'not_checked' with a logged reason — the fail-safe branch.
+  ocrExtract.mockResolvedValue({ success: true, data: { document_type: null, fields: {} } });
   pool.query.mockImplementation(sqlRouter);
 });
 
@@ -339,7 +348,16 @@ describe("createRequest — required document owner fields", () => {
   });
 });
 
-describe("createRequest — exact-hash auto-verification (existing fast path unchanged)", () => {
+describe("createRequest — exact-hash auto-verification (same document, same person, same org)", () => {
+  // The fast path's scope NARROWED when the document-replay bug was fixed: the
+  // prior-approval lookup now also requires the person to match, so a document
+  // an org already verified for one CNIC can no longer be auto-verified for
+  // another. The identity binding itself is pinned in
+  // tests/autoVerifyIdentityBinding.test.js; these cases keep proving the
+  // surviving behaviour — a genuine repeat by the same person still auto-verifies,
+  // and the legacy organization_conserned_for_future flag stays out of it.
+  // (This pool answers the prior-verified read unconditionally, which is
+  // equivalent to "the person matches" — every use below is that case.)
   it("auto-verifies when the same SHA-256 hash was already verified by the issuing org", async () => {
     // 1st query resolves the org UUID; 2nd query returns a previously-verified
     // row with the matching document_hash -> autoVerify=true, no OCR involved.

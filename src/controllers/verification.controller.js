@@ -250,16 +250,33 @@ export async function createRequest(req, res) {
     unmatchedOrgId = await resolveUnmatchedOrg(otherOrgName, otherEmail, otherPhone, otherWebsite);
   }
 
-  // Repeat submission of a document this organization has already verified.
+  // Repeat submission of a document this organization has already verified
+  // FOR THE SAME PERSON.
   //
-  // Keyed purely on the SHA-256 of the uploaded file plus the same issuing org
-  // and a prior 'verified' outcome. Identical hash means byte-for-byte the same
-  // file the org already signed off on, so there is nothing left to re-check and
-  // the re-verification is safe: the document is the exact artifact previously
-  // approved. A different scan of the same document has a different hash and
-  // falls through to the normal reference-match flow instead.
+  // Keyed on the SHA-256 of the uploaded file, the same issuing org, a prior
+  // 'verified' outcome, AND that prior verification belonging to the same
+  // identity. Identical hash means byte-for-byte the same file the org already
+  // signed off on, so there is nothing left to re-check about the ARTIFACT. A
+  // different scan of the same document has a different hash and falls through
+  // to the normal reference-match flow instead.
   //
-  // This used to additionally require organization_conserned_for_future='yes',
+  // The identity clause is load-bearing, not an extra filter. A document hash
+  // identifies a FILE, never a person: without `p.cnic_hash = ?` this path
+  // granted any person the ability to present a document somebody else had
+  // already had approved and be auto-verified on the spot, with no human review
+  // and no OCR. That is a document-replay / identity-spoofing hole, and because
+  // the row is born 'verified' it also mints a publicly signed QR certificate
+  // for a document the submitter never held. The org's prior approval of a
+  // document is a statement about WHO presented it, so it can only be inherited
+  // by the same identity.
+  //
+  // The join is an INNER join on `persons` via `linked_person_id`, which means a
+  // legacy 'verified' row with no linked person (or with a person that no longer
+  // exists) can never confer credit. That is deliberate and fail-closed: such a
+  // row proves only that the org approved some document once, and carries no
+  // identity to compare against, so the repeat submission must go to a human.
+  //
+  // This previously required `organization_conserned_for_future='yes'` as well,
   // but that column was only ever written on an auto-verified insert — never on
   // the ordinary approve paths — so the condition could never become true and
   // the whole path was dead. Matching on the verified outcome itself is both
@@ -267,14 +284,16 @@ export async function createRequest(req, res) {
   let autoVerify = false;
   if (orgId) {
     const [previousVerified] = await pool.query(
-      `SELECT id
-       FROM verification_requests
-       WHERE document_hash=?
-         AND issuing_organization_id=?
-         AND status='verified'
-       ORDER BY verified_at DESC, id DESC
+      `SELECT vr.id
+       FROM verification_requests vr
+       JOIN persons p ON p.id = vr.linked_person_id
+       WHERE vr.document_hash=?
+         AND vr.issuing_organization_id=?
+         AND vr.status='verified'
+         AND p.cnic_hash=?
+       ORDER BY vr.verified_at DESC, vr.id DESC
        LIMIT 1`,
-      [documentHash, orgId]
+      [documentHash, orgId, documentOwnerCnicHash]
     );
     autoVerify = previousVerified.length > 0;
   }
@@ -437,10 +456,26 @@ export async function createRequest(req, res) {
   // Ledger completeness: a creation-time auto-verification is a successful
   // verification and must leave a person_documents row exactly like every
   // portal / auto-match / admin approval does. The anchoring issuing org is
-  // the verifying organization; no identity cross-check runs at this point,
-  // so match_status keeps its 'not_checked' DEFAULT.
+  // the verifying organization.
+  //
+  // The form-vs-document cross-check runs here too, exactly as it does on the
+  // manual approve path and inside autoApprove(). It used to be skipped on this
+  // one path (`null` was passed through), which left every creation-time
+  // auto-verification with match_status stuck on its 'not_checked' DEFAULT — so
+  // the identity ledger recorded a "verified" outcome while holding no evidence
+  // of which document or person it had actually verified. That is exactly the
+  // row a reviewer would consult to spot a replayed document, so leaving it
+  // empty was the wrong default. buildDocumentCrossCheck() never throws and
+  // falls back to 'not_checked' with a logged reason on any OCR/service failure,
+  // so this cannot fail a request that has already been created.
+  //
+  // Cost note: this adds one OCR pass to the auto-verify path. That is the same
+  // work the other two approval paths already do, and the identity is now
+  // bound by the cnic_hash clause above, so the marginal latency is bought for
+  // a complete audit trail rather than for the decision itself.
   if (autoVerify && linkedPersonId) {
-    await recordPersonDocument(rows[0], orgId, null);
+    const creationCrossCheck = await buildDocumentCrossCheck(rows[0]);
+    await recordPersonDocument(rows[0], orgId, creationCrossCheck);
   }
 
   // Auto-verified requests also get a public QR certificate. Capture the

@@ -133,16 +133,24 @@ export async function myAttendanceHistory(req, res) {
 
   const employeeUuid = empRows[0].uuid;
   const { page, limit, offset } = parsePagination(req.query);
+  const dateFrom = typeof req.query.dateFrom === "string" && /^\d{4}-\d{2}-\d{2}$/.test(req.query.dateFrom) ? req.query.dateFrom : "";
+  const dateTo = typeof req.query.dateTo === "string" && /^\d{4}-\d{2}-\d{2}$/.test(req.query.dateTo) ? req.query.dateTo : "";
+  const status = typeof req.query.status === "string" && ["checked_in", "checked_out"].includes(req.query.status) ? req.query.status : "";
+  const conditions = ["ar.employee_uuid=?"];
+  const params = [employeeUuid];
+  if (dateFrom) { conditions.push("ar.date >= ?"); params.push(dateFrom); }
+  if (dateTo) { conditions.push("ar.date <= ?"); params.push(dateTo); }
+  if (status) { conditions.push("ar.status = ?"); params.push(status); }
+  const whereClause = `WHERE ${conditions.join(" AND ")}`;
 
   const [[{ total }]] = await pool.query(
-    "SELECT COUNT(*) AS total FROM attendance_records WHERE employee_uuid=?",
-    [employeeUuid]
+    `SELECT COUNT(*) AS total FROM attendance_records ar ${whereClause}`,
+    params
   );
   const [rows] = await pool.query(
-    `${RECORD_SELECT}
-     WHERE ar.employee_uuid=?
+    `${RECORD_SELECT} ${whereClause}
      ORDER BY ar.date DESC, ar.check_in_at DESC LIMIT ? OFFSET ?`,
-    [employeeUuid, limit, offset]
+    [...params, limit, offset]
   );
   return ok(res, paginatedResponse(rows, total, page, limit), "Attendance records");
 }

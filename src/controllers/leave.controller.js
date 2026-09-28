@@ -223,9 +223,19 @@ export async function myLeaves(req, res) {
   );
   if (!empRows.length) return ok(res, paginatedResponse([], 0, page, limit), "My leaves");
 
+  const status = typeof req.query.status === "string" && ["pending", "approved", "rejected"].includes(req.query.status) ? req.query.status : "";
+  const dateFrom = typeof req.query.dateFrom === "string" && /^\d{4}-\d{2}-\d{2}$/.test(req.query.dateFrom) ? req.query.dateFrom : "";
+  const dateTo = typeof req.query.dateTo === "string" && /^\d{4}-\d{2}-\d{2}$/.test(req.query.dateTo) ? req.query.dateTo : "";
+  const conditions = ["lr.employee_uuid=?"];
+  const params = [empRows[0].uuid];
+  if (status) { conditions.push("lr.status=?"); params.push(status); }
+  if (dateFrom) { conditions.push("lr.start_date >= ?"); params.push(dateFrom); }
+  if (dateTo) { conditions.push("lr.start_date <= ?"); params.push(dateTo); }
+  const whereClause = `WHERE ${conditions.join(" AND ")}`;
+
   const [[{ total }]] = await pool.query(
-    "SELECT COUNT(*) AS total FROM leave_requests WHERE employee_uuid=?",
-    [empRows[0].uuid]
+    `SELECT COUNT(*) AS total FROM leave_requests lr ${whereClause}`,
+    params
   );
   const [rows] = await pool.query(
     `SELECT lr.uuid,
@@ -233,14 +243,13 @@ export async function myLeaves(req, res) {
             DATE_FORMAT(lr.end_date, '%Y-%m-%d') AS end_date,
             lr.reason, lr.status, lr.approved_by, lr.approved_at,
             lr.created_at, lr.employee_uuid, lr.leave_type_id,
-            lr.organization_id,
             lt.name AS leave_type_name
      FROM leave_requests lr
      JOIN leave_types lt ON lt.id = lr.leave_type_id
-     WHERE lr.employee_uuid=?
+     ${whereClause}
      ORDER BY lr.created_at DESC
      LIMIT ? OFFSET ?`,
-    [empRows[0].uuid, limit, offset]
+    [...params, limit, offset]
   );
   return ok(res, paginatedResponse(rows, total, page, limit), "My leaves");
 }
