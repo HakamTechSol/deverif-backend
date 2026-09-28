@@ -29,6 +29,9 @@ vi.mock("../src/services/documentService.js", async (importOriginal) => {
 });
 vi.mock("../src/utils/qrCertificate.js", () => ({
   generateQrForRequest: vi.fn().mockResolvedValue(undefined),
+  // Identity pass-through: see tests/verifyUrl.test.js for the real behaviour.
+  withVerifyUrl: (row) => row,
+  withVerifyUrls: (rows) => rows,
 }));
 vi.mock("../src/utils/auditLog.js", () => ({
   logAudit: vi.fn(),

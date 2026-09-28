@@ -10,6 +10,7 @@ import paymentRoutes from "./payment.routes.js";
 import notificationRoutes from "./notification.routes.js";
 
 import adminAuth from "./admin/auth.routes.js";
+import adminSidebar from "./admin/sidebar.routes.js";
 import adminUsers from "./admin/users.routes.js";
 import adminOrganizations from "./admin/organizations.routes.js";
 import {
@@ -50,7 +51,7 @@ const router = Router();
 
 router.use("/", dashboardRoutes);
 
-// Public marketing data (no auth) — consumed by the marketing/landing site.
+// Public marketing data (no auth) â€” consumed by the marketing/landing site.
 router.use("/marketing", marketingRoutes);
 
 // Public QR verification (no auth)
@@ -85,6 +86,7 @@ router.use("/salary-records", salarySelfRoutes);
 
 // ADMIN side
 router.use("/admin/auth", adminAuth);
+router.use("/admin", adminSidebar);
 router.use("/admin/users", adminUsers);
 router.use("/admin/organizations", adminOrganizations);
 router.use("/admin/organization-types", orgTypesRouter);
@@ -98,7 +100,7 @@ router.use("/admin/subscription", adminSubscription);
 router.use("/admin/plans", adminPlans);
 
 // Org-internal modules (employees, leave, attendance, payroll/salary) are 100%
-// Org-Admin-scoped. The System Admin must have NO access — not even view-only.
+// Org-Admin-scoped. The System Admin must have NO access â€” not even view-only.
 // Explicit 403 (instead of 404) so it's clear the block is intentional. Org
 // admins reach these through /org/* with org-scoped JWTs.
 function forbidOrgScopedModule(req, res, next) {

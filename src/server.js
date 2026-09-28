@@ -4,6 +4,7 @@ import app from "./app.js";
 import { pool } from "./config/db.js";
 import { checkAndSendExpiryReminders } from "./controllers/admin/organizations.controller.js";
 import { applyDueSubscriptionChanges } from "./services/subscriptionLifecycle.service.js";
+import { assertVerifyBaseUrlConfigured } from "./utils/qrCertificate.js";
 
 const PORT = process.env.PORT || 5000;
 
@@ -15,6 +16,21 @@ const PORT = process.env.PORT || 5000;
 const gatewayProvider = String(process.env.PAYMENT_GATEWAY_PROVIDER || "").toLowerCase();
 const gatewayMode = String(process.env.PAYMENT_GATEWAY_MODE || "").toLowerCase();
 const webhookSecret = String(process.env.PAYMENT_GATEWAY_WEBHOOK_SECRET || "").trim();
+
+// Checked before the boot sequence, and deliberately outside the try below so a
+// bad value is never reported as "DB connection failed".
+//
+// The verify base URL is the one setting whose absence still produces output
+// that looks correct -- a certificate with a plausible QR printed on it -- so
+// the failure is otherwise invisible until a member of the public scans one and
+// lands somewhere wrong. In production this is fatal; elsewhere it warns, since
+// refusing to boot a test run helps nobody.
+try {
+  assertVerifyBaseUrlConfigured();
+} catch (err) {
+  console.error("❌ " + err.message);
+  process.exit(1);
+}
 
 (async () => {
   try {

@@ -57,6 +57,18 @@ export const publicVerifyLimiter = rateLimit({
   handler: handler("Too many verification lookups. Please try again later."),
 });
 
+// The public document stream is the same class of unauthenticated, token-gated
+// endpoint as the metadata lookup above, but each hit ships a whole file, so it
+// gets roughly half the budget. A single page view costs two requests (metadata
+// + document), so this still leaves room for a verifier to reload a few times.
+export const publicVerifyDocumentLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: handler("Too many document downloads. Please try again later."),
+});
+
 // OTP verification + resend (prevents code brute-force and email bombing)
 export const otpLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,

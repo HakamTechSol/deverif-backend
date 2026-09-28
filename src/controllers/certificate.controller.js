@@ -3,6 +3,10 @@ import { pool } from "../config/db.js";
 import { assertUuid } from "../utils/publicResponse.js";
 import { qrSigningConfigured } from "../utils/qrCertificate.js";
 import { generateCertificatePdf } from "../utils/certificatePdf.js";
+import { decryptCnic } from "../utils/personCrypto.js";
+import { maskCnic } from "../utils/certificateCode.js";
+import { ORGS_DIR } from "../config/uploadPaths.js";
+import path from "node:path";
 
 /**
  * Downloads the verified-request certificate PDF.
@@ -14,12 +18,16 @@ export async function downloadCertificate(req, res) {
   assertUuid(uuid, "Request UUID");
 
   const [rows] = await pool.query(
-    `SELECT vr.*, o.name AS issuing_org_name, uo.name AS unmatched_org_name,
-            requester.full_name AS requester_name
+    `SELECT vr.uuid, vr.user_id, vr.issuing_organization_id, vr.status,
+            vr.document_type, vr.document_owner_name, vr.verified_at, vr.qr_token,
+            vr.linked_person_id, o.name AS issuing_org_name, o.logo AS issuing_org_logo,
+            uo.name AS unmatched_org_name, requester.full_name AS requester_name,
+            person.cnic_encrypted AS owner_cnic_encrypted
      FROM verification_requests vr
      LEFT JOIN organizations o ON o.id = vr.issuing_organization_id
      LEFT JOIN unmatched_organizations uo ON uo.id = vr.unmatched_org_id
      LEFT JOIN users requester ON requester.id = vr.user_id
+     LEFT JOIN persons person ON person.id = vr.linked_person_id
      WHERE vr.uuid=?`,
     [uuid]
   );
@@ -44,13 +52,24 @@ export async function downloadCertificate(req, res) {
     throw new ApiError(409, "Certificate is not available yet. Contact support.");
   }
 
+  let documentOwnerCnicMasked = null;
+  if (vr.owner_cnic_encrypted) {
+    try {
+      documentOwnerCnicMasked = maskCnic(decryptCnic(vr.owner_cnic_encrypted));
+    } catch {
+      // A certificate must never fall back to exposing an unreadable raw CNIC.
+    }
+  }
+  const certificateRequest = { ...vr, document_owner_cnic_masked: documentOwnerCnicMasked };
   const organizationName = vr.issuing_org_name || vr.unmatched_org_name || null;
+  const logoName = vr.issuing_org_logo ? path.basename(String(vr.issuing_org_logo).replace(/\\/g, "/")) : null;
+  const organizationLogoPath = logoName ? path.join(ORGS_DIR, logoName) : null;
   const pdf = await generateCertificatePdf({
-    request: vr,
+    request: certificateRequest,
     organizationName,
+    organizationLogoPath,
     requesterName: vr.requester_name,
   });
-
   const filename = `dverif-certificate-${vr.uuid.slice(0, 8)}.pdf`;
   res.setHeader("Content-Type", "application/pdf");
   res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);

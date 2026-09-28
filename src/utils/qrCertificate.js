@@ -3,39 +3,129 @@ import { pool } from "../config/db.js";
 
 const QR_SIGNING_SECRET = process.env.QR_SIGNING_SECRET || "";
 
-/**
- * Public base URL stamped into every QR code and certificate PDF.
- *
- * Read once at module load, which is safe here only because config/db.js (an
- * import of this module) runs dotenv.config() during its own evaluation, before
- * this body executes. Removing that import would silently make this fall back.
- *
- * The frontend builds the SAME url from VITE_PUBLIC_BASE_URL. They are separate
- * runtimes so they cannot share one variable, but they must be set to the same
- * value: the backend's copy lands in the downloadable PDF, the frontend's copy
- * lands in the QR shown on screen, and a customer scanning one while holding the
- * other must not be sent to two different hosts.
- *
- * The fallback is intentionally a placeholder rather than a real domain. It used
- * to be a hardcoded live hostname, which meant a deploy that simply forgot to set
- * QR_VERIFY_BASE_URL would keep working and keep printing live-domain QR codes —
- * so the mistake stayed invisible until someone scanned one.
- */
-const QR_VERIFY_BASE_URL = (process.env.QR_VERIFY_BASE_URL || "https://dverif.com").replace(/\/+$/, "");
+/** The only path segment that sits between the base and the token. */
+const VERIFY_PATH = "verify";
 
-if (!process.env.QR_VERIFY_BASE_URL) {
-  console.warn(
-    "QR_VERIFY_BASE_URL is not set — QR codes will use https://dverif.com. " +
-      "Set it to the public site URL, and keep the frontend's VITE_PUBLIC_BASE_URL identical."
-  );
+/**
+ * Resolve and validate the public base URL that every verification link is
+ * built from.
+ *
+ * This is the ONE place the base is read. Everything that produces a verify
+ * link -- the certificate PDF, the `verify_url` field on API responses, and
+ * therefore the on-screen QR, the copyable link and the "View certificate"
+ * button in the frontend -- goes through it. The frontend deliberately builds
+ * nothing: it renders `request.verify_url` verbatim, so there is no second
+ * variable to keep in step and no way for the printed certificate and the
+ * screen to disagree about which host a token points at.
+ *
+ * Read lazily on every call rather than cached at module load. Reading at
+ * import time only worked because `config/db.js` (an import of this module)
+ * happened to run `dotenv.config()` first; dropping that import would have
+ * silently fallen back to a default instead of failing. The cost is a regex.
+ *
+ * @returns {string} absolute origin + path, guaranteed free of a trailing slash
+ * @throws {Error} when the value is missing or is not an absolute http(s) URL
+ */
+export function resolveVerifyBaseUrl() {
+  const raw = process.env.QR_VERIFY_BASE_URL;
+  if (!raw || !raw.trim()) {
+    throw new Error(
+      "QR_VERIFY_BASE_URL is not set. It is the public site URL that every verification " +
+        "QR code and certificate PDF points at (e.g. https://www.dverif.com). Set it in " +
+        "backend/.env and restart.",
+    );
+  }
+
+  // Strip any trailing slash(es) so callers can always join with a single "/".
+  const trimmed = raw.trim().replace(/\/+$/, "");
+
+  let parsed;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    throw new Error(
+      `QR_VERIFY_BASE_URL is not an absolute URL: ${JSON.stringify(raw)}. ` +
+        'It must be a full http(s) origin, e.g. https://www.dverif.com (got "' + trimmed + '").',
+    );
+  }
+
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error(
+      `QR_VERIFY_BASE_URL must use http or https, got ${parsed.protocol} in ${JSON.stringify(raw)}.`,
+    );
+  }
+
+  // A query or fragment on a base URL would be silently dropped by the join
+  // below, producing a link that points somewhere other than what is
+  // configured. Reject it rather than quietly disagree with the env var.
+  if (parsed.search || parsed.hash) {
+    throw new Error(
+      `QR_VERIFY_BASE_URL must not contain a query string or fragment: ${JSON.stringify(raw)}.`,
+    );
+  }
+
+  return trimmed;
+}
+
+/**
+ * Fail fast at boot if the verify base URL is unusable.
+ *
+ * A missing value used to fall back to a live-looking default, so a deploy that
+ * forgot it kept working and kept printing live-domain QR codes -- the mistake
+ * stayed invisible until a member of the public scanned one. In production this
+ * now stops the process; outside production (tests, local tooling) it warns and
+ * continues, because refusing to boot a test run is not helpful.
+ */
+export function assertVerifyBaseUrlConfigured() {
+  try {
+    resolveVerifyBaseUrl();
+    return true;
+  } catch (err) {
+    const isProduction = process.env.NODE_ENV === "production";
+    const message = err.message;
+    if (isProduction) {
+      throw new Error(
+        "Refusing to start: " + message + "\n" +
+          "   Every certificate PDF and QR code would otherwise be printed with the wrong host.",
+      );
+    }
+    console.warn(
+      "⚠️  " + message + "\n" +
+        "   The server will start, but verification links will be wrong until this is set.",
+    );
+    return false;
+  }
+}
+
+/** The public verification link for a request's QR token. */
+export function buildVerifyUrl(qrToken) {
+  if (!qrToken) {
+    throw new Error("buildVerifyUrl requires a qrToken");
+  }
+  return `${resolveVerifyBaseUrl()}/${VERIFY_PATH}/${qrToken}`;
+}
+
+/**
+ * Attach `verify_url` to a request row that carries a QR token.
+ *
+ * Returns the row untouched when there is no token, so unverified requests do
+ * not advertise a link that cannot work. Applied on the way out of every
+ * response that returns a request, which is what lets the frontend treat
+ * `request.verify_url` as the single source for the displayed link.
+ */
+export function withVerifyUrl(row) {
+  if (!row || !row.qr_token) return row;
+  return { ...row, verify_url: buildVerifyUrl(row.qr_token) };
+}
+
+/** Map {@link withVerifyUrl} over a list of request rows. */
+export function withVerifyUrls(rows) {
+  if (!Array.isArray(rows)) return rows;
+  return rows.map((row) => withVerifyUrl(row));
 }
 
 export function qrSigningConfigured() {
   return Boolean(QR_SIGNING_SECRET);
-}
-
-export function buildVerifyUrl(qrToken) {
-  return `${QR_VERIFY_BASE_URL}/verify/${qrToken}`;
 }
 
 function toEpochMillis(value) {

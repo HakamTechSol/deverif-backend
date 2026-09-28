@@ -1,6 +1,37 @@
 import nodemailer from "nodemailer";
 import { pool } from "../config/db.js";
 
+// ─────────────────────────────────────────────────────────────
+// Brand
+// ─────────────────────────────────────────────────────────────
+const NAVY = "#1e3f8f";
+const BLUE = "#2563eb";
+const SOFT = "#eff6ff";
+const INK = "#0f172a";
+const BODY = "#475569";
+const MUTED = "#64748b";
+const BORDER = "#e2e8f0";
+
+const BADGES = {
+  success: { fg: "#15803d", bg: "#f0fdf4", bd: "#bbf7d0" },
+  warn: { fg: "#b45309", bg: "#fffbeb", bd: "#fde68a" },
+  danger: { fg: "#b91c1c", bg: "#fef2f2", bd: "#fecaca" },
+  info: { fg: NAVY, bg: SOFT, bd: "#bfdbfe" },
+};
+
+const FONT = "Arial,'Segoe UI',Tahoma,'Noto Nastaliq Urdu',sans-serif";
+
+// Logo: hosted on a public HTTPS URL (EMAIL_LOGO_URL), exactly how large
+// companies do it. It is NOT attached to the message, so Gmail/Outlook do not
+// show a "logo.png" attachment chip in the inbox. If the env var is not set
+// (e.g. local dev) a text wordmark is shown instead.
+function logoSrc() {
+  return process.env.EMAIL_LOGO_URL || null;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────
 function dumpSmtpError(label, err) {
   // TEMP-DEBUG (remove after diagnosis): full raw error incl. non-enumerable props
   const raw = {};
@@ -18,6 +49,16 @@ function toBool(value, fallback = false) {
   if (value === undefined || value === null || value === "") return fallback;
   const normalized = String(value).toLowerCase().trim();
   return normalized === "true" || normalized === "1" || normalized === "yes";
+}
+
+// Escape anything user/DB-supplied before it goes into HTML.
+function esc(v) {
+  return String(v ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 export function getMailerTransport() {
@@ -76,6 +117,9 @@ function buildMail({ to, subject, text, html }) {
   };
 }
 
+// ─────────────────────────────────────────────────────────────
+// Copy (English / Urdu)
+// ─────────────────────────────────────────────────────────────
 /**
  * Recipient-facing email copy in the recipient's preferred language.
  * Layout is shared; only the wording changes. English is the default.
@@ -90,6 +134,9 @@ function emailTexts(lang) {
     footerAuto: ur
       ? "یہ ایک خودکار پیغام ہے، براہِ کرم جواب نہ دیں۔"
       : "This is an automated message, please do not reply.",
+    linkFallback: ur
+      ? "اگر بٹن کام نہ کرے تو یہ لنک اپنے براؤزر میں کاپی کریں:"
+      : "If the button doesn't work, copy and paste this link into your browser:",
 
     // Password reset
     resetSubject: ur ? "اپنا پاس ورڈ تبدیل کریں" : "Reset Your Password",
@@ -122,8 +169,8 @@ function emailTexts(lang) {
       ? "سائن ان مکمل کرنے کے لیے نیچے دیا گیا کوڈ استعمال کریں۔ یہ کوڈ <strong>5 منٹ</strong> میں ختم ہو جائے گا۔"
       : "Use the code below to complete your sign-in. This code expires in <strong>5 minutes</strong>.",
     otpIgnore: ur
-      ? "اگر آپ نے یہ کوڈ نہیں مانگا تو اس ای میل کو نظر انداز کریں۔"
-      : "If you did not request this code, you can safely ignore this email.",
+      ? "اگر آپ نے یہ کوڈ نہیں مانگا تو اس ای میل کو نظر انداز کریں۔ یہ کوڈ کسی کے ساتھ شیئر نہ کریں۔"
+      : "If you did not request this code, you can safely ignore this email. Never share this code with anyone.",
     otpTextCode: (otp) =>
       ur ? `آپ کا Dverif لاگ ان کوڈ ہے: ${otp}` : `Your Dverif login code is: ${otp}`,
     otpTextExpiry: ur
@@ -195,9 +242,8 @@ function emailTexts(lang) {
     verifiedSubject: ur
       ? "آپ کی دستاویز کی تصدیق ہو گئی ہے"
       : "Your document has been verified",
-    verifiedHeading: ur
-      ? "دستاویز تصدیق شدہ ✅"
-      : "Document Verified ✅",
+    verifiedBadge: ur ? "تصدیق شدہ" : "Verified",
+    verifiedHeading: ur ? "دستاویز کی تصدیق ہو گئی" : "Your document has been verified",
     verifiedBody: (docType) =>
       ur
         ? `آپ کی درخواست (<strong>${docType || "دستاویز"}</strong>) کامیابی سے تصدیق کر دی گئی ہے۔ آپ اپنے پورٹل پر جا کر تصدیق شدہ ریکارڈ اور سرٹیفکیٹ دیکھ سکتے ہیں۔`
@@ -216,28 +262,104 @@ function emailTexts(lang) {
   };
 }
 
-function emailWrapper(bodyHtml, lang) {
+// ─────────────────────────────────────────────────────────────
+// Template building blocks
+// ─────────────────────────────────────────────────────────────
+const align = (lang) => (lang === "ur" ? "right" : "left");
+
+function h1(text) {
+  return `<h1 style="margin:0 0 14px;color:${INK};font-size:22px;line-height:1.4;font-weight:700;font-family:${FONT};">${text}</h1>`;
+}
+
+function p(html, { small = false, muted = false } = {}) {
+  const size = small ? "13px" : "15px";
+  const color = muted ? MUTED : BODY;
+  return `<p style="margin:0 0 16px;color:${color};font-size:${size};font-family:${FONT};">${html}</p>`;
+}
+
+function badge(text, kind = "info") {
+  const b = BADGES[kind];
+  return `<div style="margin:0 0 18px;"><span style="display:inline-block;padding:6px 14px;border-radius:999px;background-color:${b.bg};border:1px solid ${b.bd};color:${b.fg};font-size:12px;font-weight:700;letter-spacing:0.4px;font-family:${FONT};">&#9679;&nbsp; ${esc(text)}</span></div>`;
+}
+
+function button(href, label, lang, color = NAVY) {
+  return `<table role="presentation" cellpadding="0" cellspacing="0" border="0" align="${align(lang)}" style="margin:8px 0 22px;">
+    <tr><td align="center" bgcolor="${color}" style="border-radius:8px;">
+      <a href="${esc(href)}" target="_blank" rel="noopener noreferrer"
+         style="display:inline-block;padding:14px 36px;font-family:${FONT};font-size:15px;font-weight:700;color:#ffffff;text-decoration:none;border-radius:8px;">${label}</a>
+    </td></tr>
+  </table>
+  <div style="clear:both;"></div>`;
+}
+
+function linkFallback(href, lang) {
   const T = emailTexts(lang);
+  return `<p style="margin:0 0 20px;color:${MUTED};font-size:12px;font-family:${FONT};">${T.linkFallback}<br>
+    <a href="${esc(href)}" target="_blank" rel="noopener noreferrer" style="color:${BLUE};word-break:break-all;">${esc(href)}</a></p>`;
+}
+
+function note(html) {
+  return `<div style="margin-top:8px;padding-top:16px;border-top:1px solid ${BORDER};color:${MUTED};font-size:13px;font-family:${FONT};">${html}</div>`;
+}
+
+function infoBox(rows) {
+  const visible = rows.filter(([, v]) => v !== undefined && v !== null && v !== "");
+  const body = visible
+    .map(
+      ([label, value], i) => `<tr><td style="padding:12px 18px;${i < visible.length - 1 ? "border-bottom:1px solid #dbeafe;" : ""}">
+        <div style="font-size:11px;font-weight:700;letter-spacing:0.6px;text-transform:uppercase;color:${MUTED};font-family:${FONT};">${esc(label)}</div>
+        <div style="padding-top:3px;font-size:15px;font-weight:700;color:${INK};font-family:${FONT};">${esc(value)}</div>
+      </td></tr>`
+    )
+    .join("");
+  return `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="${SOFT}"
+      style="margin:0 0 22px;background-color:${SOFT};border:1px solid #dbeafe;border-radius:8px;">${body}</table>`;
+}
+
+function otpBox(otp) {
+  return `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:6px 0 22px;">
+    <tr><td align="center" bgcolor="${SOFT}" style="background-color:${SOFT};border:1px solid #bfdbfe;border-radius:10px;padding:22px 0;">
+      <span style="font-size:34px;font-weight:700;letter-spacing:10px;color:${NAVY};font-family:'Courier New',Courier,monospace;">${esc(otp)}</span>
+    </td></tr>
+  </table>`;
+}
+
+function emailWrapper(bodyHtml, lang = "en", preheader = "") {
+  const T = emailTexts(lang);
+  const ur = lang === "ur";
+  const src = logoSrc();
+  const logo = src
+    ? `<img src="${src}" alt="Dverif" height="44" style="display:block;height:44px;width:auto;border:0;outline:none;text-decoration:none;">`
+    : `<span style="color:${NAVY};font-size:26px;font-weight:800;letter-spacing:0.5px;font-family:${FONT};">Dverif</span>`;
+  const year = new Date().getFullYear();
+
   return `<!DOCTYPE html>
-<html lang="${lang === "ur" ? "ur" : "en"}">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"></head>
-<body style="margin:0;padding:0;background-color:#f4f5f7;font-family:Arial,Helvetica,sans-serif;-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%;">
-  <table width="100%" cellpadding="0" cellspacing="0" style="background-color:#f4f5f7;padding:40px 0;">
+<html lang="${ur ? "ur" : "en"}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<meta name="color-scheme" content="light">
+<title>Dverif</title>
+</head>
+<body style="margin:0;padding:0;background-color:#eef2f7;-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%;">
+  <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;font-size:1px;line-height:1px;">${esc(preheader)}&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;</div>
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#eef2f7;padding:32px 12px;">
     <tr><td align="center">
-      <table width="480" cellpadding="0" cellspacing="0" style="background-color:#ffffff;border-radius:8px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
-        <tr><td style="background-color:#1a1a2e;padding:28px 40px;text-align:center;">
-          <span style="color:#ffffff;font-size:22px;font-weight:700;letter-spacing:0.5px;">Dverif</span>
+      <table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0"
+             style="width:100%;max-width:600px;background-color:#ffffff;border:1px solid ${BORDER};border-radius:12px;overflow:hidden;">
+        <!-- accent stripe -->
+        <tr><td height="6" style="height:6px;line-height:6px;font-size:0;background-color:${NAVY};border-bottom:2px solid ${BLUE};">&nbsp;</td></tr>
+        <!-- header -->
+        <tr><td style="padding:24px 40px 20px;border-bottom:1px solid ${BORDER};" align="left">${logo}</td></tr>
+        <!-- body -->
+        <tr><td dir="${ur ? "rtl" : "ltr"}" style="padding:36px 40px 32px;text-align:${align(lang)};font-family:${FONT};line-height:${ur ? "2" : "1.7"};">
+          ${bodyHtml}
         </td></tr>
-        ${bodyHtml}
-        <tr><td style="background-color:#f9fafb;padding:20px 40px;border-top:1px solid #eee;">
-          <table width="100%" cellpadding="0" cellspacing="0">
-            <tr><td style="text-align:center;">
-              <span style="color:#999;font-size:12px;">${T.footerTagline}</span>
-            </td></tr>
-            <tr><td style="padding-top:8px;text-align:center;">
-              <span style="color:#bbb;font-size:11px;">${T.footerAuto}</span>
-            </td></tr>
-          </table>
+        <!-- footer -->
+        <tr><td align="center" bgcolor="${NAVY}" style="background-color:${NAVY};padding:24px 40px;">
+          <div style="color:#ffffff;font-size:13px;font-weight:700;font-family:${FONT};">${T.footerTagline}</div>
+          <div style="padding-top:6px;color:#bfdbfe;font-size:12px;font-family:${FONT};">${T.footerAuto}</div>
+          <div style="padding-top:12px;color:#93c5fd;font-size:11px;font-family:${FONT};">&copy; ${year} Dverif. All rights reserved.</div>
         </td></tr>
       </table>
     </td></tr>
@@ -246,41 +368,38 @@ function emailWrapper(bodyHtml, lang) {
 </html>`;
 }
 
-export async function sendPasswordResetEmail({ to, resetLink, lang = "en" }) {
+function requireTransport() {
   const transporter = getMailerTransport();
   if (!transporter) {
     throw new Error("SMTP is not configured. Please set SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS");
   }
+  return transporter;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Emails
+// ─────────────────────────────────────────────────────────────
+export async function sendPasswordResetEmail({ to, resetLink, lang = "en" }) {
+  const transporter = requireTransport();
 
   const appName = process.env.APP_NAME || "Dverif";
   const expiry = process.env.RESET_PASSWORD_EXPIRES_IN || "15m";
   const T = emailTexts(lang);
-  const bodyHtml = `
-    <tr><td style="padding:40px;">
-      <h2 style="margin:0 0 8px;color:#1a1a2e;font-size:20px;font-weight:600;">${T.resetHeading}</h2>
-      <p style="margin:0 0 20px;color:#555;font-size:15px;line-height:1.6;">
-        ${T.resetBody(appName)}
-      </p>
-      <p style="margin:0 0 20px;color:#555;font-size:15px;line-height:1.6;">
-        ${T.resetLinkLine(expiry)}
-      </p>
-      <table cellpadding="0" cellspacing="0" style="margin:0 0 24px;">
-        <tr><td>
-          <a href="${resetLink}" target="_blank" rel="noopener noreferrer"
-             style="display:inline-block;background-color:#1a1a2e;color:#ffffff;font-size:15px;font-weight:600;text-decoration:none;padding:14px 32px;border-radius:6px;">
-            ${T.resetButton}
-          </a>
-        </td></tr>
-      </table>
-      <p style="margin:0 0 8px;color:#888;font-size:13px;line-height:1.5;">
-        ${T.resetIgnore}
-      </p>
-    </td></tr>`;
+
+  const bodyHtml = [
+    badge(T.resetHeading, "info"),
+    h1(T.resetHeading),
+    p(T.resetBody(esc(appName))),
+    p(T.resetLinkLine(esc(expiry))),
+    button(resetLink, T.resetButton, lang),
+    linkFallback(resetLink, lang),
+    note(T.resetIgnore),
+  ].join("");
 
   const text = [
     T.resetTextTitle,
     ``,
-    T.resetBody(appName).replace(/<[^>]+>/g, ""),
+    T.resetBody(appName),
     ``,
     T.resetTextLink(expiry).replace(/<[^>]+>/g, ""),
     resetLink,
@@ -294,7 +413,7 @@ export async function sendPasswordResetEmail({ to, resetLink, lang = "en" }) {
         to,
         subject: `${appName} — ${T.resetSubject}`,
         text,
-        html: emailWrapper(bodyHtml, lang),
+        html: emailWrapper(bodyHtml, lang, T.resetHeading),
       })
     );
     return info;
@@ -305,81 +424,48 @@ export async function sendPasswordResetEmail({ to, resetLink, lang = "en" }) {
 }
 
 export async function sendLoginOtpEmail({ to, otp, lang = "en" }) {
-  const transporter = getMailerTransport();
-  if (!transporter) {
-    throw new Error("SMTP is not configured. Please set SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS");
-  }
-
+  const transporter = requireTransport();
   const T = emailTexts(lang);
 
-  const bodyHtml = `
-    <tr><td style="padding:40px;">
-      <h2 style="margin:0 0 8px;color:#1a1a2e;font-size:20px;font-weight:600;">${T.otpHeading}</h2>
-      <p style="margin:0 0 20px;color:#555;font-size:15px;line-height:1.6;">
-        ${T.otpBody}
-      </p>
-      <div style="margin:0 0 24px;background-color:#f4f4f5;border-radius:8px;padding:20px 0;text-align:center;">
-        <span style="font-size:32px;font-weight:700;letter-spacing:8px;color:#1a1a2e;font-family:monospace;">${otp}</span>
-      </div>
-      <p style="margin:0 0 8px;color:#888;font-size:13px;line-height:1.5;">
-        ${T.otpIgnore}
-      </p>
-    </td></tr>`;
+  const bodyHtml = [
+    h1(T.otpHeading),
+    p(T.otpBody),
+    otpBox(otp),
+    note(T.otpIgnore),
+  ].join("");
 
-  const text = [
-    T.otpTextCode(otp),
-    ``,
-    T.otpTextExpiry,
-    ``,
-    T.otpTextIgnore,
-  ].join("\n");
+  const text = [T.otpTextCode(otp), ``, T.otpTextExpiry, ``, T.otpTextIgnore].join("\n");
 
   await transporter.sendMail(
     buildMail({
       to,
       subject: T.otpSubject,
       text,
-      html: emailWrapper(bodyHtml, lang),
+      html: emailWrapper(bodyHtml, lang, T.otpTextCode(otp)),
     })
   );
 }
 
 export async function sendInviteEmail({ to, setLink, invitedByName, lang = "en" }) {
-  const transporter = getMailerTransport();
-  if (!transporter) {
-    throw new Error("SMTP is not configured. Please set SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS");
-  }
+  const transporter = requireTransport();
 
   const appName = process.env.APP_NAME || "Dverif";
   const expiryHours = process.env.INVITE_EXPIRES_IN_HOURS || "72";
   const T = emailTexts(lang);
 
-  const bodyHtml = `
-    <tr><td style="padding:40px;">
-      <h2 style="margin:0 0 8px;color:#1a1a2e;font-size:20px;font-weight:600;">${T.inviteHeading}</h2>
-      <p style="margin:0 0 20px;color:#555;font-size:15px;line-height:1.6;">
-        ${T.inviteIntro(invitedByName, appName)}
-      </p>
-      <table cellpadding="0" cellspacing="0" style="margin:0 0 24px;">
-        <tr><td>
-          <a href="${setLink}" target="_blank" rel="noopener noreferrer"
-             style="display:inline-block;background-color:#1a1a2e;color:#ffffff;font-size:15px;font-weight:600;text-decoration:none;padding:14px 32px;border-radius:6px;">
-            ${T.inviteButton}
-          </a>
-        </td></tr>
-      </table>
-      <p style="margin:0 0 20px;color:#555;font-size:15px;line-height:1.6;">
-        ${T.inviteExpiry(expiryHours)}
-      </p>
-      <p style="margin:0;color:#888;font-size:13px;line-height:1.5;">
-        ${T.inviteIgnore}
-      </p>
-    </td></tr>`;
+  const bodyHtml = [
+    h1(T.inviteHeading),
+    p(T.inviteIntro(invitedByName ? esc(invitedByName) : "", esc(appName))),
+    button(setLink, T.inviteButton, lang),
+    p(T.inviteExpiry(esc(expiryHours))),
+    linkFallback(setLink, lang),
+    note(T.inviteIgnore),
+  ].join("");
 
   const text = [
     T.inviteTextTitle(appName),
     ``,
-    T.inviteTextIntro(invitedByName, appName).replace(/<[^>]+>/g, ""),
+    T.inviteTextIntro(invitedByName, appName),
     T.inviteTextCreated,
     ``,
     T.inviteTextLink(expiryHours),
@@ -393,7 +479,7 @@ export async function sendInviteEmail({ to, setLink, invitedByName, lang = "en" 
       to,
       subject: `${appName} — ${T.inviteSubject}`,
       text,
-      html: emailWrapper(bodyHtml, lang),
+      html: emailWrapper(bodyHtml, lang, T.inviteTextTitle(appName)),
     })
   );
 }
@@ -408,27 +494,14 @@ export async function sendVerificationResultEmail({ to, documentType, portalLink
   const appName = process.env.APP_NAME || "Dverif";
   const T = emailTexts(lang);
 
-  const bodyHtml = `
-    <tr><td style="padding:40px;">
-      <div style="margin:0 0 20px;display:inline-block;background-color:#16a34a10;border:1px solid #16a34a30;border-radius:6px;padding:8px 16px;">
-        <span style="color:#16a34a;font-size:13px;font-weight:600;">✓ ${T.verifiedHeading}</span>
-      </div>
-      <h2 style="margin:0 0 8px;color:#1a1a2e;font-size:20px;font-weight:600;">${T.verifiedHeading}</h2>
-      <p style="margin:0 0 16px;color:#555;font-size:15px;line-height:1.6;">
-        ${T.verifiedBody(documentType)}
-      </p>
-      <p style="margin:0 0 24px;color:#555;font-size:15px;line-height:1.6;">
-        ${T.verifiedCheck}
-      </p>
-      <table cellpadding="0" cellspacing="0" style="margin:0 0 24px;">
-        <tr><td>
-          <a href="${portalLink}" target="_blank" rel="noopener noreferrer"
-             style="display:inline-block;background-color:#16a34a;color:#ffffff;font-size:15px;font-weight:600;text-decoration:none;padding:14px 32px;border-radius:6px;">
-            ${T.verifiedButton}
-          </a>
-        </td></tr>
-      </table>
-    </td></tr>`;
+  const bodyHtml = [
+    badge(T.verifiedBadge, "success"),
+    h1(T.verifiedHeading),
+    p(T.verifiedBody(esc(documentType))),
+    p(T.verifiedCheck),
+    button(portalLink, T.verifiedButton, lang, "#15803d"),
+    linkFallback(portalLink, lang),
+  ].join("");
 
   const text = [
     T.verifiedHeading,
@@ -444,7 +517,7 @@ export async function sendVerificationResultEmail({ to, documentType, portalLink
       to,
       subject: `${appName} — ${T.verifiedSubject}`,
       text,
-      html: emailWrapper(bodyHtml, lang),
+      html: emailWrapper(bodyHtml, lang, T.verifiedTextBody(documentType)),
     })
   );
 }
@@ -509,33 +582,24 @@ export async function sendLeadNotificationEmail({ type, data }) {
     ? `New Contact Form Submission from ${data.name}`
     : `New Access Request from ${data.contact_name || data.organization_name}`;
 
-  const detailsHtml = Object.entries(data)
+  const rows = Object.entries(data)
     .filter(([, v]) => v != null && v !== "")
-    .map(([k, v]) => `<tr><td style="padding:4px 0;color:#888;font-size:13px;font-weight:600;text-transform:capitalize;vertical-align:top;white-space:nowrap;padding-right:12px;">${k.replace(/_/g, " ")}</td><td style="padding:4px 0;color:#333;font-size:13px;">${v}</td></tr>`)
-    .join("");
+    .map(([k, v]) => [k.replace(/_/g, " "), v]);
 
-  const bodyHtml = `
-    <tr><td style="padding:40px;">
-      <h2 style="margin:0 0 8px;color:#1a1a2e;font-size:20px;font-weight:600;">${subjectLine}</h2>
-      <p style="margin:0 0 20px;color:#555;font-size:15px;line-height:1.6;">
-        A new ${isContact ? "contact form" : "access request"} was submitted on the marketing website.
-      </p>
-      <table cellpadding="0" cellspacing="0" style="margin:0 0 24px;width:100%;">
-        ${detailsHtml}
-      </table>
-      <p style="margin:0;color:#888;font-size:13px;line-height:1.5;">
-        Review this lead in the admin panel.
-      </p>
-    </td></tr>`;
+  const bodyHtml = [
+    badge(isContact ? "New Contact Message" : "New Access Request", "info"),
+    h1(esc(subjectLine)),
+    p(`A new ${isContact ? "contact form" : "access request"} was submitted on the marketing website.`),
+    infoBox(rows),
+    p("Review this lead in the admin panel.", { small: true, muted: true }),
+  ].join("");
 
   const text = [
     subjectLine,
     "",
     `A new ${isContact ? "contact form" : "access request"} was submitted.`,
     "",
-    ...Object.entries(data)
-      .filter(([, v]) => v != null && v !== "")
-      .map(([k, v]) => `${k.replace(/_/g, " ")}: ${v}`),
+    ...rows.map(([k, v]) => `${k}: ${v}`),
     "",
     "Review this lead in the admin panel.",
   ].join("\n");
@@ -545,7 +609,7 @@ export async function sendLeadNotificationEmail({ type, data }) {
       to: recipients,
       subject: `${appName} — ${subjectLine}`,
       text,
-      html: emailWrapper(bodyHtml),
+      html: emailWrapper(bodyHtml, "en", subjectLine),
     })
   );
 }
@@ -564,24 +628,18 @@ export async function sendExpiryReminderEmail({ to, orgName, type, daysLeft, hou
   const recipients = Array.isArray(to) ? to : [to || from];
   const timeText = isUrgent ? `${hoursLeft} hour(s)` : `${daysLeft} day(s)`;
   const subjectPrefix = isUrgent ? "Action needed:" : "";
-  const accentColor = isUrgent ? "#dc2626" : "#d97706";
 
-  const bodyHtml = `
-    <tr><td style="padding:40px;">
-      <div style="margin:0 0 20px;display:inline-block;background-color:${accentColor}10;border:1px solid ${accentColor}30;border-radius:6px;padding:8px 16px;">
-        <span style="color:${accentColor};font-size:13px;font-weight:600;">⚠ Subscription Expiry ${isUrgent ? "Warning" : "Reminder"}</span>
-      </div>
-      <h2 style="margin:0 0 8px;color:#1a1a2e;font-size:20px;font-weight:600;">Your subscription is expiring soon</h2>
-      <p style="margin:0 0 16px;color:#555;font-size:15px;line-height:1.6;">
-        The subscription for <strong>${orgName}</strong> will expire in <strong>${timeText}</strong>.
-      </p>
-      <p style="margin:0 0 16px;color:#555;font-size:15px;line-height:1.6;">
-        After expiry, your organization will not be able to create or verify documents until the subscription is renewed.
-      </p>
-      <p style="margin:0 0 8px;color:#888;font-size:13px;line-height:1.5;">
-        Please contact your administrator to renew the subscription.
-      </p>
-    </td></tr>`;
+  const bodyHtml = [
+    badge(`Subscription Expiry ${isUrgent ? "Warning" : "Reminder"}`, isUrgent ? "danger" : "warn"),
+    h1("Your subscription is expiring soon"),
+    p(`The subscription for <strong>${esc(orgName)}</strong> will expire in <strong>${esc(timeText)}</strong>.`),
+    infoBox([
+      ["Organization", orgName],
+      ["Expires in", timeText],
+    ]),
+    p("After expiry, your organization will not be able to create or verify documents until the subscription is renewed."),
+    note("Please contact your administrator to renew the subscription."),
+  ].join("");
 
   const text = [
     `Subscription Expiry ${isUrgent ? "Warning" : "Reminder"}`,
@@ -596,9 +654,9 @@ export async function sendExpiryReminderEmail({ to, orgName, type, daysLeft, hou
   await transporter.sendMail(
     buildMail({
       to: recipients.join(", "),
-      subject: `${subjectPrefix} ${appName} — Subscription Expiring for ${orgName}`,
+      subject: `${subjectPrefix} ${appName} — Subscription Expiring for ${orgName}`.trim(),
       text,
-      html: emailWrapper(bodyHtml),
+      html: emailWrapper(bodyHtml, "en", `Subscription for ${orgName} expires in ${timeText}`),
     })
   );
 }
@@ -613,22 +671,13 @@ export async function sendSlaReminderEmail({ to, orgName, documentType, lang = "
   const appName = process.env.APP_NAME || "Dverif";
   const T = emailTexts(lang);
 
-  const bodyHtml = `
-    <tr><td style="padding:40px;">
-      <div style="margin:0 0 20px;display:inline-block;background-color:#d9770610;border:1px solid #d9770630;border-radius:6px;padding:8px 16px;">
-        <span style="color:#d97706;font-size:13px;font-weight:600;">⏳ ${T.slaBadge}</span>
-      </div>
-      <h2 style="margin:0 0 8px;color:#1a1a2e;font-size:20px;font-weight:600;">${T.slaHeading}</h2>
-      <p style="margin:0 0 16px;color:#555;font-size:15px;line-height:1.6;">
-        ${T.slaWaiting(orgName)}
-      </p>
-      <p style="margin:0 0 16px;color:#555;font-size:15px;line-height:1.6;">
-        ${T.slaDocType} <strong>${documentType || "—"}</strong>
-      </p>
-      <p style="margin:0 0 8px;color:#888;font-size:13px;line-height:1.5;">
-        ${T.slaAction}
-      </p>
-    </td></tr>`;
+  const bodyHtml = [
+    badge(T.slaBadge, "warn"),
+    h1(T.slaHeading),
+    p(T.slaWaiting(esc(orgName))),
+    infoBox([[T.slaDocType.replace(/[:：]\s*$/, ""), documentType || "—"]]),
+    note(T.slaAction),
+  ].join("");
 
   const text = [
     T.slaHeading,
@@ -644,7 +693,7 @@ export async function sendSlaReminderEmail({ to, orgName, documentType, lang = "
       to,
       subject: `${appName} — ${T.slaSubject(orgName)}`,
       text,
-      html: emailWrapper(bodyHtml, lang),
+      html: emailWrapper(bodyHtml, lang, T.slaTextWaiting(orgName)),
     })
   );
 }

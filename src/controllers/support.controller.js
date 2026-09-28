@@ -6,6 +6,7 @@ import { assertUuid } from "../utils/publicResponse.js";
 import { parsePagination, paginatedResponse } from "../utils/pagination.js";
 import { createNotificationForUsers } from "./notification.controller.js";
 import { logAudit, getActorFromReq } from "../utils/auditLog.js";
+import { OPEN_TICKET_NEEDS_ADMIN_REPLY } from "../utils/supportTicketPredicates.js";
 
 const VALID_PRIORITIES = ["low", "medium", "high"];
 const VALID_STATUSES = ["open", "in_progress", "resolved", "closed"];
@@ -231,6 +232,7 @@ export async function listAdminTickets(req, res) {
   const params = [];
 
   if (status && VALID_STATUSES.includes(status)) {
+    if (status === "open") conditions.push(OPEN_TICKET_NEEDS_ADMIN_REPLY);
     conditions.push("t.status = ?");
     params.push(status);
   }

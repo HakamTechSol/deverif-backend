@@ -3,12 +3,7 @@ import path from "path";
 import ApiError from "../utils/ApiError.js";
 import { pool } from "../config/db.js";
 import { DOCS_DIR } from "../config/uploadPaths.js";
-import {
-  qrSigningConfigured,
-  verifyQrSignature,
-} from "../utils/qrCertificate.js";
 
-const QR_TOKEN_PATTERN = /^[0-9a-f]{64}$/i;
 const DOC_FILENAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const REQUEST_DOC_PATH_PREFIX = "/uploads/documents/";
 const EMPLOYEE_DOC_PATH_PREFIX = "documents/";
@@ -104,58 +99,6 @@ export async function getAuthenticatedDocument(req, res) {
     req.user && req.user.organization && doc.organization_id === req.user.organization;
 
   if (!isOrgAdmin) throw new ApiError(404, "Document not found");
-
-  return streamDocument(res, filename);
-}
-
-/**
- * Public (no auth) access to the document of a VERIFIED verification request,
- * gated by the same QR token + HMAC signature checks as the public verify
- * endpoint. Only reachable by someone in possession of the QR token. Fails
- * closed with 404 on any invalid / forged / unverifiable input.
- * Route: GET /api/v1/verify/document/:filename?qr_token=...
- */
-export async function streamPublicQrDocument(req, res) {
-  const filename = safeDocumentFilename(req.params.filename);
-  const qrToken = typeof req.query.qr_token === "string" ? req.query.qr_token : "";
-
-  if (!filename || !QR_TOKEN_PATTERN.test(qrToken) || !qrSigningConfigured()) {
-    return res.status(404).json({ success: false, message: "Not found" });
-  }
-
-  const [rows] = await pool.query(
-    `SELECT vr.uuid, vr.status, vr.qr_token, vr.qr_signature, vr.document_path,
-            vr.issuing_organization_id, vr.verified_at
-     FROM verification_requests vr
-     WHERE vr.qr_token=?`,
-    [qrToken]
-  );
-
-  if (!rows.length) {
-    return res.status(404).json({ success: false, message: "Not found" });
-  }
-
-  const vr = rows[0];
-
-  if (vr.status !== "verified" || !vr.qr_signature) {
-    return res.status(404).json({ success: false, message: "Not found" });
-  }
-
-  const signatureValid = verifyQrSignature({
-    qrToken: vr.qr_token,
-    requestUuid: vr.uuid,
-    orgId: vr.issuing_organization_id,
-    verifiedAtMillis: vr.verified_at ? new Date(vr.verified_at).getTime() : 0,
-    signature: vr.qr_signature,
-  });
-
-  if (!signatureValid) {
-    return res.status(404).json({ success: false, message: "Not found" });
-  }
-
-  if (!vr.document_path || path.basename(vr.document_path) !== filename) {
-    return res.status(404).json({ success: false, message: "Not found" });
-  }
 
   return streamDocument(res, filename);
 }

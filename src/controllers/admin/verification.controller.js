@@ -5,11 +5,15 @@ import { assertUuid } from "../../utils/publicResponse.js";
 import { parsePagination, paginatedResponse } from "../../utils/pagination.js";
 import { createNotificationForOrgUsers, createNotificationForUsers } from "../notification.controller.js";
 import { logAudit, getActorFromReq } from "../../utils/auditLog.js";
-import { generateQrForRequest } from "../../utils/qrCertificate.js";
+import { generateQrForRequest, withVerifyUrl, withVerifyUrls } from "../../utils/qrCertificate.js";
 import { runSlaChecks } from "../../utils/slaChecks.js";
 import { sendVerificationResultEmailToOrg } from "../../utils/mailer.js";
 import { firstFrontendUrl } from "../../utils/frontendUrl.js";
 import { recordPersonDocument } from "../../utils/personDocuments.js";
+
+// Assigned unmatched requests stay in the unmatched queue until company verification clears their unmatched_org_id.
+const UNMATCHED_ORG_JOIN = "vr.unmatched_org_id = uo.id";
+const MATCHED_ONLY = "vr.unmatched_org_id IS NULL";
 
 const REQUEST_SELECT = `SELECT vr.*,
         requester.uuid AS requester_uuid,
@@ -44,7 +48,7 @@ export async function listAllRequests(req, res) {
   let whereClause = "";
   const params = [];
 
-  const conditions = [];
+  const conditions = [MATCHED_ONLY];
   if (search) {
     conditions.push(`(requester.full_name LIKE ? OR requester.email LIKE ? OR vr.document_type LIKE ? OR issuing_org.name LIKE ? OR vr.document_format LIKE ? OR vr.uuid LIKE ?)`);
     const like = `%${search}%`;
@@ -75,7 +79,7 @@ export async function listAllRequests(req, res) {
     `${REQUEST_SELECT} ${whereClause} ORDER BY vr.created_at DESC LIMIT ? OFFSET ?`,
     [...params, limit, offset]
   );
-  return ok(res, paginatedResponse(rows, total, page, limit), "All verification requests");
+  return ok(res, paginatedResponse(withVerifyUrls(rows), total, page, limit), "All verification requests");
 }
 
 export async function listSlaFlaggedRequests(req, res) {
@@ -107,7 +111,7 @@ export async function listSlaFlaggedRequests(req, res) {
     [...params, limit, offset]
   );
 
-  return ok(res, paginatedResponse(rows, total, page, limit), "Unresponsive requests");
+  return ok(res, paginatedResponse(withVerifyUrls(rows), total, page, limit), "Unresponsive requests");
 }
 
 export async function adminActOnSlaRequest(req, res) {
@@ -147,7 +151,14 @@ export async function adminActOnSlaRequest(req, res) {
   );
 
   if (status === "verified") {
-    await generateQrForRequest(updated[0]);
+    // Write the token back onto the row: the re-read above ran BEFORE the
+    // token existed, so the response would otherwise carry a null qr_token
+    // and no verify_url for the caller to show.
+    const qr = await generateQrForRequest(updated[0]);
+    if (qr && qr.qr_token) {
+      updated[0].qr_token = qr.qr_token;
+      updated[0].qr_signature = qr.qr_signature;
+    }
   }
 
   // Append to the person's document history
@@ -185,7 +196,7 @@ export async function adminActOnSlaRequest(req, res) {
     req,
   });
 
-  return ok(res, { request: updated[0] }, "Request updated");
+  return ok(res, { request: withVerifyUrl(updated[0]) }, "Request updated");
 }
 
 export async function deleteRequest(req, res) {
@@ -224,7 +235,7 @@ export async function listNullOrganizationRequests(req, res) {
 
   let whereClause = "";
   const params = [];
-  const conditions = [];
+  const conditions = ["EXISTS (SELECT 1 FROM verification_requests pending_vr WHERE pending_vr.unmatched_org_id=uo.id AND pending_vr.status <> 'verified')"];
 
   if (search) {
     conditions.push("(uo.name LIKE ? OR uo.email LIKE ? OR uo.phone LIKE ?)");
@@ -252,7 +263,7 @@ export async function listNullOrganizationRequests(req, res) {
     `SELECT uo.*,
             COUNT(vr.id) AS request_count
      FROM unmatched_organizations uo
-     LEFT JOIN verification_requests vr ON vr.unmatched_org_id = uo.id
+     LEFT JOIN verification_requests vr ON ${UNMATCHED_ORG_JOIN}
      ${whereClause}
      GROUP BY uo.id
      ORDER BY uo.created_at DESC
@@ -341,6 +352,13 @@ export async function adminVerifyUnmatchedRequest(req, res) {
     [uuid]
   );
 
+  // A finalized unmatched request leaves the unmatched queue and enters the main admin list.
+  if (status === "verified") {
+    await pool.query(
+      "UPDATE verification_requests SET unmatched_org_id=NULL WHERE uuid=?",
+      [uuid]
+    );
+  }
   // Notify the submitter
   const [requester] = await pool.query(
     "SELECT uuid, email, preferred_language, organization FROM users WHERE id=?",
@@ -385,7 +403,14 @@ export async function adminVerifyUnmatchedRequest(req, res) {
   );
 
   if (status === "verified") {
-    await generateQrForRequest(updated[0]);
+    // Write the token back onto the row: the re-read above ran BEFORE the
+    // token existed, so the response would otherwise carry a null qr_token
+    // and no verify_url for the caller to show.
+    const qr = await generateQrForRequest(updated[0]);
+    if (qr && qr.qr_token) {
+      updated[0].qr_token = qr.qr_token;
+      updated[0].qr_signature = qr.qr_signature;
+    }
   }
 
   // Append to the person's document history
@@ -402,7 +427,7 @@ export async function adminVerifyUnmatchedRequest(req, res) {
     req,
   });
 
-  return ok(res, { request: updated[0] }, "Request updated");
+  return ok(res, { request: withVerifyUrl(updated[0]) }, "Request updated");
 }
 
 export async function acceptNullOrganizationRequest(req, res) {
@@ -466,15 +491,6 @@ export async function acceptNullOrganizationRequest(req, res) {
     [assignedOrgId, unmatchedOrg.id]
   );
 
-  // Detach the routed requests from the unmatched org so they leave the
-  // unmatched queue and live only under the assigned (verified) org.
-  if (routedCount > 0) {
-    await pool.query(
-      "UPDATE verification_requests SET unmatched_org_id=NULL WHERE id IN (?)",
-      [routedRequests.map((r) => r.id)]
-    );
-  }
-
   logAudit({
     ...getActorFromReq(req),
     action: "unmatched_org.assign",
@@ -525,7 +541,7 @@ export async function lockRequest(req, res) {
     req,
   });
 
-  return ok(res, { request: updated[0] }, `Request locked by ${lockerName || "team member"}`);
+  return ok(res, { request: withVerifyUrl(updated[0]) }, `Request locked by ${lockerName || "team member"}`);
 }
 
 export async function unlockRequest(req, res) {
@@ -560,5 +576,5 @@ export async function unlockRequest(req, res) {
     req,
   });
 
-  return ok(res, { request: updated[0] }, "Request unlocked");
+  return ok(res, { request: withVerifyUrl(updated[0]) }, "Request unlocked");
 }

@@ -438,10 +438,13 @@ async function getSalaryRecordForPayslip(uuid, orgId, isAdmin) {
     params.push(uuid, orgId);
   }
   const [rows] = await pool.query(
-    `SELECT sr.*, e.full_name AS employee_name,
-            o.name AS organization_name
+    `SELECT sr.*, e.full_name AS employee_name, e.cnic AS employee_cnic,
+            e.phone AS employee_phone, dg.name AS designation, dp.name AS department,
+            o.name AS organization_name, o.logo AS organization_logo
      FROM salary_records sr
      JOIN employees e ON e.uuid = sr.employee_uuid
+     LEFT JOIN designations dg ON dg.id = e.designation_id
+     LEFT JOIN departments dp ON dp.id = e.department_id
      JOIN organizations o ON o.id = sr.organization_id
      ${whereClause}`,
     params

@@ -11,7 +11,7 @@ import { assertOrganizationActive } from "./admin/organizations.controller.js";
 import { enforceRequestQuota } from "../utils/requestQuota.js";
 import { resolveUnmatchedOrg } from "../utils/unmatchedOrg.js";
 import { logAudit, getActorFromReq } from "../utils/auditLog.js";
-import { generateQrForRequest } from "../utils/qrCertificate.js";
+import { generateQrForRequest, withVerifyUrl, withVerifyUrls } from "../utils/qrCertificate.js";
 import { runSlaChecks } from "../utils/slaChecks.js";
 import { runAutoMatchChecks, hasMatchMismatchRisk, computeMatchConfidence, autoApprove } from "../utils/autoMatch.js";
 import { buildDocumentCrossCheck } from "../utils/documentConsistency.js";
@@ -522,7 +522,11 @@ export async function createRequest(req, res) {
     req,
   });
 
-  return created(res, { request: rows[0] }, "Request created");
+  // withVerifyUrl runs LAST, after every branch that can replace rows[0]: the
+  // exact-hash path assigns qr_token above, and the inline auto-match path
+  // swaps in a freshly-read row (which has no token on it). Attaching earlier
+  // would be silently dropped by that reassignment.
+  return created(res, { request: withVerifyUrl(rows[0]) }, "Request created");
 }
 
 export async function mySentRequests(req, res) {
@@ -601,7 +605,7 @@ export async function mySentRequests(req, res) {
     [...params, limit, offset]
   );
 
-  return ok(res, paginatedResponse(rows, total, page, limit), "Sent requests");
+  return ok(res, paginatedResponse(withVerifyUrls(rows), total, page, limit), "Sent requests");
 }
 
 export async function deleteMySentRequest(req, res) {
@@ -821,7 +825,7 @@ export async function updateMySentRequest(req, res) {
     req,
   });
 
-  return ok(res, { request: rows[0] }, "Request updated");
+  return ok(res, { request: withVerifyUrl(rows[0]) }, "Request updated");
 }
 
 export async function myInboxRequests(req, res) {
@@ -924,12 +928,12 @@ export async function myInboxRequests(req, res) {
     [...params, limit, offset]
   );
 
-  const enriched = rows.map(r => ({
+  const enriched = withVerifyUrls(rows.map(r => ({
     ...r,
     person_known: Boolean(r.linked_person_id),
     person_has_prior_verification: r.person_prior_verified_at != null,
     match_mismatch_risk: hasMatchMismatchRisk(r),
-  }));
+  })));
   return ok(res, paginatedResponse(enriched, total, page, limit), "Inbox requests");
 }
 
@@ -1030,7 +1034,7 @@ export async function getMyInboxRequestDetail(req, res) {
 
   detail.match_mismatch_risk = hasMatchMismatchRisk(vr);
 
-  return ok(res, { request: detail }, "Request detail");
+  return ok(res, { request: withVerifyUrl(detail) }, "Request detail");
 }
 
 export async function myInboxCount(req, res) {
@@ -1138,7 +1142,7 @@ export async function myAutoVerifiedRequests(req, res) {
     [...params, limit, offset]
   );
 
-  return ok(res, paginatedResponse(rows, total, page, limit), "Auto-verified requests");
+  return ok(res, paginatedResponse(withVerifyUrls(rows), total, page, limit), "Auto-verified requests");
 }
 
 /**
@@ -1247,9 +1251,10 @@ export async function verifyRequest(req, res) {
   await pool.query(
     `UPDATE verification_requests
      SET status=?, verified_at=NOW(), verified_by=?, verification_remarks=?,
-         verification_method='portal'
+         verification_method='portal',
+         unmatched_org_id=CASE WHEN ?='verified' THEN NULL ELSE unmatched_org_id END
      WHERE uuid=?`,
-    [status, req.user.id, remarks || null, uuid]
+    [status, req.user.id, remarks || null, status, uuid]
   );
 
   const [updated] = await pool.query(
@@ -1262,9 +1267,16 @@ export async function verifyRequest(req, res) {
     [uuid]
   );
 
-  // Verified requests get a tamper-evident public QR certificate
+  // Verified requests get a tamper-evident public QR certificate.
+  // The token is written back onto the row: the re-read above happened BEFORE
+  // the token existed, so without this the response would carry a null
+  // qr_token and the frontend would have no verify_url to show.
   if (status === "verified") {
-    await generateQrForRequest(updated[0]);
+    const qr = await generateQrForRequest(updated[0]);
+    if (qr && qr.qr_token) {
+      updated[0].qr_token = qr.qr_token;
+      updated[0].qr_signature = qr.qr_signature;
+    }
   }
 
   // Append to the person's document history (accumulates across re-verifications)
@@ -1331,7 +1343,7 @@ export async function verifyRequest(req, res) {
     req,
   });
 
-  return ok(res, { request: updated[0] }, "Request updated");
+  return ok(res, { request: withVerifyUrl(updated[0]) }, "Request updated");
 }
 
 export async function listOrganizations(req, res) {
