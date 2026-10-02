@@ -13,13 +13,44 @@ export const FEATURE_NOT_INCLUDED_MESSAGE =
 export const NO_ACTIVE_SUBSCRIPTION_MESSAGE =
   "Your organization does not have an active subscription. Please subscribe to use these modules.";
 
-/** Human labels used in the UPGRADE_REQUIRED response, keyed by module. */
+/**
+ * Human labels used in the UPGRADE_REQUIRED response, keyed by module.
+ *
+ * This string is user-facing: it becomes "Upgrade your plan to access X." and
+ * also travels to the client as `module_label`, which the frontend renders in
+ * the locked-module card. A missing key here is NOT a no-op — `upgradeRequiredError`
+ * falls back to echoing the raw snake_case key, so a module that ships without a
+ * label shows the user "recruitment_management". tests/hrModuleFlags.test.js
+ * asserts every MODULE_FEATURE_KEYS entry has one.
+ */
 const MODULE_LABELS = {
+  // --- Pre-existing core HR ---
   employee_management: "Employee Management",
   attendance_management: "Attendance Management",
   user_management: "User Management",
   leave_management: "Leave Management",
   payroll_management: "Payroll Management",
+
+  // --- Workforce lifecycle ---
+  manpower_management: "Manpower Management",
+  recruitment_management: "Recruitment Management",
+  onboarding_management: "Onboarding Management",
+  separation_management: "Separation Management",
+  training_management: "Training Management",
+
+  // --- Performance & variable pay ---
+  performance_management: "Performance Management",
+  piece_work_management: "Piece Work Management",
+
+  // --- Money ops ---
+  expense_management: "Expense Management",
+  travel_management: "Travel Management",
+  asset_management: "Asset Management",
+  helpdesk_management: "Help Desk Management",
+
+  // --- Automation & documents ---
+  scheduled_reports: "Scheduled Reports",
+  hr_letters_management: "HR Letters Management",
 };
 
 /**
@@ -104,7 +135,10 @@ export async function assertModuleFeature(moduleKey, orgId) {
  * "subscription not active" 403. Only when a plan IS active do the plan's
  * module_flags decide access.
  *
- * @param {"employee_management"|"attendance_management"|"user_management"|"leave_management"|"payroll_management"} moduleKey
+ * @param {string} moduleKey One of MODULE_FEATURE_KEYS (utils/moduleFlags.js). The
+ *   factory throws synchronously on anything else, so a typo fails at route
+ *   registration time rather than silently locking an organization out of a
+ *   module that does not exist.
  */
 export default function requireModuleFeature(moduleKey) {
   if (!MODULE_FEATURE_KEYS.includes(moduleKey)) {

@@ -39,7 +39,13 @@ ALTER TABLE `verification_requests`
 -- touched. Matching on verification_method (rather than match_status) is what
 -- makes the repeat-of-a-verified-file path included: that path never ran the
 -- reference match, so its match_status is still 'not_attempted'.
-ALTER TABLE `verification_requests`
-    UPDATE `status` = 'auto_verified'
-    WHERE `status` = 'verified'
-      AND `verification_method` IN ('automatic_match', 'auto');
+-- NOTE: the `SET` keyword below was missing (the statement read
+-- `ALTER TABLE ... UPDATE status = ...`, which is a syntax error). This file
+-- had been applied by hand against the live database without being recorded in
+-- schema_migrations, so the broken statement was never executed by the runner
+-- and went unnoticed until migrations/run.mjs reached it. Corrected 2026-11-01.
+-- The statement is idempotent (it only rewrites rows that are still 'verified').
+UPDATE `verification_requests`
+   SET `status` = 'auto_verified'
+ WHERE `status` = 'verified'
+   AND `verification_method` IN ('automatic_match', 'auto');

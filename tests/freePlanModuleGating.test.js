@@ -7,28 +7,21 @@ import requireModuleFeature from "../src/middleware/requireModuleFeature.js";
 import requireActiveSubscription from "../src/middleware/requireActiveSubscription.js";
 import errorHandler from "../src/middleware/errorHandler.js";
 import { parseModuleFlags, isModuleIncluded } from "../src/utils/moduleFlags.js";
+import { ALL_MODULE_KEYS } from "./helpers/moduleKeyFixtures.js";
 
 /**
  * The real shape of the seeded Free plan: Employee Management is the ONLY module
  * included. This is the data a brand-new organization lands on by default, and
  * it is the exact scenario that was reported as broken -- a Free org saw
  * Employee Management locked too.
+ *
+ * Only `employee_management` is listed. Every other key is deliberately ABSENT
+ * rather than explicitly `false`, because that is how the Free plan is really
+ * seeded: `isModuleIncluded` reads an absent key as blocked either way, and a
+ * test that wrote them out as `false` would no longer catch a regression that
+ * changed the absent-vs-false distinction.
  */
-const FREE_PLAN_FLAGS = JSON.stringify({
-  employee_management: true,
-  attendance_management: false,
-  user_management: false,
-  leave_management: false,
-  payroll_management: false,
-});
-
-const ALL_MODULE_KEYS = [
-  "employee_management",
-  "attendance_management",
-  "user_management",
-  "leave_management",
-  "payroll_management",
-];
+const FREE_PLAN_FLAGS = JSON.stringify({ employee_management: true });
 
 let orgRow;
 
@@ -105,7 +98,11 @@ describe("per-module gating on a Free plan matches the pricing card", () => {
     expect(next.mock.calls[0][0]).toBeUndefined();
   });
 
-  it.each(["attendance_management", "user_management", "leave_management", "payroll_management"])(
+  // Every module other than employee_management must be locked on the Free plan,
+  // including the thirteen added by the HR expansion. Driven off ALL_MODULE_KEYS
+  // rather than a hand-written list so a new module cannot be added without this
+  // assertion covering it.
+  it.each(ALL_MODULE_KEYS.filter((k) => k !== "employee_management"))(
     "returns a distinct UPGRADE_REQUIRED for %s instead of a generic 403",
     async (key) => {
       const next = mockNext();
