@@ -6,6 +6,7 @@ import { assertUuid } from "../../utils/publicResponse.js";
 import {
   syncDocumentTypesInBackground,
   getDocumentServiceSchemaStatus,
+  getSupportedSchemaKeys,
 } from "../../services/documentTypeSync.js";
 
 /**
@@ -18,6 +19,13 @@ import {
  * a dropdown. The catalogue is pushed to the document service after every write
  * (see services/documentTypeSync.js).
  *
+ * The set of valid `schema_key` values is NOT listed in this file. It used to be
+ * a 40-entry `KNOWN_SCHEMA_KEYS` array copied from the Python service's schema
+ * registry, so the two had to be edited together and the copy rotted silently
+ * whenever only one side changed. The service is asked instead — see
+ * `getSupportedSchemaKeys` — leaving the registry as the single definition of
+ * what can be extracted.
+ *
  * `label_key` mirrors the service's own normalization exactly (lowercase, every
  * run of non-alphanumerics collapsed to one space) so the two agree on what
  * "the same label" means without either side re-deriving it.
@@ -26,49 +34,6 @@ import {
 const MAX_NAME = 150;
 const MAX_DESCRIPTION = 255;
 const MAX_SCHEMA_KEY = 50;
-
-/** Schema keys this build of the document service is known to support. */
-const KNOWN_SCHEMA_KEYS = new Set([
-  "generic",
-  "cnic",
-  "passport",
-  "offer_letter",
-  "appointment_letter",
-  "employment_contract",
-  "experience_letter",
-  "reference_letter",
-  "resume",
-  "application_form",
-  "education_certificate",
-  "transcript",
-  "relieving_letter",
-  "resignation_letter",
-  "promotion_letter",
-  "increment_letter",
-  "transfer_letter",
-  "bank_details",
-  "tax_document",
-  "background_check",
-  "medical_certificate",
-  "character_certificate",
-  "emergency_form",
-  "leave_record",
-  "attendance_record",
-  "performance_review",
-  "training_record",
-  "disciplinary",
-  "exit_form",
-  "clearance_form",
-  "settlement",
-  "photo",
-  "employee_id",
-  "policy_ack",
-  "legal_agreement",
-  "onboarding",
-  "asset_handover",
-  "job_description",
-  "closing_checklist",
-]);
 
 /**
  * The same normalization the Python service applies to a document_type string
@@ -91,15 +56,47 @@ function validateName(raw) {
   return name;
 }
 
-function validateSchemaKey(raw) {
+/**
+ * Validate a schema key against what the document service actually supports.
+ *
+ * The list of valid keys is NOT kept in this file. It used to be a 40-entry
+ * `KNOWN_SCHEMA_KEYS` array duplicated from the Python service, which meant the
+ * two had to be edited in lockstep and the copy silently rotted whenever a schema
+ * was added on one side only. The service is asked instead, so the set of valid
+ * keys has exactly one definition — the registry the extractor actually reads.
+ *
+ * A key the service does not know is rejected rather than accepted-and-ignored:
+ * `set_dynamic_label_map` on the Python side drops such entries, so the type
+ * would be stored and listed as selectable while quietly extracting with the
+ * generic schema. Failing at save time is the only point where the admin can
+ * still see the mistake.
+ *
+ * If the service is unreachable, the write is allowed through rather than
+ * blocked: a catalogue entry is a convenience and must not be un-editable
+ * because the OCR service happens to be down, and the extractor degrades to the
+ * generic schema in the meantime. The sync push retries on the next change.
+ */
+async function validateSchemaKey(raw) {
   // An omitted schema is a legitimate choice, not an error: 'generic' extracts
   // name + CNIC and is a real, working schema.
   const schemaKey = typeof raw === "string" && raw.trim() ? raw.trim() : "generic";
   if (schemaKey.length > MAX_SCHEMA_KEY) {
     throw new ApiError(400, `schema_key must be ${MAX_SCHEMA_KEY} characters or fewer`);
   }
-  if (!KNOWN_SCHEMA_KEYS.has(schemaKey)) {
-    throw new ApiError(400, `Unknown schema_key "${schemaKey}". Pick one the document service supports.`);
+
+  const { supported, reachable } = await getSupportedSchemaKeys();
+  if (!reachable) {
+    console.warn(
+      `[docTypes] could not confirm schema_key "${schemaKey}" against the document service; ` +
+        `accepting it. It will fall back to the generic schema until the service is reachable.`
+    );
+    return schemaKey;
+  }
+  if (!supported.has(schemaKey)) {
+    throw new ApiError(
+      400,
+      `Unknown schema_key "${schemaKey}". The document service supports: ${[...supported].sort().join(", ")}`
+    );
   }
   return schemaKey;
 }
@@ -146,7 +143,7 @@ export async function listActiveDocumentTypes(req, res) {
 
 export async function createDocumentType(req, res) {
   const name = validateName(req.body?.name);
-  const schemaKey = validateSchemaKey(req.body?.schema_key);
+  const schemaKey = await validateSchemaKey(req.body?.schema_key);
   const description = validateDescription(req.body?.description);
   const isActive = req.body?.is_active === false ? 0 : 1;
   const labelKey = normalizeLabelKey(name);
@@ -212,7 +209,9 @@ export async function updateDocumentType(req, res) {
 
   const name = req.body?.name === undefined ? existing.name : validateName(req.body.name);
   const schemaKey =
-    req.body?.schema_key === undefined ? existing.schema_key : validateSchemaKey(req.body.schema_key);
+    req.body?.schema_key === undefined
+      ? existing.schema_key
+      : await validateSchemaKey(req.body.schema_key);
   const description =
     req.body?.description === undefined ? existing.description : validateDescription(req.body.description);
   const isActive =
@@ -301,5 +300,3 @@ export async function getDocumentTypeSyncStatus(req, res) {
   const status = await getDocumentServiceSchemaStatus();
   return ok(res, { status }, "Document service sync status");
 }
-
-export { KNOWN_SCHEMA_KEYS };

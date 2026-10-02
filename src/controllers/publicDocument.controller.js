@@ -44,6 +44,17 @@ export async function streamPublicVerifiedDocument(req, res) {
 
   const filePath = resolvePublicDocumentPath(vr.document_path);
   if (!filePath) {
+    // The token is VALID here — the guard already proved the signature and that
+    // the record is verified. So this is not a probe or a forged link; it is a
+    // genuine certificate whose file is missing from disk (a bad deploy, a
+    // restored database without its uploads, a lost volume). The visitor still
+    // gets an undifferentiated 404, because telling them the difference would
+    // leak that the record exists, but the operator gets a line in the log:
+    // without this the only symptom is a support ticket saying "my QR is broken".
+    console.error(
+      `[publicDocument] VERIFIED request ${vr.uuid} (token ${req.params.qr_token.slice(0, 8)}…) ` +
+        `has no readable file on disk: ${vr.document_path}. The record is valid; the upload is gone.`
+    );
     return res.status(404).json({ success: false, message: "Not found" });
   }
 

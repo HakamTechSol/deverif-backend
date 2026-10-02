@@ -138,12 +138,51 @@ export function syncDocumentTypesOnBoot({ attempts = 3, delayMs = 4000 } = {}) {
 export async function getDocumentServiceSchemaStatus() {
   try {
     const { data } = await describeSchemas();
-    return { reachable: true, ...data };
+    // A flat, sorted list of valid keys alongside the per-key detail. The admin
+    // panel's schema input completes against this instead of against a copy of
+    // the registry baked into the frontend bundle, so a schema added to the
+    // service is offered immediately and one removed disappears immediately.
+    const schemaKeys = [...Object.keys(data?.schemas || {})].sort();
+    if (data?.generic) schemaKeys.push("generic");
+    return {
+      reachable: true,
+      ...data,
+      schema_keys: schemaKeys.sort(),
+    };
   } catch (error) {
     return {
       reachable: false,
       error: error.message,
       kind: error instanceof DocumentServiceError ? error.kind : "generic",
+      schema_keys: [],
     };
+  }
+}
+
+/**
+ * The schema keys the document service can actually extract, as a Set.
+ *
+ * This is the single source of truth for "is this a valid schema_key". It was
+ * previously a 40-entry array copied into the Node controller and a 40-entry
+ * label map copied into the frontend, both of which had to be edited by hand
+ * whenever the Python registry changed and silently rotted when they were not.
+ * Asking the service means there is exactly one list — the registry the
+ * extractor reads — so a new schema becomes selectable the moment it exists.
+ *
+ * `generic` is added explicitly: the service reports it separately from the
+ * schema table (it is the fallback used when a label resolves to nothing), so it
+ * is not in `schemas`, yet it is a real, working, valid choice.
+ *
+ * `reachable: false` means the service could not be asked. Callers must treat
+ * that as "unknown", never as "empty" — an empty set would reject every key.
+ */
+export async function getSupportedSchemaKeys() {
+  try {
+    const { data } = await describeSchemas();
+    const keys = new Set(Object.keys(data?.schemas || {}));
+    keys.add("generic");
+    return { supported: keys, reachable: true };
+  } catch (error) {
+    return { supported: new Set(), reachable: false, error: error.message };
   }
 }
