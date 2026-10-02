@@ -33,8 +33,8 @@ function mockRes() {
 }
 
 /** A staff request: scopeOrgId is what makes the caller "scoped". */
-function staffReq(user) {
-  return { user, scopeOrgId: ORG_ID, query: {} };
+function staffReq(user, query = {}) {
+  return { user, scopeOrgId: ORG_ID, query };
 }
 
 function statements() {
@@ -72,16 +72,26 @@ describe("listEmployees — sub-admin sees the org roster", () => {
 
   it("still scopes the sub-admin to their own organization", async () => {
     await listEmployees(staffReq(subAdmin), mockRes());
-    // Param order is record_type first, then the org scope, so assert by
-    // membership rather than by index.
+    // Assert by membership rather than by index: the org scope and the status
+    // filter are bound in different shapes now (the current-employee list binds
+    // an IN-list into the SQL and passes no status param at all).
     expect(countStmt().params).toContain(ORG_ID);
   });
 
-  it("keeps the record_type filter so roster/reference views still work", async () => {
+  it("keeps the current-employee status filter so both list views still work", async () => {
     await listEmployees(staffReq(subAdmin), mockRes());
     const count = countStmt();
-    expect(count.sql).toContain("e.record_type = ?");
-    expect(count.params).toContain("roster");
+    // Default view excludes ex-employees by status, not by the dropped
+    // record_type column.
+    expect(count.sql).toContain("e.status IN (");
+    expect(count.sql).not.toContain("record_type");
+  });
+
+  it("shows only ex-employees in the reference view", async () => {
+    await listEmployees(staffReq(subAdmin, { reference: "1" }), mockRes());
+    const count = countStmt();
+    expect(count.sql).toContain("e.status = ?");
+    expect(count.params).toContain("ex_employee");
   });
 });
 

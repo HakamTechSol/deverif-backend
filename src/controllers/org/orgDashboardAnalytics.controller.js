@@ -9,9 +9,14 @@ import { getOrgQuotaStatus } from "../../utils/requestQuota.js";
 export async function orgDashboardAnalytics(req, res) {
   const orgId = req.scopeOrgId;
 
-  // 1. Active employee count
+  // 1. Active employee count.
+  // 'active' (deactivated) counts as staff: they are still on the roster and
+  // still occupying a seat, they simply cannot log in. The old query was
+  // `status='active' AND record_type='roster'`, which after the merge collapses
+  // to the status test alone.
   const [[empCount]] = await pool.query(
-    `SELECT COUNT(*) AS total FROM employees WHERE organization_id=? AND status='active' AND record_type='roster'`,
+    `SELECT COUNT(*) AS total FROM employees
+      WHERE organization_id=? AND status IN ('active','current_employee')`,
     [orgId]
   );
 
@@ -58,15 +63,20 @@ export async function orgDashboardAnalytics(req, res) {
     `SELECT COALESCE(dp.name, 'Unassigned') AS department, COUNT(*) AS count
      FROM employees e
      LEFT JOIN departments dp ON dp.id = e.department_id
-     WHERE e.organization_id=? AND e.status='active' AND e.record_type='roster'
+     WHERE e.organization_id=? AND e.status IN ('active','current_employee')
      GROUP BY dp.name
      ORDER BY count DESC`,
     [orgId]
   );
 
   // 7. Today's attendance breakdown (present / absent / late)
-  //    present = checked_in or checked_out today; absent = active employees with no record today
+  //    present = checked_in or checked_out today; absent = current employees with no record today
   //    late = checked_in after 09:30 (simple heuristic)
+  //
+  //    Filters on current-employee status so an archived ex-employee's leftover
+  //    attendance rows cannot be counted as present. They would otherwise
+  //    inflate `present` against a headcount that no longer includes them and
+  //    drive the absent count to zero.
   const [todayRecords] = await pool.query(
     `SELECT ar.employee_uuid,
             ar.check_in_at,
@@ -74,7 +84,8 @@ export async function orgDashboardAnalytics(req, res) {
             ar.status
      FROM attendance_records ar
      JOIN employees e ON e.uuid = ar.employee_uuid
-     WHERE e.organization_id=? AND ar.date = CURDATE() AND e.record_type='roster'`,
+     WHERE e.organization_id=? AND ar.date = CURDATE()
+       AND e.status IN ('active','current_employee')`,
     [orgId]
   );
 

@@ -12,7 +12,7 @@ import { logAudit, getActorFromReq } from "../../utils/auditLog.js";
 import { STAFF_ROLES, assertRole, ROLE_ORG_ADMIN } from "../../utils/roles.js";
 
 const EMPLOYEE_SELECT = `SELECT e.id, e.uuid, e.organization_id, e.full_name, e.email, e.phone,
-        e.cnic, dg.name AS designation, dp.name AS department, e.status, e.record_type, e.is_platform_user,
+        e.cnic, dg.name AS designation, dp.name AS department, e.status, e.is_platform_user,
         e.linked_user_uuid, e.added_by_uuid, e.promoted_by_uuid, e.promoted_at,
         e.joining_date, e.emergency_contact,
         e.created_at,
@@ -62,7 +62,37 @@ async function resolveOrganizationId(organizationUuid) {
   return rows[0].id;
 }
 
-const ALLOWED_EMPLOYEE_STATUS = ["active", "inactive", "resigned", "terminated"];
+/**
+ * The employee `status` values, and the subset a CREATE may use.
+ *
+ * `record_type` was merged into this column (see migration
+ * 20260930_merge_employee_record_type_into_status.sql), so the enum now carries
+ * both questions it used to split between two columns: is this person currently
+ * on staff ('current_employee'), and if not why ('ex_employee').
+ *
+ * 'inactive' is deliberately NOT creatable. It is the DEACTIVATION kill-switch
+ * read by middleware/authUser.js and the login controllers — it means "this
+ * account exists and must be refused" — which is not a state a brand-new
+ * employee can meaningfully be in. It is accepted on update only, which is where
+ * deactivating actually happens.
+ *
+ * Kept as two exported lists rather than one, so the create/update split cannot
+ * drift: adding a value to the union without deciding which side it belongs to
+ * is a visible code change, not a silent default.
+ */
+const ALLOWED_EMPLOYEE_STATUS = ["active", "inactive", "current_employee", "ex_employee"];
+
+/** Statuses a CREATE may set. Excludes 'inactive' — see above. */
+const CREATABLE_EMPLOYEE_STATUS = ["current_employee", "active", "ex_employee"];
+
+/** Statuses that mean "currently on staff", for headcount and roster queries. */
+const CURRENT_EMPLOYEE_STATUSES = ["active", "current_employee"];
+
+/** SQL fragment for the current-employee predicate, so it is spelled once. */
+const CURRENT_EMPLOYEE_SQL = `'active','current_employee'`;
+
+/** Statuses that mean "no longer on staff". */
+const EX_EMPLOYEE_STATUSES = ["ex_employee"];
 
 /** Resolve an org-scoped designation/department row by name, creating it if missing. */
 async function resolveMetaId(conn, orgId, table, name) {
@@ -105,7 +135,12 @@ function normalizeEmployeePayload(body) {
 
   if (errors.length) throw new ApiError(400, errors.join("; "));
 
-  const normalizedStatus = ALLOWED_EMPLOYEE_STATUS.includes(status) ? status : "active";
+  // A create may not set 'inactive' (see CREATABLE_EMPLOYEE_STATUS). Anything
+  // unrecognised falls back to 'current_employee', which is the only correct
+  // default now that status encodes roster membership: defaulting to 'ex_employee'
+  // would bury a new employee in the reference list, and defaulting to 'active'
+  // would silently produce a value no roster query looks for.
+  const normalizedStatus = CREATABLE_EMPLOYEE_STATUS.includes(status) ? status : "current_employee";
 
   return {
     full_name: String(full_name).trim(),
@@ -355,10 +390,21 @@ export async function listEmployees(req, res) {
   const conditions = [];
   const params = [];
 
-  // Default: only roster employees. ?reference=1 shows learned_reference rows instead.
+  // Default: current employees. ?reference=1 shows ex-employee rows instead.
+  // This used to be `record_type = 'roster' | 'learned_reference'`; it is now a
+  // status comparison, because record_type was merged into status.
+  //
+  // 'active' is included in BOTH views deliberately. It means "deactivated" and
+  // a deactivated employee is still on the roster — hiding them from the list
+  // would make them impossible to find and therefore impossible to reactivate,
+  // which is the only way out of that state.
   const showReferences = req.query.reference === "1" || req.query.reference === "true";
-  conditions.push("e.record_type = ?");
-  params.push(showReferences ? "learned_reference" : "roster");
+  if (showReferences) {
+    conditions.push("e.status = ?");
+    params.push("ex_employee");
+  } else {
+    conditions.push(`e.status IN (${CURRENT_EMPLOYEE_SQL})`);
+  }
 
   if (scope.scoped) {
     conditions.push("e.organization_id = ?");
@@ -478,7 +524,14 @@ export async function updateEmployee(req, res) {
   }
   if (status !== undefined) {
     updateFields.push("status = ?");
-    updateValues.push(ALLOWED_EMPLOYEE_STATUS.includes(status) ? status : "active");
+    // An update MAY set 'inactive' — deactivating an existing employee is the
+    // whole point of that value, and it is what the auth guards key off. An
+    // unrecognised value falls back to the row's CURRENT status rather than to a
+    // fixed default: defaulting to 'active' here would silently un-deactivate
+    // someone the caller only meant to rename.
+    updateValues.push(
+      ALLOWED_EMPLOYEE_STATUS.includes(status) ? status : (existing.status ?? "current_employee")
+    );
   }
   if (joining_date !== undefined) {
     updateFields.push("joining_date = ?");
@@ -559,10 +612,10 @@ export async function archiveReference(req, res) {
     throw new ApiError(403, "You can only manage employees within your organization");
   }
 
-  await pool.query(
-    `UPDATE employees SET record_type='learned_reference', status='resigned' WHERE uuid=?`,
-    [uuid]
-  );
+  // One column, one value. This used to write both `record_type='learned_reference'`
+  // and `status='resigned'`, which is the dual-write that made the two columns
+  // capable of disagreeing.
+  await pool.query(`UPDATE employees SET status='ex_employee' WHERE uuid=?`, [uuid]);
 
   const [updated] = await pool.query(`${EMPLOYEE_SELECT} WHERE e.uuid=?`, [uuid]);
 
@@ -599,11 +652,16 @@ export async function createReference(req, res) {
 
   const addedByUuid = req.admin?.uuid || req.user?.uuid || null;
 
+  // 'ex_employee', not 'active'. This row used to be inserted as
+  // status='active' + record_type='learned_reference' and was kept out of
+  // headcount ONLY by that second column. With record_type gone, inserting
+  // 'active' would make every manually-created verification reference count as
+  // live staff on the org dashboard and in the platform-admin employee count.
   const [result] = await pool.query(
     `INSERT INTO employees
-     (uuid, organization_id, full_name, cnic, status, record_type,
+     (uuid, organization_id, full_name, cnic, status,
       is_platform_user, added_by_uuid, created_at)
-     VALUES (UUID(), ?, ?, ?, 'active', 'learned_reference', 'no', ?, NOW())`,
+     VALUES (UUID(), ?, ?, ?, 'ex_employee', 'no', ?, NOW())`,
     [orgId, String(full_name).trim(), trimmedCnic, addedByUuid]
   );
 

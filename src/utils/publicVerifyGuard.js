@@ -3,6 +3,7 @@ import fs from "fs";
 import { pool } from "../config/db.js";
 import { UPLOAD_ROOT, DOCS_DIR } from "../config/uploadPaths.js";
 import { qrSigningConfigured, verifyQrSignature } from "./qrCertificate.js";
+import { isVerifiedStatus } from "./verifiedStatuses.js";
 
 /**
  * The single fail-closed gate in front of BOTH public QR endpoints:
@@ -36,7 +37,8 @@ export function publicVerifyDocumentEnabled() {
  *   1. the token is 64 hex characters,
  *   2. QR signing is configured (an unsigned deployment can prove nothing),
  *   3. a request row exists for it,
- *   4. that request is `verified` and carries a signature,
+ *   4. that request reached a terminal SUCCESSFUL status ('verified' or
+ *      'auto_verified') and carries a signature,
  *   5. the HMAC over (token, uuid, org id, verified_at) matches, compared with
  *      crypto.timingSafeEqual inside verifyQrSignature.
  */
@@ -62,7 +64,12 @@ export async function loadVerifiedRequestForPublicToken(qrToken) {
   if (!rows.length) return null;
 
   const vr = rows[0];
-  if (vr.status !== "verified" || !vr.qr_signature) return null;
+  // BOTH terminal-success statuses count. An auto-verified request carries a
+  // signature and a token exactly like a manually verified one — autoApprove
+  // mints them through the same generateQrForRequest call — so its certificate
+  // has to stay publicly verifiable. Testing `status === "verified"` here would
+  // 404 every auto-approved certificate the moment the new status existed.
+  if (!isVerifiedStatus(vr.status) || !vr.qr_signature) return null;
 
   const signatureValid = verifyQrSignature({
     qrToken: vr.qr_token,

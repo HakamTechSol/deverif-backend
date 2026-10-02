@@ -388,11 +388,17 @@ export async function autoApprove(vr, confidence) {
   // The tenant invariant is restated on the write as well as the read: an
   // automatic outcome may only ever be recorded for a request that is addressed
   // to a real organization. Costless belt-and-braces on the one statement that
-  // flips a request to 'verified' without a human.
+  // closes a request without a human.
+  //
+  // The status written is 'auto_verified', not 'verified'. It is a terminal
+  // success like 'verified' — a certificate and a QR are minted below exactly as
+  // before — but it is distinguishable, so the submitter can be shown that the
+  // system approved their document and no reviewer ever saw it. Reads that mean
+  // "was this verified?" must test both values; see utils/verifiedStatuses.js.
   const [u] = await pool.query(
     `UPDATE verification_requests
        SET match_status='auto_matched', match_confidence=?,
-           status='verified', verified_at=NOW(), verification_method='automatic_match'
+           status='auto_verified', verified_at=NOW(), verification_method='automatic_match'
      WHERE id=? AND match_status='not_attempted' AND status='under_review'
        AND issuing_organization_id IS NOT NULL`,
     [confidence, vr.id]

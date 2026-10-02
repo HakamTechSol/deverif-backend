@@ -27,12 +27,21 @@ export async function listLeaveAllocations(req, res) {
     [orgId]
   );
 
+  // `e.status <> 'removed'` was here and was ALWAYS TRUE: 'removed' has never been
+  // a member of the status enum, so MySQL coerced the literal to index 0 and the
+  // predicate matched every row. The screen was therefore listing ex-employees —
+  // and every resigned/terminated row — alongside current staff, with no way to
+  // tell them apart. Now that status distinguishes them, filter properly.
+  //
+  // Deactivated ('inactive') employees ARE included: they remain on the roster
+  // and are still accruing/entitling leave, so excluding them would let an
+  // admin assign nothing to a colleague they merely switched off.
   const [employees] = await pool.query(
     `SELECT e.uuid AS employee_uuid, e.full_name, e.email, dg.name AS designation, dp.name AS department, e.status
      FROM employees e
      LEFT JOIN designations dg ON dg.id = e.designation_id
      LEFT JOIN departments dp ON dp.id = e.department_id
-     WHERE e.organization_id = ? AND e.status <> 'removed'
+     WHERE e.organization_id = ? AND e.status IN ('active','current_employee')
      ORDER BY e.full_name`,
     [orgId]
   );

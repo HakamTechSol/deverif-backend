@@ -16,7 +16,7 @@ import crypto from "node:crypto";
  * The document owner's CNIC was never part of that lookup. So the sequence
  *   1. Person A submits document D to org X; the org approves it.
  *   2. Person B submits the SAME bytes of D, claiming a different CNIC.
- * was auto-verified on the spot — never reaching the reviewing organization's
+ * was auto-verified on the spot â€” never reaching the reviewing organization's
  * inbox, with no human in the loop and no OCR. Because the row is born
  * 'verified', a publicly signed, tamper-evident QR certificate was minted for a
  * document B never held: document replay dressed up as identity verification.
@@ -25,7 +25,7 @@ import crypto from "node:crypto";
  * can only ever be inherited by the same identity. The fix joins `persons` and
  * requires `p.cnic_hash` to match, so the prior approval is scoped to a person
  * and not to a file. A legacy verified row with no linked person has no
- * identity to compare and confers no credit at all (fail closed → manual review).
+ * identity to compare and confers no credit at all (fail closed â†’ manual review).
  *
  * These tests pin that binding at the SQL level, and pin the two places it could
  * otherwise be quietly undone: the identity ledger (which recorded
@@ -34,7 +34,7 @@ import crypto from "node:crypto";
  * byte equality alone, discarding the reference's own CNIC evidence).
  *
  * NOTE ON THE MOCK: the prior-verified lookup is modelled as a faithful
- * implementation of its OWN statement — it reads the SQL and applies whichever
+ * implementation of its OWN statement â€” it reads the SQL and applies whichever
  * predicates that SQL actually binds, so it reproduces the vulnerable query's
  * behaviour exactly when the identity predicate is absent. A mock hard-wired to
  * require a cnic_hash match would be worse than useless: the vulnerable query
@@ -42,7 +42,7 @@ import crypto from "node:crypto";
  * comparison would never match, and the "a different person must not
  * auto-verify" tests would go green against the very bug they exist to catch.
  * Verified by running this file against the pre-fix code, where 13 of these 22
- * assertions fail — including every "a different person must not auto-verify"
+ * assertions fail â€” including every "a different person must not auto-verify"
  * case. The other 9 pass both before and after by design: they pin behaviour the
  * fix must not break (same-person repeats, the cross-org boundary, and the
  * fast path where the reference has no CNIC to contradict).
@@ -254,7 +254,7 @@ function installCreatePool({ priorApproved = null, orgId = ORG_ID, personByCnic 
  * Read the request INSERT's bound parameters BY COLUMN NAME.
  *
  * Positional assertions break whenever a column is inserted mid-statement, so
- * the column list is parsed instead — the same approach as
+ * the column list is parsed instead â€” the same approach as
  * tests/createRequest.test.js.
  */
 function insertedColumns() {
@@ -327,11 +327,11 @@ beforeEach(() => {
   runAutoMatchChecksSpy.mockResolvedValue(undefined);
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Part 1 — the prior-approval lookup is bound to a person, not to a file
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Part 1 â€” the prior-approval lookup is bound to a person, not to a file
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-describe("Part 1 — the exact-hash auto-verify lookup is scoped to one person", () => {
+describe("Part 1 â€” the exact-hash auto-verify lookup is scoped to one person", () => {
   it("joins persons and requires the same cnic_hash before granting auto-verify", async () => {
     installCreatePool({ priorApproved: priorApprovalFor({ cnicHash: CNIC_HASH_A }) });
 
@@ -340,7 +340,7 @@ describe("Part 1 — the exact-hash auto-verify lookup is scoped to one person",
     const lookup = priorVerifiedLookup();
     expect(lookup).toBeDefined();
     // The identity predicate is in the query itself, not applied as a post-filter
-    // in JS — a post-filter would still have to read every org's verified rows.
+    // in JS â€” a post-filter would still have to read every org's verified rows.
     expect(lookup[0]).toContain("JOIN persons p ON p.id = vr.linked_person_id");
     expect(lookup[0]).toContain("p.cnic_hash=?");
   });
@@ -353,7 +353,7 @@ describe("Part 1 — the exact-hash auto-verify lookup is scoped to one person",
     const [, params] = priorVerifiedLookup();
     expect(params[0]).toBe(DOC_HASH);
     expect(params[1]).toBe(ORG_ID);
-    // The third bound value is the submitter's own CNIC hash — the invariant.
+    // The third bound value is the submitter's own CNIC hash â€” the invariant.
     expect(params[2]).toBe(CNIC_HASH_A);
   });
 
@@ -364,7 +364,7 @@ describe("Part 1 — the exact-hash auto-verify lookup is scoped to one person",
     const res = await submit({ owner: OWNER_A });
 
     const cols = insertedColumns();
-    expect(cols.status).toBe("verified");
+    expect(cols.status).toBe("auto_verified");
     expect(cols.verification_method).toBe("auto");
     expect(cols.verified_at).toEqual(expect.any(Date));
     // The client still gets the "Auto Verified" confirmation.
@@ -480,19 +480,19 @@ describe("Part 1 — the exact-hash auto-verify lookup is scoped to one person",
     await submit({ owner: OWNER_A });
 
     expect(priorVerifiedLookup()[0]).not.toContain("organization_conserned_for_future");
-    expect(insertedColumns().status).toBe("verified");
+    expect(insertedColumns().status).toBe("auto_verified");
   });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Part 2 — an auto-verified request leaves real identity evidence behind
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Part 2 â€” an auto-verified request leaves real identity evidence behind
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-describe("Part 2 — the creation-time auto-verify path records a cross-check", () => {
+describe("Part 2 â€” the creation-time auto-verify path records a cross-check", () => {
   it("passes cross-check data to recordPersonDocument instead of null", async () => {
     // Passing null left person_documents.match_status on its 'not_checked'
     // DEFAULT, so the identity ledger held a "verified" outcome with no evidence
-    // of which document or person it had verified — exactly the row a reviewer
+    // of which document or person it had verified â€” exactly the row a reviewer
     // would consult to spot a replayed document.
     installCreatePool({ priorApproved: priorApprovalFor({ cnicHash: CNIC_HASH_A }) });
 
@@ -512,7 +512,7 @@ describe("Part 2 — the creation-time auto-verify path records a cross-check", 
 
     const [, , crossCheck] = recordPersonDocument.mock.calls[0];
     expect(crossCheck.extractedName).toBe(OWNER_A.document_owner_name);
-    // Hashed, never plaintext — same rule as persons.cnic_hash.
+    // Hashed, never plaintext â€” same rule as persons.cnic_hash.
     expect(crossCheck.extractedCnicHash).toBe(CNIC_HASH_A);
   });
 
@@ -525,7 +525,7 @@ describe("Part 2 — the creation-time auto-verify path records a cross-check", 
     const res = await submit({ owner: OWNER_A });
 
     expect(res.status).toHaveBeenCalledWith(201);
-    expect(insertedColumns().status).toBe("verified");
+    expect(insertedColumns().status).toBe("auto_verified");
     const [, , crossCheck] = recordPersonDocument.mock.calls[0];
     expect(crossCheck.matchStatus).toBe("not_checked");
     expect(crossCheck.reason).toMatch(/unavailable|failed/i);
@@ -556,11 +556,11 @@ describe("Part 2 — the creation-time auto-verify path records a cross-check", 
   });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Part 3 — the reference-match fast path cannot assert identity from bytes
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Part 3 â€” the reference-match fast path cannot assert identity from bytes
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-describe("Part 3 — autoMatch's exact-hash fast path is gated on identity", () => {
+describe("Part 3 â€” autoMatch's exact-hash fast path is gated on identity", () => {
   const REFERENCE_ID = 777;
 
   /** A reference row with a cached canonical CNIC of `cnicValue`. */
@@ -655,7 +655,7 @@ describe("Part 3 — autoMatch's exact-hash fast path is gated on identity", () 
   it("REGRESSION: refuses the shortcut when the reference names a different CNIC", async () => {
     // The suppression this guards against: the reference the org filed under
     // Person A carries Person B's CNIC, yet byte-identical bytes let Person B's
-    // submission be waved through at 100 — discarding the engine's strongest
+    // submission be waved through at 100 â€” discarding the engine's strongest
     // piece of counter-evidence. The canonical comparison must run instead.
     installSweepPool({
       request: stagedRequest(),
@@ -752,9 +752,9 @@ describe("Part 3 — autoMatch's exact-hash fast path is gated on identity", () 
   });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Part 4 — Node honours the service's own refusal
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Part 4 â€” Node honours the service's own refusal
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 //
 // The Python service can score a pair highly and still refuse to have it
 // approved: an identity-poor document type (a photograph, an NDA, a policy
@@ -773,7 +773,7 @@ describe("Part 3 — autoMatch's exact-hash fast path is gated on identity", () 
 // be read as a refusal, or every request would be stuck in manual review during
 // a partial rollout.
 
-describe("Part 4 — the document service's refusal is honoured before the threshold", () => {
+describe("Part 4 â€” the document service's refusal is honoured before the threshold", () => {
   const REFERENCE_ID = 777;
 
   /**

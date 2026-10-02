@@ -1,5 +1,6 @@
 import { pool } from "../config/db.js";
 import { ok } from "../utils/response.js";
+import { VERIFIED_STATUS_SQL } from "../utils/verifiedStatuses.js";
 
 export async function userDashboardStats(req, res) {
   const [usersCountRows] = await pool.query(
@@ -21,7 +22,11 @@ export async function userDashboardStats(req, res) {
     [req.user.id]
   );
   const [verifiedReqsRows] = await pool.query(
-    "SELECT COUNT(*) AS total FROM verification_requests WHERE user_id = ? AND status='verified'",
+    // Both terminal-success statuses: an auto-approved request is still a
+    // verified request as far as this counter is concerned, and counting only
+    // 'verified' would make the tiles stop summing to the request total the
+    // moment any request was approved by the system.
+    `SELECT COUNT(*) AS total FROM verification_requests WHERE user_id = ? AND status IN (${VERIFIED_STATUS_SQL})`,
     [req.user.id]
   );
   const [unverifiedReqsRows] = await pool.query(
@@ -75,7 +80,7 @@ export async function adminDashboardStats(req, res) {
     "SELECT COUNT(*) AS total FROM verification_requests"
   );
   const [verifiedReqsRows] = await pool.query(
-    "SELECT COUNT(*) AS total FROM verification_requests WHERE status='verified'"
+    `SELECT COUNT(*) AS total FROM verification_requests WHERE status IN (${VERIFIED_STATUS_SQL})`
   );
   const [unverifiedReqsRows] = await pool.query(
     "SELECT COUNT(*) AS total FROM verification_requests WHERE status='unverified'"

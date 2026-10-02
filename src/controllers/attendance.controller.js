@@ -296,7 +296,13 @@ export async function manualEntry(req, res) {
   if (emp.linked_user_uuid === req.user.uuid) {
     throw new ApiError(403, "Org admins cannot add manual attendance for themselves");
   }
-  if (emp.status !== "active") throw new ApiError(400, "Employee is inactive");
+  // "Active" here means on the current roster, which after the record_type merge
+  // is two enum values: 'current_employee' (normal) and 'active' (deactivated
+  // platform user). Reading only 'active' would have rejected every ordinary
+  // employee, since a newly created one is 'current_employee'.
+  if (!["active", "current_employee"].includes(emp.status)) {
+    throw new ApiError(400, "Employee is not a current employee of this organization");
+  }
 
   const status = check_out_time ? "checked_out" : "checked_in";
   try {

@@ -26,7 +26,10 @@ const ORG_SELECT = `organizations.id, organizations.uuid, organizations.name, or
 
   const ORG_LIST_SELECT = `${ORG_SELECT},
   (SELECT COUNT(*) FROM users u WHERE u.organization = organizations.id AND u.deleted_at IS NULL) AS users_count,
-  (SELECT COUNT(*) FROM employees e WHERE e.organization_id = organizations.id AND e.record_type='roster') AS employees_count,
+  -- Now explicitly current-employee only. This previously had NO status filter at all
+  -- (just record_type='roster'), so it was already over-counting resigned staff; the
+  -- merged column makes the correct predicate expressible for the first time.
+  (SELECT COUNT(*) FROM employees e WHERE e.organization_id = organizations.id AND e.status IN ('active','current_employee')) AS employees_count,
   (SELECT COUNT(*) FROM verification_requests vr WHERE vr.issuing_organization_id = organizations.id) AS requests_count,
   (SELECT u.full_name FROM users u WHERE u.organization = organizations.id AND u.org_role = 'org_admin' AND u.deleted_at IS NULL ORDER BY u.id ASC LIMIT 1) AS admin_name,
   (SELECT u.email FROM users u WHERE u.organization = organizations.id AND u.org_role = 'org_admin' AND u.deleted_at IS NULL ORDER BY u.id ASC LIMIT 1) AS admin_email`;

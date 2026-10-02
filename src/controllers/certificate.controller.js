@@ -6,6 +6,7 @@ import { generateCertificatePdf } from "../utils/certificatePdf.js";
 import { decryptCnic } from "../utils/personCrypto.js";
 import { maskCnic } from "../utils/certificateCode.js";
 import { ORGS_DIR } from "../config/uploadPaths.js";
+import { isVerifiedStatus } from "../utils/verifiedStatuses.js";
 import path from "node:path";
 
 /**
@@ -44,7 +45,11 @@ export async function downloadCertificate(req, res) {
     throw new ApiError(403, "You are not allowed to download this certificate");
   }
 
-  if (vr.status !== "verified") {
+  // Both terminal-success statuses get a certificate. An auto-verified request
+  // has the same token and signature as a manually verified one, so refusing it
+  // here would leave the requester holding a "verified" result with no
+  // certificate to download for it.
+  if (!isVerifiedStatus(vr.status)) {
     throw new ApiError(409, "Certificate is available once the request is verified");
   }
 

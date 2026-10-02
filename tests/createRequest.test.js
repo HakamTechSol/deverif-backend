@@ -138,7 +138,7 @@ beforeEach(() => {
   priorPersonDoc = null;
   validate.mockResolvedValue({ success: true, data: { valid: true } });
   // OCR finds nothing readable in this suite's dummy file, which resolves the
-  // cross-check to 'not_checked' with a logged reason — the fail-safe branch.
+  // cross-check to 'not_checked' with a logged reason â€” the fail-safe branch.
   ocrExtract.mockResolvedValue({ success: true, data: { document_type: null, fields: {} } });
   pool.query.mockImplementation(sqlRouter);
 });
@@ -147,7 +147,7 @@ beforeEach(() => {
  * Read the request INSERT's bound parameters BY COLUMN NAME.
  *
  * Positional assertions (params[8], params[9], ...) break every time a column is
- * added in the middle of the statement — which is exactly what happened when
+ * added in the middle of the statement â€” which is exactly what happened when
  * document_validation_status / document_validation_reason were inserted ahead of
  * the auto-verify columns, silently shifting six unrelated assertions. Parsing
  * the column list instead keeps these tests honest about what they claim to test.
@@ -159,7 +159,7 @@ function insertedColumns() {
   expect(call).toBeDefined();
 
   // NOW() is the only function call in the VALUES list, but it contains
-  // parentheses, so neutralise it before splitting on commas — otherwise the
+  // parentheses, so neutralise it before splitting on commas â€” otherwise the
   // simple regex stops at the first NOW() and captures a truncated value list.
   const sql = call[0].replace(/NOW\(\)/gi, "@now");
   const [, columnList, valueList] = sql.match(/\(([^)]*)\)\s*VALUES\s*\(([^)]*)\)/i);
@@ -176,7 +176,7 @@ function insertedColumns() {
   );
 }
 
-describe("createRequest — other_organization_name validation", () => {
+describe("createRequest â€” other_organization_name validation", () => {
   it("succeeds when an organization UUID is provided (other_organization_name optional)", async () => {
     pool.query.mockResolvedValueOnce([[{ id: 10 }]]);
 
@@ -250,7 +250,7 @@ describe("createRequest — other_organization_name validation", () => {
   });
 });
 
-describe("createRequest — submission_remarks validation", () => {
+describe("createRequest â€” submission_remarks validation", () => {
   it("succeeds with submission_remarks under 500 characters", async () => {
     pool.query.mockResolvedValueOnce([[{ id: 10 }]]);
 
@@ -307,7 +307,7 @@ describe("createRequest — submission_remarks validation", () => {
   });
 });
 
-describe("createRequest — required document owner fields", () => {
+describe("createRequest â€” required document owner fields", () => {
   it("rejects with 400 when document_owner_name is missing", async () => {
     const req = makeReq({
       body: { document_type: "Degree", document_owner_cnic: "42101-1234567-1" },
@@ -348,16 +348,16 @@ describe("createRequest — required document owner fields", () => {
   });
 });
 
-describe("createRequest — exact-hash auto-verification (same document, same person, same org)", () => {
+describe("createRequest â€” exact-hash auto-verification (same document, same person, same org)", () => {
   // The fast path's scope NARROWED when the document-replay bug was fixed: the
   // prior-approval lookup now also requires the person to match, so a document
   // an org already verified for one CNIC can no longer be auto-verified for
   // another. The identity binding itself is pinned in
   // tests/autoVerifyIdentityBinding.test.js; these cases keep proving the
-  // surviving behaviour — a genuine repeat by the same person still auto-verifies,
+  // surviving behaviour â€” a genuine repeat by the same person still auto-verifies,
   // and the legacy organization_conserned_for_future flag stays out of it.
   // (This pool answers the prior-verified read unconditionally, which is
-  // equivalent to "the person matches" — every use below is that case.)
+  // equivalent to "the person matches" â€” every use below is that case.)
   it("auto-verifies when the same SHA-256 hash was already verified by the issuing org", async () => {
     // 1st query resolves the org UUID; 2nd query returns a previously-verified
     // row with the matching document_hash -> autoVerify=true, no OCR involved.
@@ -375,14 +375,14 @@ describe("createRequest — exact-hash auto-verification (same document, same pe
     expect(res.status).toHaveBeenCalledWith(201);
 
     const cols = insertedColumns();
-    expect(cols.status).toBe("verified");
+    expect(cols.status).toBe("auto_verified");
     expect(cols.verification_method).toBe("auto");
     expect(cols.verified_at).toEqual(expect.any(Date)); // verified_at populated
   });
 
   it("auto-verifies a repeat even when the earlier verified row was flagged organization_conserned_for_future='no'", async () => {
     // Regression: the lookup used to require organization_conserned_for_future='yes',
-    // but that column was only ever written on an auto-verified insert — never on
+    // but that column was only ever written on an auto-verified insert â€” never on
     // the ordinary approve paths. So a document that had been approved through the
     // inbox (flag 'no') could never auto-verify on re-submission: the feature was
     // dead. A prior verified outcome is now sufficient on its own.
@@ -400,7 +400,7 @@ describe("createRequest — exact-hash auto-verification (same document, same pe
     expect(res.status).toHaveBeenCalledWith(201);
 
     const cols = insertedColumns();
-    expect(cols.status).toBe("verified");
+    expect(cols.status).toBe("auto_verified");
     expect(cols.verification_method).toBe("auto");
   });
 
@@ -516,7 +516,7 @@ describe("createRequest — exact-hash auto-verification (same document, same pe
   });
 });
 
-describe("createRequest — person identity context & ledger writes", () => {
+describe("createRequest â€” person identity context & ledger writes", () => {
   it("reports person_known=false when the CNIC has no persons row yet", async () => {
     pool.query.mockResolvedValueOnce([[{ id: 10 }]]); // org lookup
 

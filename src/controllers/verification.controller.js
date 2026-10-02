@@ -12,6 +12,7 @@ import { enforceRequestQuota } from "../utils/requestQuota.js";
 import { resolveUnmatchedOrg } from "../utils/unmatchedOrg.js";
 import { logAudit, getActorFromReq } from "../utils/auditLog.js";
 import { generateQrForRequest, withVerifyUrl, withVerifyUrls } from "../utils/qrCertificate.js";
+import { VERIFIED_STATUS_SQL, isVerifiedStatus } from "../utils/verifiedStatuses.js";
 import { runSlaChecks } from "../utils/slaChecks.js";
 import { runAutoMatchChecks, hasMatchMismatchRisk, computeMatchConfidence, autoApprove } from "../utils/autoMatch.js";
 import { buildDocumentCrossCheck } from "../utils/documentConsistency.js";
@@ -85,13 +86,27 @@ async function stageReferenceMatch(executor, orgId, normalizedCnic) {
     return { matchStatus: "no_reference_found", matchedEmployeeDocumentId: null };
   }
 
+  // ORDER BY, NOT a WHERE filter — this is a PREFERENCE ranking, and it has to
+  // stay one. A current employee's document is preferred as the match
+  // candidate, but an ex-employee's is a perfectly valid fallback: their
+  // reference documents are exactly what the auto-match engine exists to
+  // compare against. Turning this into `AND status = 'current_employee'` would
+  // drop that fallback and silently downgrade every request verified against an
+  // ex-employee to manual review, with no error anywhere.
+  //
+  // 'inactive' (deactivated) sorts last alongside ex-employee deliberately: a
+  // deactivated employee's documents are still on file, but a live colleague's
+  // is the better first choice.
+  const preferCurrent =
+    "(e.status IN ('active','current_employee'))";
+
   const [refRows] = await executor.query(
     `SELECT e.uuid AS employee_uuid, ed.id AS doc_id, ed.document_hash
      FROM employees e
      JOIN employee_documents ed ON ed.employee_uuid = e.uuid
      WHERE e.organization_id = ?
        AND REPLACE(REPLACE(e.cnic, '-', ''), ' ', '') = ?
-     ORDER BY (e.record_type = 'roster') DESC
+     ORDER BY ${preferCurrent} DESC
      LIMIT 1`,
     [orgId, normalizedCnic]
   );
@@ -103,7 +118,7 @@ async function stageReferenceMatch(executor, orgId, normalizedCnic) {
     `SELECT emp.uuid FROM employees emp
      WHERE emp.organization_id = ?
        AND REPLACE(REPLACE(emp.cnic, '-', ''), ' ', '') = ?
-     ORDER BY (emp.record_type = 'roster') DESC
+     ORDER BY (emp.status IN ('active','current_employee')) DESC
      LIMIT 1`,
     [orgId, normalizedCnic]
   );
@@ -289,7 +304,7 @@ export async function createRequest(req, res) {
        JOIN persons p ON p.id = vr.linked_person_id
        WHERE vr.document_hash=?
          AND vr.issuing_organization_id=?
-         AND vr.status='verified'
+         AND vr.status IN (${VERIFIED_STATUS_SQL})
          AND p.cnic_hash=?
        ORDER BY vr.verified_at DESC, vr.id DESC
        LIMIT 1`,
@@ -337,7 +352,12 @@ export async function createRequest(req, res) {
         document_type,
         orgId,
         unmatchedOrgId,
-        autoVerify ? "verified" : "under_review",
+        // A repeat of a file this organization has already verified is closed on
+        // the spot, with no reviewer involved — so it is recorded as
+        // 'auto_verified' rather than a plain 'verified'. The submitter can then
+        // see that the system made this decision, which a plain 'verified'
+        // (always meaning "a person approved it") would have misrepresented.
+        autoVerify ? "auto_verified" : "under_review",
         docPath,
         docFormat,
         documentHash,
@@ -879,20 +899,20 @@ export async function myInboxRequests(req, res) {
   const dateTo = typeof req.query.dateTo === "string" ? req.query.dateTo.trim() : "";
 
   // The inbox is the organization's ACTIONABLE queue. An automatic outcome has
-  // already been decided by the reference match, so listing it here meant the
-  // queue carried rows nobody could act on, mixed in with the ones that needed a
+  // already been decided by the engine, so listing it here meant the queue
+  // carried rows nobody could act on, mixed in with the ones that needed a
   // human — and the automatic ones looked identical to manual ones, so a
   // verifier could spend time "reviewing" a decision the system had made.
   //
   // Those outcomes are not lost: myAutoVerifiedRequests serves them as their own
-  // read-only ledger, and the frontend surfaces that as the "Auto Approved" tab on
-  // this same page. Both automatic methods are excluded, matching that ledger.
+  // read-only ledger (now selected by the same 'auto_verified' status).
   //
-  // NULL is kept: a request that has not been decided yet has no method.
-  let whereClause =
-    "WHERE vr.issuing_organization_id = ? " +
-    "AND (vr.verification_method IS NULL " +
-    "     OR vr.verification_method NOT IN ('automatic_match', 'auto'))";
+  // Filtered by STATUS, not by verification_method. The method list was the
+  // pre-migration workaround for automatic outcomes having no status of their
+  // own; keeping it would mean any future automatic path that set some other
+  // method value silently started appearing in a queue of work nobody can
+  // complete. The status is the one thing every automatic path sets.
+  let whereClause = "WHERE vr.issuing_organization_id = ? AND vr.status <> 'auto_verified'";
   const params = [req.user.organization];
 
   if (search) {
@@ -1112,12 +1132,14 @@ export async function myAutoVerifiedRequests(req, res) {
   const dateFrom = typeof req.query.dateFrom === "string" ? req.query.dateFrom.trim() : "";
   const dateTo = typeof req.query.dateTo === "string" ? req.query.dateTo.trim() : "";
 
-  // Both automatic outcomes count as "auto verified" for this ledger: the
-  // reference match ('automatic_match') and the repeat-of-an-already-verified
-  // file ('auto'). Neither ever appears in the inbox, so both belong here —
-  // otherwise they would be invisible in the product.
-  let whereClause =
-    "WHERE vr2.issuing_organization_id = ? AND vr2.status = 'verified' AND vr2.verification_method IN ('automatic_match', 'auto')";
+  // This ledger is now selected purely by status. It used to mean "verified AND
+  // one of the two automatic methods", which was the pre-migration workaround
+  // for automatic outcomes having no status of their own; the backfill in
+  // 20260930_add_auto_verified_status.sql moved every such row onto
+  // 'auto_verified', so the status alone identifies them. Keeping the old
+  // method filter as well would now be redundant and would hide a future method
+  // value that produced the same status.
+  let whereClause = "WHERE vr2.issuing_organization_id = ? AND vr2.status = 'auto_verified'";
   const params = [req.user.organization];
 
   if (search) {

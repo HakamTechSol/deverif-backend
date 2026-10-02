@@ -27,22 +27,31 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
  *     looks like a safety net that is not there.
  */
 
-const { sharedQuery, fakeConnection, syncSpy, syncBgSpy, syncStatusSpy } = vi.hoisted(() => {
-  const q = vi.fn();
-  return {
-    sharedQuery: q,
-    fakeConnection: {
-      query: q,
-      beginTransaction: vi.fn(),
-      commit: vi.fn(),
-      rollback: vi.fn(),
-      release: vi.fn(),
-    },
-    syncSpy: vi.fn().mockResolvedValue({ ok: true, sent: 47 }),
-    syncBgSpy: vi.fn(),
-    syncStatusSpy: vi.fn().mockResolvedValue({ reachable: true, catalogue_count: 47 }),
-  };
-});
+const { sharedQuery, fakeConnection, syncSpy, syncBgSpy, syncStatusSpy, supportedSchemaKeys } =
+  vi.hoisted(() => {
+    const q = vi.fn();
+    return {
+      sharedQuery: q,
+      fakeConnection: {
+        query: q,
+        beginTransaction: vi.fn(),
+        commit: vi.fn(),
+        rollback: vi.fn(),
+        release: vi.fn(),
+      },
+      syncSpy: vi.fn().mockResolvedValue({ ok: true, sent: 47 }),
+      syncBgSpy: vi.fn(),
+      syncStatusSpy: vi.fn().mockResolvedValue({ reachable: true, catalogue_count: 47 }),
+      // Stands in for GET /schemas on the document service. The registry is
+      // deliberately NOT reproduced in full here: the point of the change is
+      // that this list is no longer duplicated in application code, so the mock
+      // carries just the keys these tests exercise.
+      supportedSchemaKeys: vi.fn().mockResolvedValue({
+        reachable: true,
+        supported: new Set(["generic", "cnic", "passport", "resume", "photo"]),
+      }),
+    };
+  });
 
 vi.mock("../src/config/db.js", () => ({
   pool: { query: sharedQuery, getConnection: vi.fn(async () => fakeConnection) },
@@ -55,6 +64,11 @@ vi.mock("../src/services/documentTypeSync.js", () => ({
   syncDocumentTypesInBackground: syncBgSpy,
   getDocumentServiceSchemaStatus: syncStatusSpy,
   pushDocumentTypeCatalogue: syncSpy,
+  // The controller asks the document service which schema keys it can actually
+  // extract instead of comparing against a hard-coded list. Mocked as reachable
+  // so the create/update paths validate for real; tests that care about an
+  // unsupported key override this via supportedSchemaKeys.mockResolvedValue.
+  getSupportedSchemaKeys: supportedSchemaKeys,
 }));
 
 import { pool } from "../src/config/db.js";

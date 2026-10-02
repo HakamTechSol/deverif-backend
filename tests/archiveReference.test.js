@@ -38,9 +38,9 @@ beforeEach(() => {
 });
 
 describe("archiveReference", () => {
-  it("archives an in-org employee as a learned_reference (happy path)", async () => {
-    const emp = { uuid: EMP_UUID, organization_id: ORG_ID, status: "active", full_name: "Jane Roe" };
-    const archived = { ...emp, status: "resigned", record_type: "learned_reference" };
+  it("archives an in-org employee as an ex_employee (happy path)", async () => {
+    const emp = { uuid: EMP_UUID, organization_id: ORG_ID, status: "current_employee", full_name: "Jane Roe" };
+    const archived = { ...emp, status: "ex_employee" };
 
     pool.query
       .mockResolvedValueOnce(mockScopeOrg())   // resolveScopeOrganization
@@ -56,8 +56,10 @@ describe("archiveReference", () => {
     const updateCall = pool.query.mock.calls.find(([sql]) =>
       typeof sql === "string" && sql.startsWith("UPDATE employees")
     );
-    expect(updateCall[0]).toContain("record_type='learned_reference'");
-    expect(updateCall[0]).toContain("status='resigned'");
+    // One column, one value. This used to write record_type='learned_reference'
+    // AND status='resigned' — the dual-write the merge removed.
+    expect(updateCall[0]).toContain("status='ex_employee'");
+    expect(updateCall[0]).not.toContain("record_type");
     expect(updateCall[1]).toEqual([EMP_UUID]);
 
     const body = res.json.mock.calls[0][0];
@@ -66,11 +68,13 @@ describe("archiveReference", () => {
     expect(body.message).toBe("Employee archived as reference");
   });
 
-  it("keeps learned_reference rows visible to staff lists (record_type preserved)", async () => {
-    // Regression guard: archiving must NOT delete the row — it only toggles
-    // record_type + status, which is what the org dashboard filters rely on.
-    const emp = { uuid: EMP_UUID, organization_id: ORG_ID, status: "terminated", full_name: "Term Case" };
-    const archived = { ...emp, status: "resigned", record_type: "learned_reference" };
+  it("keeps ex_employee rows visible to staff lists (row is preserved)", async () => {
+    // Regression guard: archiving must NOT delete the row — it only moves it to
+    // the ex-employee status, which is what the org dashboard filters rely on.
+    // An archived employee keeps their documents, so the auto-match reference
+    // pool stays intact.
+    const emp = { uuid: EMP_UUID, organization_id: ORG_ID, status: "current_employee", full_name: "Term Case" };
+    const archived = { ...emp, status: "ex_employee" };
 
     pool.query
       .mockResolvedValueOnce(mockScopeOrg())
@@ -85,7 +89,7 @@ describe("archiveReference", () => {
       typeof sql === "string" && /^DELETE\b/.test(sql)
     );
     expect(deleteCall).toBeUndefined();
-    expect(res.json.mock.calls[0][0].data.employee.record_type).toBe("learned_reference");
+    expect(res.json.mock.calls[0][0].data.employee.status).toBe("ex_employee");
   });
 
   it("rejects archiving an employee from another organization (403)", async () => {
