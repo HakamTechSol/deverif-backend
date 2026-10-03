@@ -1,4 +1,4 @@
-import { Router } from "express";
+﻿import { Router } from "express";
 import ApiError from "../utils/ApiError.js";
 
 import unifiedAuth from "./auth.routes.js";
@@ -29,6 +29,7 @@ import orgRoutes from "./org.routes.js";
 import verifyRoutes from "./verify.routes.js";
 import documentsRoutes from "./documents.routes.js";
 import leavesRoutes from "./leaves.routes.js";
+import myLettersRoutes from "./myLetters.routes.js";
 import attendanceRoutes from "./attendance.routes.js";
 import salarySelfRoutes from "./salary.routes.js";
 import supportRoutes from "./support.routes.js";
@@ -54,7 +55,7 @@ const router = Router();
 
 router.use("/", dashboardRoutes);
 
-// Public marketing data (no auth) â€” consumed by the marketing/landing site.
+// Public marketing data (no auth) Ã¢â‚¬â€ consumed by the marketing/landing site.
 router.use("/marketing", marketingRoutes);
 
 // Public QR verification (no auth)
@@ -85,6 +86,8 @@ router.use("/document-types", documentTypes);
 router.use("/payment", paymentRoutes);
 router.use("/notifications", notificationRoutes);
 router.use("/leaves", leavesRoutes);
+// Employee portal: my own issued HR letters (self-service, any employee).
+router.use("/my-letters", myLettersRoutes);
 router.use("/attendance", attendanceRoutes);
 router.use("/salary-records", salarySelfRoutes);
 
@@ -106,7 +109,7 @@ router.use("/admin/document-types", adminDocumentTypes);
 router.use("/admin/database", adminDatabaseBackup);
 
 // Org-internal modules (employees, leave, attendance, payroll/salary) are 100%
-// Org-Admin-scoped. The System Admin must have NO access â€” not even view-only.
+// Org-Admin-scoped. The System Admin must have NO access Ã¢â‚¬â€ not even view-only.
 // Explicit 403 (instead of 404) so it's clear the block is intentional. Org
 // admins reach these through /org/* with org-scoped JWTs.
 function forbidOrgScopedModule(req, res, next) {
