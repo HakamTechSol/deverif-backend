@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+﻿import { randomUUID } from "node:crypto";
 import { pool } from "../config/db.js";
 import ApiError from "../utils/ApiError.js";
 import { assertUuid } from "../utils/publicResponse.js";
@@ -20,7 +20,7 @@ import {
  * The invariant worth stating up front: an ISSUED letter's `body_snapshot` is
  * immutable and the PDF and the QR both attest to that snapshot. Editing a
  * template therefore cannot retroactively change a letter an employee already
- * holds — which matters because these are the documents banks, embassies and
+ * holds â€” which matters because these are the documents banks, embassies and
  * background checkers ask for years later.
  *
  * A revoked letter keeps its row and its reference number but loses its
@@ -48,9 +48,45 @@ function letterTypeOrThrow(value) {
 }
 
 /**
+ * Normalise a JSON array column into a real array.
+ *
+ * MySQL JSON columns arrive from mysql2 as STRINGS, so a `merge_fields` value of
+ * ['a','b'] reaches Node as the text ["a","b"]. Returning that raw makes every
+ * client that trusts the declared type fail: a React page doing `tags.map(...)`
+ * throws "tags.slice(...).map is not a function", because slice() works on a
+ * string and map() does not.
+ *
+ * This is the same normalisation the rest of the codebase already does â€”
+ * plans.controller.js runs row.features through normalizePlanFeatures() and
+ * row.module_flags through parseModuleFlags() for exactly this reason. Skipping
+ * it here was the bug, so it is centralised rather than done ad hoc per column.
+ */
+function parseJsonArray(value) {
+  if (value == null) return [];
+  if (Array.isArray(value)) return value;
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      // Malformed JSON must not take the whole list down; an empty tag list
+      // degrades the palette, a thrown error blanks the page.
+      return [];
+    }
+  }
+  return [];
+}
+
+/** Apply the JSON-column normalisation to a template row. */
+function normalizeTemplate(row) {
+  if (!row) return row;
+  return { ...row, merge_fields: parseJsonArray(row.merge_fields) };
+}
+
+/**
  * Employee + org context used to fill a letter's automatic merge tags.
  *
- * employees has NO `designation` / `department` text columns — they were
+ * employees has NO `designation` / `department` text columns â€” they were
  * replaced by `designation_id` / `department_id` FKs into the managed catalogues
  * (see salary.controller.js, which joins the same way). Selecting the old text
  * columns is a hard ER_BAD_FIELD_ERROR, so this lives in one place to make that
@@ -100,8 +136,8 @@ async function loadLetterForOrg({ orgId, letterUuid, conn = pool, forUpdate = fa
  *
  * Callers must pass a row already aliased to `employee_name` (see
  * EMPLOYEE_CONTEXT_SELECT). Passing the raw employees row, where the column is
- * `full_name`, silently yields an unresolved $employee_name — a letter that
- * opens "Dear ," — which is why the alias lives in the shared SQL rather than at
+ * `full_name`, silently yields an unresolved $employee_name â€” a letter that
+ * opens "Dear ," â€” which is why the alias lives in the shared SQL rather than at
  * each call site.
  */
 function defaultsFromLetter(letter) {
@@ -169,7 +205,7 @@ export async function listTemplates({ orgId, letterType, includeInactive = false
       ORDER BY letter_type, name`,
     params
   );
-  return rows;
+  return rows.map(normalizeTemplate);
 }
 
 export async function getTemplate({ orgId, templateUuid }) {
@@ -180,7 +216,7 @@ export async function getTemplate({ orgId, templateUuid }) {
     [templateUuid, orgId]
   );
   if (!rows.length) throw new ApiError(404, "Template not found");
-  return rows[0];
+  return normalizeTemplate(rows[0]);
 }
 
 export async function createTemplate({ orgId, actorUuid, letterType, name, body }) {
@@ -377,6 +413,10 @@ export async function getLetter({ orgId, letterUuid, mergedValues }) {
   if (mergedValues) {
     letter.preview_values = mergedValues;
   }
+  // payload is a JSON column, so it arrives as a string. Normalise it for the
+  // same reason merge_fields is normalised — a client that trusts the declared
+  // Record<string,string> type will crash on the raw text.
+  letter.payload = parseJson(letter.payload);
   letter.verify_url =
     letter.qr_token && letter.status === "issued" ? buildLetterVerifyUrl(letter.qr_token) : null;
   return letter;
@@ -407,7 +447,7 @@ export async function issueLetter({ orgId, letterUuid, actorUuid, values }) {
       throw new ApiError(409, `This letter was already ${letter.status}`);
     }
 
-    // hr_letters has NO `body` column — only the frozen `body_snapshot`, which is
+    // hr_letters has NO `body` column â€” only the frozen `body_snapshot`, which is
     // written at issue time. The body therefore has to come from the template
     // this letter was created against. Reading a non-existent `letter.body`
     // yields undefined, which made every issuance fail with "no body to render".
@@ -441,7 +481,7 @@ export async function issueLetter({ orgId, letterUuid, actorUuid, values }) {
     if (unresolved.length) {
       throw new ApiError(
         400,
-        `Cannot issue: these merge tags have no value — ${unresolved.map((t) => `$${t}`).join(", ")}. ` +
+        `Cannot issue: these merge tags have no value â€” ${unresolved.map((t) => `$${t}`).join(", ")}. ` +
           "Supply them in the issue form."
       );
     }
@@ -482,7 +522,7 @@ export async function issueLetter({ orgId, letterUuid, actorUuid, values }) {
 /**
  * Revoke an issued letter.
  *
- * Clears `issued_at`, which is inside the signed payload — so the stored
+ * Clears `issued_at`, which is inside the signed payload â€” so the stored
  * signature can no longer validate and the public endpoint refuses the letter.
  * The reference number is released for reuse, and body_snapshot is retained:
  * the record of what was issued is exactly what must survive revocation.
@@ -620,4 +660,4 @@ function auditTemplate(actorUuid, action, orgId, entityId, details) {
   });
 }
 
-export { LETTER_TYPES, defaultsFromLetter, buildReferenceNumber, parseJson };
+export { LETTER_TYPES, defaultsFromLetter, buildReferenceNumber, parseJson, parseJsonArray, normalizeTemplate };
