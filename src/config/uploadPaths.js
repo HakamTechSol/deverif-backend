@@ -16,9 +16,16 @@ export const DOCS_DIR = path.join(UPLOAD_ROOT, "documents");
 export const PROFILES_DIR = path.join(UPLOAD_ROOT, "profiles");
 export const ORGS_DIR = path.join(UPLOAD_ROOT, "organizations");
 
+// Generic entity attachments (expense receipts, asset invoices, onboarding
+// documents, training certificates, travel tickets). Kept separate from
+// DOCS_DIR so a cleanup job that prunes verification uploads cannot reach HR
+// evidence, and so the file-type allow-list for each can differ: a receipt is a
+// phone photo, a verification document is not.
+export const ATTACHMENTS_DIR = path.join(UPLOAD_ROOT, "attachments");
+
 export function ensureUploadDirs() {
-  for (const dir of [UPLOAD_ROOT, DOCS_DIR, PROFILES_DIR, ORGS_DIR]) {
+  for (const dir of [UPLOAD_ROOT, DOCS_DIR, PROFILES_DIR, ORGS_DIR, ATTACHMENTS_DIR]) {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   }
-  return { UPLOAD_ROOT, DOCS_DIR, PROFILES_DIR, ORGS_DIR };
+  return { UPLOAD_ROOT, DOCS_DIR, PROFILES_DIR, ORGS_DIR, ATTACHMENTS_DIR };
 }
