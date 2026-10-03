@@ -122,6 +122,8 @@ function forbidOrgScopedModule(req, res, next) {
   "/admin/leaves",
   "/admin/attendance",
   "/admin/salary-records",
+  "/admin/hr-letters",
+  "/admin/letter-templates",
 ].forEach((p) => {
   router.use(p, forbidOrgScopedModule);
 });

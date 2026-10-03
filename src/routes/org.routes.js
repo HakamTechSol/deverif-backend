@@ -85,6 +85,21 @@ import {
 import {
   orgDashboardAnalytics,
 } from "../controllers/org/orgDashboardAnalytics.controller.js";
+import {
+  listTemplates,
+  getTemplate,
+  createTemplate,
+  updateTemplate,
+  deleteTemplate,
+  previewTemplate,
+  listLetters,
+  getLetter,
+  createLetter,
+  issueLetter,
+  revokeLetter,
+  deleteLetter,
+  downloadLetterPdf,
+} from "../controllers/org/hrLetters.controller.js";
 
 const router = Router();
 
@@ -109,6 +124,11 @@ const leaveMgmt = [...staff, requireModuleFeature("leave_management")];
 const leaveMgmtOwner = [...orgAdminsOnly, requireModuleFeature("leave_management")];
 const payrollMgmt = [...staff, requireModuleFeature("payroll_management")];
 const payrollMgmtOwner = [...orgAdminsOnly, requireModuleFeature("payroll_management")];
+
+// HR Letters. Staff manage letters; deleting a template is org-admin-only
+// because it is a shared org-wide resource every issued letter was rendered from.
+const hrLettersMgmt = [...staff, requireModuleFeature("hr_letters_management")];
+const hrLettersOwner = [...orgAdminsOnly, requireModuleFeature("hr_letters_management")];
 
 // ---- Employees ----
 // Staff can create/edit/list/view employees and upload documents. Only the
@@ -211,6 +231,26 @@ router.delete("/employees/:uuid/salary-components/:assignUuid", payrollMgmt, asy
 
 // ---- Payroll auto-generation (staff) ----
 router.post("/payroll/generate", payrollMgmt, asyncHandler(generatePayroll));
+
+// ---- HR Letters ----
+// Ordering note: the literal "/letter-templates" and "/hr-letters/preview" paths
+// are registered BEFORE the "/:uuid" patterns so they cannot be swallowed by the
+// uuid matcher. Same defensive pattern used for "/employees/reference".
+router.get("/letter-templates", hrLettersMgmt, asyncHandler(listTemplates));
+router.post("/letter-templates", hrLettersMgmt, asyncHandler(createTemplate));
+router.get("/letter-templates/:uuid", hrLettersMgmt, asyncHandler(getTemplate));
+router.put("/letter-templates/:uuid", hrLettersMgmt, asyncHandler(updateTemplate));
+router.delete("/letter-templates/:uuid", hrLettersOwner, asyncHandler(deleteTemplate));
+
+router.post("/letter-templates/:uuid/preview", hrLettersMgmt, asyncHandler(previewTemplate));
+
+router.get("/hr-letters", hrLettersMgmt, asyncHandler(listLetters));
+router.post("/hr-letters", hrLettersMgmt, asyncHandler(createLetter));
+router.get("/hr-letters/:uuid", hrLettersMgmt, asyncHandler(getLetter));
+router.post("/hr-letters/:uuid/issue", hrLettersMgmt, asyncHandler(issueLetter));
+router.post("/hr-letters/:uuid/revoke", hrLettersMgmt, asyncHandler(revokeLetter));
+router.delete("/hr-letters/:uuid", hrLettersMgmt, asyncHandler(deleteLetter));
+router.get("/hr-letters/:uuid/pdf", hrLettersMgmt, asyncHandler(downloadLetterPdf));
 
 // ---- Org dashboard analytics (staff) ----
 router.get("/dashboard/analytics", staff, asyncHandler(orgDashboardAnalytics));
