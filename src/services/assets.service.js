@@ -4,9 +4,18 @@ import { assertUuid } from "../utils/publicResponse.js";
 import { logAudit } from "../utils/auditLog.js";
 import { paginatedResponse } from "../utils/pagination.js";
 import { buildInsert, buildUpdateStrict, buildOrgScope, boolField } from "../utils/crudHelpers.js";
+import * as attachments from "./attachments.service.js";
 
 /**
  * Asset management: categories, inventory, custody, maintenance.
+ *
+ * FILES ARE ATTACHMENTS, NOT COLUMNS. Purchase receipts and maintenance
+ * invoices go through the polymorphic attachments table (entity_type 'asset' and
+ * 'asset_maintenance') rather than a receipt_path column. That is the house design
+ * — see 20261103_create_attachments.sql — and it is also the only version that
+ * gets tenant isolation (attachments filters organization_id), path-traversal
+ * defence (resolveAttachmentPath re-anchors against ATTACHMENTS_DIR), soft
+ * delete and an audit entry per upload. A bare path column had none of those.
  *
  * THE ONE RULE THAT SHAPES THIS WHOLE MODULE. An asset's status is never set by a
  * client. It is DERIVED from whether the asset currently has an open assignment
@@ -33,6 +42,18 @@ import { buildInsert, buildUpdateStrict, buildOrgScope, boolField } from "../uti
  * uuid 404s instead of leaking another tenant's inventory.
  */
 
+/** Attachment entity types, namespaced to match the attachments table. */
+export const ATTACHMENT_ENTITY = {
+  ASSET: "asset",
+  MAINTENANCE: "asset_maintenance",
+};
+
+/** Sub-categories, so receipts and invoices stay distinguishable on one entity. */
+export const ATTACHMENT_CATEGORY = {
+  RECEIPT: "purchase_receipt",
+  INVOICE: "maintenance_invoice",
+};
+
 export const ASSET_STATUSES = ["available", "assigned", "maintenance", "retired"];
 const RETURN_CONDITIONS = ["good", "damaged", "needs_maintenance"];
 
@@ -46,7 +67,6 @@ const ASSET_COLUMNS = [
   "purchase_date",
   "purchase_cost",
   "vendor",
-  "receipt_path",
   "warranty_expires_at",
   "notes",
 ];
@@ -319,11 +339,34 @@ export async function getAsset({ orgId, assetUuid }) {
     [assetUuid],
   );
 
+  // Attachments are resolved per job. Each lookup is isolated so one failing
+  // invoice query degrades to an empty list rather than a 500 that blanks the
+  // whole asset page, custody history included.
+  const jobsWithInvoices = await Promise.all(
+    jobs.map(async (job) => {
+      let invoices = [];
+      try {
+        invoices = await listInvoices({ orgId, jobUuid: job.uuid });
+      } catch {
+        invoices = [];
+      }
+      return { ...job, invoices };
+    }),
+  );
+
+  let receipts = [];
+  try {
+    receipts = await listReceipts({ orgId, assetUuid });
+  } catch {
+    receipts = [];
+  }
+
   return {
     ...asset,
     holder: history.find((h) => !h.returned_at) ?? null,
     assignments: history,
-    maintenance: jobs,
+    maintenance: jobsWithInvoices,
+    receipts,
   };
 }
 
@@ -376,7 +419,6 @@ export async function createAsset({ orgId, actorUuid, data }) {
         purchase_date: data.purchase_date || null,
         purchase_cost: data.purchase_cost ?? null,
         vendor: data.vendor ?? null,
-        receipt_path: data.receipt_path ?? null,
         warranty_expires_at: data.warranty_expires_at || null,
         notes: data.notes ?? null,
       },
@@ -431,7 +473,6 @@ export async function updateAsset({ orgId, actorUuid, assetUuid, data }) {
         purchase_date: data.purchase_date || null,
         purchase_cost: data.purchase_cost ?? null,
         vendor: data.vendor ?? null,
-        receipt_path: data.receipt_path ?? null,
         warranty_expires_at: data.warranty_expires_at || null,
         notes: data.notes ?? null,
       },
@@ -651,9 +692,9 @@ export async function reportMaintenance({ orgId, actorUuid, assetUuid, data }) {
     try {
       const [res] = await conn.query(
         `INSERT INTO asset_maintenance
-           (organization_id, asset_uuid, title, description, vendor, cost,
-            invoice_path, reported_by_uuid)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+(organization_id, asset_uuid, title, description, vendor, cost,
+             reported_by_uuid)
+          VALUES (?, ?, ?, ?, ?, ?, ?)`,
         [
           orgId,
           assetUuid,
@@ -661,7 +702,6 @@ export async function reportMaintenance({ orgId, actorUuid, assetUuid, data }) {
           data.description ?? null,
           data.vendor ?? null,
           data.cost ?? null,
-          data.invoice_path ?? null,
           actorUuid ?? null,
         ],
       );
@@ -739,6 +779,114 @@ export async function completeMaintenance({ orgId, actorUuid, jobUuid, data = {}
   } finally {
     conn.release();
   }
+}
+
+// ---------------------------------------------------------------------------
+// Attachments: purchase receipts and maintenance invoices
+// ---------------------------------------------------------------------------
+
+/**
+ * Attach a purchase receipt to an asset.
+ *
+ * The entity is verified to exist in THIS org before any file row is written.
+ * attachments.entity_uuid carries no foreign key — it points at a different table
+ * per entity_type — so nothing but this check stops an attachment being attached
+ * to another organization's asset. Without it, uploading a "receipt" against a
+ * guessed uuid would create a row that only fails much later, if at all.
+ */
+export async function attachReceipt({ orgId, actorUuid, assetUuid, files, category, description }) {
+  await loadAsset(orgId, assetUuid);
+  const rows = await attachments.createAttachments({
+    orgId,
+    entityType: ATTACHMENT_ENTITY.ASSET,
+    entityUuid: assetUuid,
+    uploadedByUuid: actorUuid ?? null,
+    category: category ?? ATTACHMENT_CATEGORY.RECEIPT,
+    description: description ?? null,
+    files,
+  });
+  audit(actorUuid, "asset.attachment.add", "asset", assetUuid, orgId, {
+    count: rows.length,
+    category: category ?? ATTACHMENT_CATEGORY.RECEIPT,
+  });
+  return rows;
+}
+
+/** Attach a repair invoice to a maintenance job, same ownership check first. */
+export async function attachInvoice({ orgId, actorUuid, jobUuid, files, description }) {
+  assertUuid(jobUuid, "Maintenance UUID");
+  const [[job]] = await pool.query(
+    "SELECT uuid FROM asset_maintenance WHERE uuid=? AND organization_id=?",
+    [jobUuid, orgId],
+  );
+  if (!job) throw new ApiError(404, "Maintenance job not found");
+
+  const rows = await attachments.createAttachments({
+    orgId,
+    entityType: ATTACHMENT_ENTITY.MAINTENANCE,
+    entityUuid: jobUuid,
+    uploadedByUuid: actorUuid ?? null,
+    category: ATTACHMENT_CATEGORY.INVOICE,
+    description: description ?? null,
+    files,
+  });
+  audit(actorUuid, "asset.maintenance.attachment.add", "asset_maintenance", jobUuid, orgId, {
+    count: rows.length,
+  });
+  return rows;
+}
+
+export function listReceipts({ orgId, assetUuid }) {
+  return attachments.listAttachments({
+    orgId,
+    entityType: ATTACHMENT_ENTITY.ASSET,
+    entityUuid: assetUuid,
+  });
+}
+
+export function listInvoices({ orgId, jobUuid }) {
+  return attachments.listAttachments({
+    orgId,
+    entityType: ATTACHMENT_ENTITY.MAINTENANCE,
+    entityUuid: jobUuid,
+  });
+}
+
+/**
+ * Soft-delete one of the entity's attachments.
+ *
+ * removeAttachment scopes by organization_id AND re-reads which entity owns the
+ * file, so a caller cannot delete another organization's file even holding a
+ * valid uuid. It does not itself confirm the file belongs to THIS asset, so the
+ * check is made here before delegating: without it, a sub-admin with any
+ * attachment uuid could strip a receipt off an asset they cannot see.
+ */
+export async function removeAssetAttachment({ orgId, actorUuid, attachmentUuid }) {
+  const [rows] = await pool.query(
+    `SELECT uuid, entity_type, entity_uuid FROM attachments
+      WHERE uuid=? AND organization_id=? AND deleted_at IS NULL`,
+    [attachmentUuid, orgId],
+  );
+  if (!rows.length) throw new ApiError(404, "Attachment not found");
+  if (![ATTACHMENT_ENTITY.ASSET, ATTACHMENT_ENTITY.MAINTENANCE].includes(rows[0].entity_type)) {
+    throw new ApiError(400, "That file does not belong to an asset");
+  }
+  // Confirms the owning entity is visible in this org.
+  if (rows[0].entity_type === ATTACHMENT_ENTITY.ASSET) {
+    await loadAsset(orgId, rows[0].entity_uuid);
+  } else {
+    const [[job]] = await pool.query(
+      "SELECT uuid FROM asset_maintenance WHERE uuid=? AND organization_id=?",
+      [rows[0].entity_uuid, orgId],
+    );
+    if (!job) throw new ApiError(404, "Attachment not found");
+  }
+  return attachments.removeAttachment({ orgId, attachmentUuid, actorUuid });
+}
+
+/** Stream an attachment, resolved through the shared path-traversal guard. */
+export function resolveAssetAttachment({ orgId, attachmentUuid }) {
+  return attachments.resolveForDownload({ orgId, attachmentUuid });
 }
 
 // ---------------------------------------------------------------------------

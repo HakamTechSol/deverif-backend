@@ -158,6 +158,66 @@ export async function completeMaintenance(req, res) {
 }
 
 // ---------------------------------------------------------------------------
+// Attachments: purchase receipts and repair invoices
+// ---------------------------------------------------------------------------
+
+export async function uploadReceipts(req, res) {
+  const rows = await assets.attachReceipt({
+    orgId: req.scopeOrgId,
+    actorUuid: req.user?.uuid,
+    assetUuid: req.params.uuid,
+    files: req.files ?? [],
+    category: typeof req.body?.category === "string" ? req.body.category : undefined,
+    description: req.body?.description ?? null,
+  });
+  return ok(res, { items: rows }, "Receipts uploaded");
+}
+
+export async function listReceipts(req, res) {
+  const rows = await assets.listReceipts({ orgId: req.scopeOrgId, assetUuid: req.params.uuid });
+  return ok(res, { items: rows }, "Receipts");
+}
+
+export async function uploadInvoices(req, res) {
+  const rows = await assets.attachInvoice({
+    orgId: req.scopeOrgId,
+    actorUuid: req.user?.uuid,
+    jobUuid: req.params.jobUuid,
+    files: req.files ?? [],
+    description: req.body?.description ?? null,
+  });
+  return ok(res, { items: rows }, "Invoices uploaded");
+}
+
+export async function listInvoices(req, res) {
+  const rows = await assets.listInvoices({ orgId: req.scopeOrgId, jobUuid: req.params.jobUuid });
+  return ok(res, { items: rows }, "Invoices");
+}
+
+export async function removeAttachment(req, res) {
+  const result = await assets.removeAssetAttachment({
+    orgId: req.scopeOrgId,
+    actorUuid: req.user?.uuid,
+    attachmentUuid: req.params.attachmentUuid,
+  });
+  return ok(res, result, "Attachment removed");
+}
+
+export async function downloadAttachment(req, res) {
+  const resolved = await assets.resolveAssetAttachment({
+    orgId: req.scopeOrgId,
+    attachmentUuid: req.params.attachmentUuid,
+  });
+
+  res.setHeader("Content-Type", resolved.mime_type || "application/octet-stream");
+  // Quoted and stripped of anything that could break out of the header, because
+  // file_name is attacker-influenced original-upload text.
+  const safeName = String(resolved.file_name || "download").replace(/[^\w.\- ]+/g, "_");
+  res.setHeader("Content-Disposition", `attachment; filename="${safeName}"`);
+  return res.sendFile(resolved.absolutePath);
+}
+
+// ---------------------------------------------------------------------------
 // Retirement
 // ---------------------------------------------------------------------------
 

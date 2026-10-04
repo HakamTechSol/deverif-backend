@@ -5,6 +5,7 @@ import requireActiveSubscription from "../middleware/requireActiveSubscription.j
 import requireModuleFeature from "../middleware/requireModuleFeature.js";
 import { createEmployeeLimiter } from "../middleware/rateLimiter.js";
 import { uploadDocs } from "../middleware/uploadDocs.js";
+import { uploadAttachments } from "../middleware/uploadAttachments.js";
 
 import {
   createEmployee,
@@ -280,6 +281,26 @@ router.post("/assets/:uuid/retire", assetMgmt, asyncHandler(retireAsset));
 router.post("/assets/:uuid/reinstate", assetMgmt, asyncHandler(reinstateAsset));
 router.get("/asset-maintenance", assetMgmt, asyncHandler(listMaintenance));
 router.post("/asset-maintenance/:jobUuid/complete", assetMgmt, asyncHandler(completeMaintenance));
+// Files go through the polymorphic attachments table, never a path column. See
+// 20261103_create_attachments.sql: a module keeps its own row and never grows a
+// file column, because attachments is what supplies tenant scoping, the
+// path-traversal guard, soft delete and the audit entry.
+router.get("/assets/:uuid/receipts", assetMgmt, asyncHandler(listReceipts));
+router.post(
+  "/assets/:uuid/receipts",
+  assetMgmt,
+  uploadAttachments.array("files", 10),
+  asyncHandler(uploadReceipts),
+);
+router.get("/asset-maintenance/:jobUuid/invoices", assetMgmt, asyncHandler(listInvoices));
+router.post(
+  "/asset-maintenance/:jobUuid/invoices",
+  assetMgmt,
+  uploadAttachments.array("files", 10),
+  asyncHandler(uploadInvoices),
+);
+router.delete("/asset-attachments/:attachmentUuid", assetMgmt, asyncHandler(removeAttachment));
+router.get("/asset-attachments/:attachmentUuid/download", assetMgmt, asyncHandler(downloadAttachment));
 
 // ---- Org dashboard analytics (staff) ----
 router.get("/dashboard/analytics", staff, asyncHandler(orgDashboardAnalytics));
@@ -289,6 +310,12 @@ import {
   createCategory,
   updateCategory,
   deleteCategory,
+  uploadReceipts,
+  listReceipts,
+  uploadInvoices,
+  listInvoices,
+  removeAttachment,
+  downloadAttachment,
   listAssets,
   createAsset,
   getAsset,

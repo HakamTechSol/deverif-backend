@@ -1,0 +1,42 @@
+Assets: purchase receipts and invoices as attachment entities
+
+Removes receipt_path from assets and invoice_path from asset_maintenance. Those
+columns contradicted the house design stated in 20261103_create_attachments.sql
+("a module keeps its own domain row and never grows a file column"), and that
+migration already listed assets as an anticipated entity_type.
+
+A path column is not an equivalent spelling of an attachment row. It gives up
+four things:
+
+  - TENANT ISOLATION. attachments filters organization_id on every query; a
+    column on `assets` has nothing to filter.
+  - PATH-TRAVERSAL DEFENCE. resolveAttachmentPath re-anchors a stored path
+    against ATTACHMENTS_DIR and refuses anything escaping it. A caller-supplied
+    path has no such guard, which is how a stored "../../.env" turns a download
+    into an arbitrary-file-read.
+  - SOFT DELETE, so a mistaken removal leaves a tombstone.
+  - AN AUDIT ENTRY per upload.
+
+entity_type values follow the table's namespacing: 'asset' for receipts and
+'asset_maintenance' for repair invoices, separated further by
+attachments.category.
+
+uploadAttachments middleware writes to ATTACHMENTS_DIR rather than reusing
+uploadDocs, which targets DOCS_DIR: attachments.service re-anchors stored paths
+against ATTACHMENTS_DIR, so a file written elsewhere would fail its own traversal
+guard at download time. The allow-list is isDocumentAllowed's, reused rather than
+restated, since a receipt is a document in exactly that sense.
+
+The ownership check before every upload is the load-bearing part. entity_uuid
+cannot carry a foreign key (it points at a different table per entity_type), so
+nothing but that check stops a receipt being attached to another organization's
+asset. Deletion additionally verifies the owning entity is visible in this org,
+because removeAttachment scopes by organization_id but not by asset, so without
+it a caller holding any attachment uuid could strip a receipt off an asset they
+cannot see.
+
+Asset detail resolves receipts and per-job invoices, each lookup isolated so a
+failing one degrades to an empty list rather than a 500 that blanks custody
+history too.
+
+67 files, 1239 tests passing.
