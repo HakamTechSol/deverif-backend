@@ -254,8 +254,54 @@ router.post("/hr-letters/:uuid/re-draft", hrLettersMgmt, asyncHandler(revertLett
 router.delete("/hr-letters/:uuid", hrLettersMgmt, asyncHandler(deleteLetter));
 router.get("/hr-letters/:uuid/pdf", hrLettersMgmt, asyncHandler(downloadLetterPdf));
 
+// ---- Assets ----
+// Gated on asset_management, which the plan flags already carry. Category
+// administration is org_admin-only: a sub-admin can move laptops around but must
+// not be able to redefine what classes of asset exist, because that changes what
+// the register reports on.
+const assetMgmt = [...staff, requireModuleFeature("asset_management")];
+const assetCategoryMgmt = [...orgAdminsOnly, requireModuleFeature("asset_management")];
+
+router.get("/asset-categories", assetCategoryMgmt, asyncHandler(listCategories));
+router.post("/asset-categories", assetCategoryMgmt, asyncHandler(createCategory));
+router.put("/asset-categories/:uuid", assetCategoryMgmt, asyncHandler(updateCategory));
+router.delete("/asset-categories/:uuid", assetCategoryMgmt, asyncHandler(deleteCategory));
+
+router.get("/assets", assetMgmt, asyncHandler(listAssets));
+router.post("/assets", assetMgmt, asyncHandler(createAsset));
+// Summary before /assets/:uuid so "summary" is not read as a uuid.
+router.get("/assets/summary", assetMgmt, asyncHandler(summary));
+router.get("/assets/:uuid", assetMgmt, asyncHandler(getAsset));
+router.put("/assets/:uuid", assetMgmt, asyncHandler(updateAsset));
+router.post("/assets/:uuid/assign", assetMgmt, asyncHandler(assignAsset));
+router.post("/assets/:uuid/return", assetMgmt, asyncHandler(returnAsset));
+router.post("/assets/:uuid/maintenance", assetMgmt, asyncHandler(reportMaintenance));
+router.post("/assets/:uuid/retire", assetMgmt, asyncHandler(retireAsset));
+router.post("/assets/:uuid/reinstate", assetMgmt, asyncHandler(reinstateAsset));
+router.get("/asset-maintenance", assetMgmt, asyncHandler(listMaintenance));
+router.post("/asset-maintenance/:jobUuid/complete", assetMgmt, asyncHandler(completeMaintenance));
+
 // ---- Org dashboard analytics (staff) ----
 router.get("/dashboard/analytics", staff, asyncHandler(orgDashboardAnalytics));
+
+import {
+  listCategories,
+  createCategory,
+  updateCategory,
+  deleteCategory,
+  listAssets,
+  createAsset,
+  getAsset,
+  updateAsset,
+  summary,
+  assignAsset,
+  returnAsset,
+  listMaintenance,
+  reportMaintenance,
+  completeMaintenance,
+  retireAsset,
+  reinstateAsset,
+} from "../controllers/org/assets.controller.js";
 
 export default router;
 
