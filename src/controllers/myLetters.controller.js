@@ -9,21 +9,28 @@ import { buildLetterVerifyUrl } from "../utils/letterQr.js";
  * Employee self-service for HR Letters.
  *
  * SCOPE IS THE WHOLE POINT. The requester is derived from the JWT via
- * req.scopeOrgId + the employees row linked to the authenticated user â€” NEVER
+ * req.scopeOrgId + the employees row linked to the authenticated user — NEVER
  * from a body or query parameter. There is deliberately no way to ask for
  * someone else's letters: no employee_uuid parameter exists to tamper with.
  * `/org/hr-letters` remains the staff view of the whole organization.
  *
  * Employees see ISSUED letters only. A draft is an unfinished internal document
  * and a revoked one has had its attestation withdrawn, so neither is exposed
- * here â€” showing a revoked letter as if it were still valid would be actively
+ * here — showing a revoked letter as if it were still valid would be actively
  * misleading, and the revocation reason is HR's to handle privately.
  */
 
-/** The employee record for the authenticated platform user, or null. */
+/**
+ * The employee record for the authenticated platform user, or null.
+ *
+ * Only `designation_id` exists on `employees`; the designation NAME lives in the
+ * `designations` table. Selecting a bare `designation` column here made every
+ * /my-letters route fail with ER_BAD_FIELD_ERROR (surfacing as a 500), and the
+ * value was never read by any caller anyway.
+ */
 async function employeeForUser(userUuid, orgId) {
   const [rows] = await pool.query(
-    `SELECT uuid, full_name, designation FROM employees
+    `SELECT uuid, full_name FROM employees
       WHERE organization_id=? AND linked_user_uuid=?`,
     [orgId, userUuid]
   );
@@ -33,7 +40,7 @@ async function employeeForUser(userUuid, orgId) {
 export async function listMyLetters(req, res) {
   const employee = await employeeForUser(req.user.uuid, req.scopeOrgId);
   if (!employee) {
-    // The user is not on the roster â€” a sub-admin or an org admin with no
+    // The user is not on the roster — a sub-admin or an org admin with no
     // employee record. Not an error, just nothing to show.
     return ok(res, paginatedResponse([], 0, 1, 20), "No letters");
   }
