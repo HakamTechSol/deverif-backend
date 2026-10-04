@@ -1,4 +1,4 @@
-﻿import { randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { pool } from "../config/db.js";
 import ApiError from "../utils/ApiError.js";
 import { assertUuid } from "../utils/publicResponse.js";

@@ -1,4 +1,4 @@
-﻿import { pool } from "../config/db.js";
+import { pool } from "../config/db.js";
 import ApiError from "../utils/ApiError.js";
 import { ok } from "../utils/response.js";
 import { parsePagination, paginatedResponse } from "../utils/pagination.js";
