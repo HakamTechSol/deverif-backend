@@ -33,6 +33,42 @@ export const MERGE_TAGS = [
 
 export const MANUAL_TAGS = MERGE_TAGS.filter((t) => t.source === "manual").map((t) => t.tag);
 
+const KNOWN_TAGS = new Set(MERGE_TAGS.map((t) => t.tag));
+
+const LABELS = new Map(MERGE_TAGS.map((t) => [t.tag, t.label]));
+
+/**
+ * Tags the issue form must collect from a human.
+ *
+ * DELIBERATELY NOT THE SAME AS MANUAL_TAGS, and this distinction was a real
+ * dead end. A manual tag is one nobody can ever derive, so it always needs a
+ * person. An AUTO tag that merely happens to be EMPTY for this employee - no CNIC
+ * on file, joining date never recorded - equally needs a person.
+ *
+ * Filtering by MANUAL_TAGS only meant such a tag landed in `unresolved` while
+ * being absent from `missing_manual`, so the issue form rendered no input for it
+ * and kept submit disabled (gated on `unresolved`). The letter could not be
+ * issued at all, with nothing on screen explaining why. $cnic hit this whenever
+ * the employee record had no CNIC.
+ *
+ * So: anything unresolved that we at least RECOGNISE is collectable. Only a
+ * genuinely unknown tag stays uncollectable, because there is no sensible field
+ * to show for it - that remains a template authoring bug.
+ */
+export function collectableTags(unresolved) {
+  return unresolved.filter((tag) => KNOWN_TAGS.has(tag));
+}
+
+/** Friendly label for a tag, e.g. "cnic" -> "CNIC". Falls back to the tag. */
+export function tagLabel(tag) {
+  return LABELS.get(String(tag).toLowerCase()) ?? String(tag);
+}
+
+/** Every tag's label, for a client that renders the whole palette at once. */
+export function allTagLabels() {
+  return Object.fromEntries(LABELS);
+}
+
 // Case-insensitive, and one character is enough: a template author may write
 // $x. It cannot misfire on money, because a currency amount never starts with a
 // letter or underscore.
@@ -63,8 +99,7 @@ export function extractTags(body) {
  * an employee, so issuance refuses rather than producing a broken document.
  */
 export function unknownTags(body) {
-  const known = new Set(MERGE_TAGS.map((t) => t.tag));
-  return extractTags(body).filter((tag) => !known.has(tag));
+  return extractTags(body).filter((tag) => !KNOWN_TAGS.has(tag));
 }
 
 /** Human-readable value: dates in en-PK, nulls as an empty string. */

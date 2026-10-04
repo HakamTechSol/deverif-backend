@@ -5,7 +5,13 @@ import ApiError from "../utils/ApiError.js";
 import { assertUuid } from "../utils/publicResponse.js";
 import { logAudit } from "../utils/auditLog.js";
 import { paginatedResponse } from "../utils/pagination.js";
-import { renderTemplate, validateBody, unknownTags, MANUAL_TAGS } from "../utils/letterMerge.js";
+import {
+  renderTemplate,
+  validateBody,
+  unknownTags,
+  collectableTags,
+  allTagLabels,
+} from "../utils/letterMerge.js";
 import { generateHrLetterPdf } from "../utils/hrLetterPdf.js";
 import { ORGS_DIR } from "../config/uploadPaths.js";
 import {
@@ -96,6 +102,7 @@ function normalizeTemplate(row) {
  */
 const EMPLOYEE_CONTEXT_SELECT = `
   SELECT e.full_name AS employee_name, e.joining_date,
+         e.cnic, e.phone AS employee_phone,
          dg.name AS designation, dp.name AS department,
          o.name AS organization_name, o.logo AS organization_logo
     FROM employees e
@@ -148,7 +155,9 @@ function defaultsFromLetter(letter) {
     designation: letter.designation ?? "",
     department: letter.department ?? "",
     joining_date: letter.joining_date ?? "",
-    cnic: "",
+    // Was hardcoded to "", so $cnic could never resolve: every letter using it
+    // printed the literal $cnic and issuance refused. Now read from the record.
+    cnic: letter.cnic ?? "",
     organization_name: letter.organization_name ?? "",
     issue_date: letter.issued_at ?? new Date(),
     letter_date: letter.issued_at ?? new Date(),
@@ -691,7 +700,13 @@ export async function previewTemplate({ orgId, employeeUuid, templateUuid, value
     text,
     unresolved,
     unknown: unknownTags(template.body),
-    missing_manual: unresolved.filter((t) => MANUAL_TAGS.includes(t)),
+    // Every recognised-but-empty tag, not just the always-manual ones, so the
+    // form offers an input for a missing CNIC or joining date instead of
+    // refusing to issue with no way forward. See collectableTags().
+    missing_manual: collectableTags(unresolved),
+    // Labels so the form can render "CNIC" rather than humanising "cnic" into
+    // "Cnic". Purely presentational; the tag key is what gets submitted.
+    tag_labels: allTagLabels(),
   };
 }
 
