@@ -100,11 +100,26 @@ function normalizeTemplate(row) {
  * columns is a hard ER_BAD_FIELD_ERROR, so this lives in one place to make that
  * mistake impossible to repeat.
  */
+/**
+ * The employee/organization columns every letter read must select.
+ *
+ * THIS IS ONE CONSTANT ON PURPOSE. Two separate queries used to assemble this
+ * context independently - one by employee_uuid for the preview, one by letter
+ * uuid for issue/revoke/download - and they drifted. $cnic was added to the
+ * preview query only, so the preview showed a correct CNIC while /issue still
+ * failed with "these merge tags have no value - $cnic", which reads as though
+ * the fix had not worked. Sharing the list means a column cannot be added to one
+ * path and forgotten in the other.
+ */
+const EMPLOYEE_CONTEXT_COLUMNS = `
+            e.full_name AS employee_name,
+            e.joining_date,
+            e.cnic,
+            dg.name AS designation, dp.name AS department,
+            o.name AS organization_name, o.logo AS organization_logo`;
+
 const EMPLOYEE_CONTEXT_SELECT = `
-  SELECT e.full_name AS employee_name, e.joining_date,
-         e.cnic, e.phone AS employee_phone,
-         dg.name AS designation, dp.name AS department,
-         o.name AS organization_name, o.logo AS organization_logo
+  SELECT${EMPLOYEE_CONTEXT_COLUMNS}
     FROM employees e
     JOIN organizations o ON o.id = e.organization_id
     LEFT JOIN designations dg ON dg.id = e.designation_id
@@ -120,9 +135,7 @@ async function loadEmployeeContext(orgId, employeeUuid) {
 async function loadLetterForOrg({ orgId, letterUuid, conn = pool, forUpdate = false }) {
   if (letterUuid) assertUuid(letterUuid, "Letter UUID");
   const [rows] = await conn.query(
-    `SELECT l.*, e.full_name AS employee_name,
-            dg.name AS designation, dp.name AS department,
-            e.joining_date, o.name AS organization_name, o.logo AS organization_logo
+    `SELECT l.*,${EMPLOYEE_CONTEXT_COLUMNS}
        FROM hr_letters l
        JOIN employees e ON e.uuid = l.employee_uuid
        JOIN organizations o ON o.id = l.organization_id
