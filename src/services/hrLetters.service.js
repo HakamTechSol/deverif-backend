@@ -20,7 +20,7 @@ import {
  * The invariant worth stating up front: an ISSUED letter's `body_snapshot` is
  * immutable and the PDF and the QR both attest to that snapshot. Editing a
  * template therefore cannot retroactively change a letter an employee already
- * holds â€” which matters because these are the documents banks, embassies and
+ * holds — which matters because these are the documents banks, embassies and
  * background checkers ask for years later.
  *
  * A revoked letter keeps its row and its reference number but loses its
@@ -56,7 +56,7 @@ function letterTypeOrThrow(value) {
  * throws "tags.slice(...).map is not a function", because slice() works on a
  * string and map() does not.
  *
- * This is the same normalisation the rest of the codebase already does â€”
+ * This is the same normalisation the rest of the codebase already does —
  * plans.controller.js runs row.features through normalizePlanFeatures() and
  * row.module_flags through parseModuleFlags() for exactly this reason. Skipping
  * it here was the bug, so it is centralised rather than done ad hoc per column.
@@ -86,7 +86,7 @@ function normalizeTemplate(row) {
 /**
  * Employee + org context used to fill a letter's automatic merge tags.
  *
- * employees has NO `designation` / `department` text columns â€” they were
+ * employees has NO `designation` / `department` text columns — they were
  * replaced by `designation_id` / `department_id` FKs into the managed catalogues
  * (see salary.controller.js, which joins the same way). Selecting the old text
  * columns is a hard ER_BAD_FIELD_ERROR, so this lives in one place to make that
@@ -136,8 +136,8 @@ async function loadLetterForOrg({ orgId, letterUuid, conn = pool, forUpdate = fa
  *
  * Callers must pass a row already aliased to `employee_name` (see
  * EMPLOYEE_CONTEXT_SELECT). Passing the raw employees row, where the column is
- * `full_name`, silently yields an unresolved $employee_name â€” a letter that
- * opens "Dear ," â€” which is why the alias lives in the shared SQL rather than at
+ * `full_name`, silently yields an unresolved $employee_name — a letter that
+ * opens "Dear ," — which is why the alias lives in the shared SQL rather than at
  * each call site.
  */
 function defaultsFromLetter(letter) {
@@ -388,7 +388,7 @@ export async function listLetters({ orgId, page, limit, offset, employeeUuid, le
   );
   const [rows] = await pool.query(
     `SELECT l.uuid, l.letter_type, l.reference_no, l.title, l.status, l.issued_at,
-            l.revoked_at, l.created_at, l.qr_token,
+            l.revoked_at, l.created_at, l.qr_token, l.template_uuid,
             e.uuid AS employee_uuid, e.full_name AS employee_name,
             dg.name AS designation
        FROM hr_letters l
@@ -447,7 +447,7 @@ export async function issueLetter({ orgId, letterUuid, actorUuid, values }) {
       throw new ApiError(409, `This letter was already ${letter.status}`);
     }
 
-    // hr_letters has NO `body` column â€” only the frozen `body_snapshot`, which is
+    // hr_letters has NO `body` column — only the frozen `body_snapshot`, which is
     // written at issue time. The body therefore has to come from the template
     // this letter was created against. Reading a non-existent `letter.body`
     // yields undefined, which made every issuance fail with "no body to render".
@@ -481,7 +481,7 @@ export async function issueLetter({ orgId, letterUuid, actorUuid, values }) {
     if (unresolved.length) {
       throw new ApiError(
         400,
-        `Cannot issue: these merge tags have no value â€” ${unresolved.map((t) => `$${t}`).join(", ")}. ` +
+        `Cannot issue: these merge tags have no value — ${unresolved.map((t) => `$${t}`).join(", ")}. ` +
           "Supply them in the issue form."
       );
     }
@@ -522,7 +522,7 @@ export async function issueLetter({ orgId, letterUuid, actorUuid, values }) {
 /**
  * Revoke an issued letter.
  *
- * Clears `issued_at`, which is inside the signed payload â€” so the stored
+ * Clears `issued_at`, which is inside the signed payload — so the stored
  * signature can no longer validate and the public endpoint refuses the letter.
  * The reference number is released for reuse, and body_snapshot is retained:
  * the record of what was issued is exactly what must survive revocation.
