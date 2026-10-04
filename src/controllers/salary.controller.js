@@ -84,8 +84,8 @@ function computedNet(basicSalary, allowancesTotal, deductionsTotal) {
 /**
  * Generate payroll for a whole month. For every employee (whether or not they
  * are a linked platform user) we look up their effective basic salary from
- * employee_salary_history and apply this org's salary_components â€” fixed
- * amounts and percentages â€” then store the totals in salary_records.
+ * employee_salary_history and apply this org's salary_components —” fixed
+ * amounts and percentages —” then store the totals in salary_records.
  * Net is computed automatically; it is never entered manually.
  */
 export async function generatePayroll(req, res) {

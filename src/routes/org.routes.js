@@ -210,7 +210,7 @@ router.get("/salary-records/:uuid/payslip", payrollMgmt, asyncHandler(downloadPa
 router.delete("/salary-records/:uuid", payrollMgmtOwner, asyncHandler(deleteSalaryRecord));
 router.delete("/salary-records/period/:year/:month", payrollMgmtOwner, asyncHandler(deleteSalaryPeriod));
 
-// ---- Salary components â€” unified allowances/deductions (staff; delete + status toggle = org_admin) ----
+// ---- Salary components —” unified allowances/deductions (staff; delete + status toggle = org_admin) ----
 router.get("/salary-components", payrollMgmt, asyncHandler(listSalaryComponents));
 router.post("/salary-components", payrollMgmt, asyncHandler(createSalaryComponent));
 router.put("/salary-components/:uuid", payrollMgmt, asyncHandler(updateSalaryComponent));

@@ -55,7 +55,7 @@ const router = Router();
 
 router.use("/", dashboardRoutes);
 
-// Public marketing data (no auth) Ã¢â‚¬â€ consumed by the marketing/landing site.
+// Public marketing data (no auth) Ã¢â‚¬— consumed by the marketing/landing site.
 router.use("/marketing", marketingRoutes);
 
 // Public QR verification (no auth)
@@ -109,7 +109,7 @@ router.use("/admin/document-types", adminDocumentTypes);
 router.use("/admin/database", adminDatabaseBackup);
 
 // Org-internal modules (employees, leave, attendance, payroll/salary) are 100%
-// Org-Admin-scoped. The System Admin must have NO access Ã¢â‚¬â€ not even view-only.
+// Org-Admin-scoped. The System Admin must have NO access Ã¢â‚¬— not even view-only.
 // Explicit 403 (instead of 404) so it's clear the block is intentional. Org
 // admins reach these through /org/* with org-scoped JWTs.
 function forbidOrgScopedModule(req, res, next) {
