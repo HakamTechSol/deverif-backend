@@ -97,6 +97,7 @@ import {
   createLetter,
   issueLetter,
   revokeLetter,
+  revertLetter,
   deleteLetter,
   downloadLetterPdf,
 } from "../controllers/org/hrLetters.controller.js";
@@ -249,6 +250,7 @@ router.post("/hr-letters", hrLettersMgmt, asyncHandler(createLetter));
 router.get("/hr-letters/:uuid", hrLettersMgmt, asyncHandler(getLetter));
 router.post("/hr-letters/:uuid/issue", hrLettersMgmt, asyncHandler(issueLetter));
 router.post("/hr-letters/:uuid/revoke", hrLettersMgmt, asyncHandler(revokeLetter));
+router.post("/hr-letters/:uuid/re-draft", hrLettersMgmt, asyncHandler(revertLetter));
 router.delete("/hr-letters/:uuid", hrLettersMgmt, asyncHandler(deleteLetter));
 router.get("/hr-letters/:uuid/pdf", hrLettersMgmt, asyncHandler(downloadLetterPdf));
 

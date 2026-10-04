@@ -138,6 +138,23 @@ export async function revokeLetter(req, res) {
   return ok(res, { letter }, "Letter revoked");
 }
 
+/**
+ * Return a revoked letter to draft.
+ *
+ * The re-issue is a separate, explicit step: reverting does NOT re-mint the QR
+ * or set issued_at. Doing that here would let one click put a letter back into
+ * circulation without anyone re-reading it, which is exactly what revoking was
+ * meant to prevent.
+ */
+export async function revertLetter(req, res) {
+  const letter = await letters.revertLetterToDraft({
+    orgId: req.scopeOrgId,
+    letterUuid: req.params.uuid,
+    actorUuid: req.user?.uuid,
+  });
+  return ok(res, { letter }, "Letter reverted to draft");
+}
+
 export async function deleteLetter(req, res) {
   await letters.deleteLetter({
     orgId: req.scopeOrgId,

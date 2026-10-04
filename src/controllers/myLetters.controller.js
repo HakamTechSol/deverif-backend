@@ -1,8 +1,11 @@
+import path from "node:path";
+
 import { pool } from "../config/db.js";
 import ApiError from "../utils/ApiError.js";
 import { ok } from "../utils/response.js";
 import { parsePagination, paginatedResponse } from "../utils/pagination.js";
 import { generateHrLetterPdf } from "../utils/hrLetterPdf.js";
+import { ORGS_DIR } from "../config/uploadPaths.js";
 import { buildLetterVerifyUrl } from "../utils/letterQr.js";
 
 /**
@@ -117,6 +120,18 @@ export async function getMyLetter(req, res) {
   );
 }
 
+/**
+ * Resolve a stored logo reference to an absolute path.
+ *
+ * basename() is load-bearing: the stored value is a relative path and must not
+ * be joined onto ORGS_DIR verbatim, or "../../.env" would escape the directory.
+ */
+function letterLogoFile(logoValue) {
+  if (!logoValue) return null;
+  const name = path.basename(String(logoValue).replace(/\\/g, "/"));
+  return name ? path.join(ORGS_DIR, name) : null;
+}
+
 export async function downloadMyLetterPdf(req, res) {
   const employee = await employeeForUser(req.user.uuid, req.scopeOrgId);
   if (!employee) throw new ApiError(404, "Letter not found");
@@ -124,7 +139,8 @@ export async function downloadMyLetterPdf(req, res) {
   const [rows] = await pool.query(
     `SELECT l.uuid, l.letter_type, l.reference_no, l.title, l.status,
             l.body_snapshot, l.issued_at, l.qr_token,
-            e.full_name AS employee_name, o.name AS organization_name
+            e.full_name AS employee_name, o.name AS organization_name,
+            o.logo AS organization_logo
        FROM hr_letters l
        JOIN employees e ON e.uuid = l.employee_uuid
        JOIN organizations o ON o.id = l.organization_id
@@ -138,6 +154,7 @@ export async function downloadMyLetterPdf(req, res) {
     letter,
     employeeName: letter.employee_name,
     organizationName: letter.organization_name,
+    organizationLogoPath: letterLogoFile(letter.organization_logo),
     verifyUrl: letter.qr_token ? buildLetterVerifyUrl(letter.qr_token) : null,
   });
 

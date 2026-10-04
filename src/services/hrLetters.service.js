@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import path from "node:path";
 import { pool } from "../config/db.js";
 import ApiError from "../utils/ApiError.js";
 import { assertUuid } from "../utils/publicResponse.js";
@@ -6,6 +7,7 @@ import { logAudit } from "../utils/auditLog.js";
 import { paginatedResponse } from "../utils/pagination.js";
 import { renderTemplate, validateBody, unknownTags, MANUAL_TAGS } from "../utils/letterMerge.js";
 import { generateHrLetterPdf } from "../utils/hrLetterPdf.js";
+import { ORGS_DIR } from "../config/uploadPaths.js";
 import {
   newLetterQrToken,
   signLetterData,
@@ -95,7 +97,7 @@ function normalizeTemplate(row) {
 const EMPLOYEE_CONTEXT_SELECT = `
   SELECT e.full_name AS employee_name, e.joining_date,
          dg.name AS designation, dp.name AS department,
-         o.name AS organization_name
+         o.name AS organization_name, o.logo AS organization_logo
     FROM employees e
     JOIN organizations o ON o.id = e.organization_id
     LEFT JOIN designations dg ON dg.id = e.designation_id
@@ -113,7 +115,7 @@ async function loadLetterForOrg({ orgId, letterUuid, conn = pool, forUpdate = fa
   const [rows] = await conn.query(
     `SELECT l.*, e.full_name AS employee_name,
             dg.name AS designation, dp.name AS department,
-            e.joining_date, o.name AS organization_name
+            e.joining_date, o.name AS organization_name, o.logo AS organization_logo
        FROM hr_letters l
        JOIN employees e ON e.uuid = l.employee_uuid
        JOIN organizations o ON o.id = l.organization_id
@@ -542,6 +544,45 @@ export async function revokeLetter({ orgId, letterUuid, actorUuid, reason }) {
   return getLetter({ orgId, letterUuid });
 }
 
+/**
+ * Return a REVOKED letter to draft so it can be corrected and issued again.
+ *
+ * This exists because revocation was previously a one-way door: revoking a
+ * letter for a typo left HR unable to fix it, since a revoked letter can neither
+ * be edited into a correct draft nor issued. That forced a re-create, which lost
+ * the reference number and the audit trail.
+ *
+ * Everything that made the letter attestable is cleared, and this mirrors
+ * revokeLetter exactly in reverse:
+ *   - qr_token / qr_signature  the old public link stops verifying immediately
+ *   - issued_at                the signature covers this timestamp
+ *   - revoked_at / reason      the revocation no longer applies
+ *   - body_snapshot            re-rendered from the template at the next issue,
+ *                              so a corrected template takes effect
+ *
+ * body_snapshot is deliberately NOT preserved: keeping it would make the
+ * re-issued letter identical to the revoked one, and the point is to correct it.
+ *
+ * The status guard makes this idempotent-safe: only a revoked letter moves, so
+ * a double submit cannot silently discard an issued letter's attestation.
+ */
+export async function revertLetterToDraft({ orgId, letterUuid, actorUuid }) {
+  assertUuid(letterUuid, "Letter UUID");
+  const [result] = await pool.query(
+    `UPDATE hr_letters
+        SET status='draft', revoked_at=NULL, revoked_reason=NULL, issued_at=NULL,
+            qr_token=NULL, qr_signature=NULL, body_snapshot=NULL
+      WHERE uuid=? AND organization_id=? AND status='revoked'`,
+    [letterUuid, orgId]
+  );
+  if (!result.affectedRows) {
+    throw new ApiError(409, "Only a revoked letter can be reverted to draft");
+  }
+
+  auditTemplate(actorUuid, "hr_letter.revert_to_draft", orgId, letterUuid, {});
+  return getLetter({ orgId, letterUuid });
+}
+
 export async function deleteLetter({ orgId, letterUuid, actorUuid }) {
   assertUuid(letterUuid, "Letter UUID");
   const letter = await loadLetterForOrg({ orgId, letterUuid });
@@ -552,6 +593,21 @@ export async function deleteLetter({ orgId, letterUuid, actorUuid }) {
   auditTemplate(actorUuid, "hr_letter.delete", orgId, letterUuid, {});
 }
 
+/**
+ * Resolve a stored logo reference to an absolute path.
+ *
+ * `basename` is load-bearing, not cosmetic: the stored value is a relative path
+ * like "uploads/organizations/org_x.jpeg" and must never be concatenated onto a
+ * base directory as-is, or a value of "../../.env" would escape ORGS_DIR. This
+ * mirrors how certificatePdf.js resolves the same column.
+ */
+function organizationLogoFile(logoValue) {
+  if (!logoValue) return null;
+  const name = path.basename(String(logoValue).replace(/\\/g, "/"));
+  if (!name) return null;
+  return path.join(ORGS_DIR, name);
+}
+
 /** Render and return the PDF, without persisting anything. */
 export async function renderLetterPdf({ orgId, letterUuid }) {
   const letter = await loadLetterForOrg({ orgId, letterUuid });
@@ -559,6 +615,7 @@ export async function renderLetterPdf({ orgId, letterUuid }) {
     letter,
     employeeName: letter.employee_name,
     organizationName: letter.organization_name,
+    organizationLogoPath: organizationLogoFile(letter.organization_logo),
     verifyUrl: letter.qr_token && letter.status === "issued" ? buildLetterVerifyUrl(letter.qr_token) : null,
   });
   return { buffer, filename: `${letter.reference_no.replace(/[^\w.-]+/g, "-")}.pdf` };
