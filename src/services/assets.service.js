@@ -118,12 +118,17 @@ async function categoryInOrg(orgId, categoryUuid, conn = pool) {
 }
 
 async function employeeInOrg(orgId, employeeUuid, conn = pool) {
-  if (!employeeUuid) throw new ApiError(400, "employee_uuid is required");
-  assertUuid(employeeUuid, "Employee UUID");
+  // Trim first. A dropdown that submits nothing sends undefined or ""; one that
+  // submits an unfilled input can send "   ". Left untrimmed, whitespace falls
+  // through to assertUuid and blames the client for a malformed UUID when the
+  // only real problem is that nobody was picked.
+  const wanted = typeof employeeUuid === "string" ? employeeUuid.trim() : employeeUuid;
+  if (!wanted) throw new ApiError(400, "Please select an employee");
+  assertUuid(wanted, "Employee UUID");
   const [rows] = await conn.query(
     `SELECT uuid, full_name, linked_user_uuid
        FROM employees WHERE uuid=? AND organization_id=?`,
-    [employeeUuid, orgId],
+    [wanted, orgId],
   );
   if (!rows.length) throw new ApiError(404, "Employee not found in this organization");
   return rows[0];
@@ -558,11 +563,16 @@ export async function assignAsset({ orgId, actorUuid, assetUuid, employeeUuid })
 
     const employee = await employeeInOrg(orgId, employeeUuid, conn);
 
+    // Write employee.uuid - the value the lookup just confirmed is a real
+    // employee in this organization - rather than echoing back whatever the
+    // client sent. The two are the same string today, but storing the client
+    // input means the assignment and the employee record can drift apart, and
+    // /my/assets resolves its employee by joining on exactly this column.
     const [res] = await conn.query(
       `INSERT INTO asset_assignments
          (organization_id, asset_uuid, employee_uuid, assigned_by_uuid)
        VALUES (?, ?, ?, ?)`,
-      [orgId, assetUuid, employeeUuid, actorUuid ?? null],
+      [orgId, assetUuid, employee.uuid, actorUuid ?? null],
     );
     const [[row]] = await conn.query("SELECT uuid FROM asset_assignments WHERE id=?", [res.insertId]);
 
@@ -571,7 +581,7 @@ export async function assignAsset({ orgId, actorUuid, assetUuid, employeeUuid })
 
     audit(actorUuid, "asset.assign", "asset", assetUuid, orgId, {
       assignment_uuid: row.uuid,
-      employee_uuid: employeeUuid,
+      employee_uuid: employee.uuid,
       employee_name: employee.full_name,
     });
     return {
