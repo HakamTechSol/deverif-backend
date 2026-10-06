@@ -89,7 +89,12 @@ router.use("/notifications", notificationRoutes);
 router.use("/leaves", leavesRoutes);
 // Employee portal: my own issued HR letters (self-service, any employee).
 router.use("/my-letters", myLettersRoutes);
-router.use("/my-assets", myAssetsRoutes);
+// Mounted at /my/assets, NOT /my-assets. The frontend calls "/my/assets", which
+// resolves to /api/v1/my/assets, and these two disagreed - the API answered on
+// /api/v1/my-assets while the app requested /api/v1/my/assets, so the page 404'd
+// with "Route not found" even though both halves existed and every unit test
+// passed. Nothing checked the mount path against the client's request.
+router.use("/my/assets", myAssetsRoutes);
 router.use("/attendance", attendanceRoutes);
 router.use("/salary-records", salarySelfRoutes);
 
