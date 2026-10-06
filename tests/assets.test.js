@@ -230,7 +230,9 @@ describe("assignment", () => {
     conn.query = vi.fn(async (sql) => {
       const s = String(sql);
       if (s.includes("FROM assets a")) return [[assetRow({ status })], []];
-      if (s.includes("FROM employees")) return [[{ uuid: EMPLOYEE, full_name: "Kinza" }], []];
+      if (s.includes("FROM employees")) {
+        return [[{ uuid: EMPLOYEE, full_name: "Kinza", linked_user_uuid: "user-uuid-1" }], []];
+      }
       if (s.includes("INSERT INTO asset_assignments")) {
         assigned = true;
         return [{ insertId: 5 }, []];
@@ -262,6 +264,55 @@ describe("assignment", () => {
 
     expect(result.status).toBe("assigned");
     expect(result.employee_name).toBe("Kinza");
+  });
+
+  it("reports whether the employee can actually see it on /my/assets", async () => {
+    // /my/assets resolves the employee from the session via linked_user_uuid, so
+    // this flag is the difference between "assigned" and "assigned but invisible
+    // to the person holding it".
+    await readyAsset("available");
+    const linked = await assets.assignAsset({
+      orgId: ORG,
+      actorUuid: ADMIN,
+      assetUuid: ASSET,
+      employeeUuid: EMPLOYEE,
+    });
+    expect(linked.employee_has_portal_account).toBe(true);
+  });
+
+  it("flags an employee with no portal account so the UI can warn", async () => {
+    // readyAsset installs its own query mock, so swap it afterwards.
+    const conn = await readyAsset("available");
+    let assigned = false;
+    conn.query = vi.fn(async (sql) => {
+      const s = String(sql);
+      if (s.includes("FROM assets a")) return [[assetRow({ status: "available" })], []];
+      if (s.includes("FROM employees")) {
+        // Nobody to log in as, so /my/assets can never resolve this employee.
+        return [[{ uuid: EMPLOYEE, full_name: "Kinza", linked_user_uuid: null }], []];
+      }
+      if (s.includes("INSERT INTO asset_assignments")) {
+        assigned = true;
+        return [{ insertId: 5 }, []];
+      }
+      if (s.includes("SELECT uuid FROM asset_assignments")) return [[{ uuid: "assign-1" }], []];
+      if (s.includes("FROM asset_maintenance WHERE asset_uuid")) return [[{ n: 0 }], []];
+      if (s.includes("FROM asset_assignments WHERE asset_uuid")) {
+        return [[{ n: assigned ? 1 : 0 }], []];
+      }
+      return [[], []];
+    });
+
+    const result = await assets.assignAsset({
+      orgId: ORG,
+      actorUuid: ADMIN,
+      assetUuid: ASSET,
+      employeeUuid: EMPLOYEE,
+    });
+    // The assignment still succeeds: withholding hardware over a login gap would
+    // be worse. The caller just has to be told it is not yet visible.
+    expect(result.status).toBe("assigned");
+    expect(result.employee_has_portal_account).toBe(false);
   });
 
   it("scopes the asset lookup to the organization", async () => {
@@ -317,7 +368,9 @@ describe("assignment", () => {
     conn.query = vi.fn(async (sql) => {
       const s = String(sql);
       if (s.includes("FROM assets a")) return [[assetRow({ status: "available" })], []];
-      if (s.includes("FROM employees")) return [[{ uuid: EMPLOYEE, full_name: "Kinza" }], []];
+      if (s.includes("FROM employees")) {
+      return [[{ uuid: EMPLOYEE, full_name: "Kinza", linked_user_uuid: "user-uuid-1" }], []];
+    }
       if (s.includes("INSERT INTO asset_assignments")) {
         throw Object.assign(new Error("dup"), { code: "ER_DUP_ENTRY" });
       }

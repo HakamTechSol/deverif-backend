@@ -121,7 +121,8 @@ async function employeeInOrg(orgId, employeeUuid, conn = pool) {
   if (!employeeUuid) throw new ApiError(400, "employee_uuid is required");
   assertUuid(employeeUuid, "Employee UUID");
   const [rows] = await conn.query(
-    "SELECT uuid, full_name FROM employees WHERE uuid=? AND organization_id=?",
+    `SELECT uuid, full_name, linked_user_uuid
+       FROM employees WHERE uuid=? AND organization_id=?`,
     [employeeUuid, orgId],
   );
   if (!rows.length) throw new ApiError(404, "Employee not found in this organization");
@@ -573,7 +574,17 @@ export async function assignAsset({ orgId, actorUuid, assetUuid, employeeUuid })
       employee_uuid: employeeUuid,
       employee_name: employee.full_name,
     });
-    return { assignment_uuid: row.uuid, status, employee_name: employee.full_name };
+    return {
+      assignment_uuid: row.uuid,
+      status,
+      employee_name: employee.full_name,
+      // Not a warning for its own sake: /my/assets resolves the employee FROM the
+      // session, i.e. via employees.linked_user_uuid. An employee with no portal
+      // account can therefore never see this asset, and the assignment looks
+      // perfectly healthy in every staff view. Saying so here is the only place
+      // anyone can still act on it.
+      employee_has_portal_account: Boolean(employee.linked_user_uuid),
+    };
   } catch (e) {
     await conn.rollback();
     // The generated-column unique key is the backstop; translate it rather than
