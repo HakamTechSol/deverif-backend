@@ -158,6 +158,24 @@ export async function completeMaintenance(req, res) {
 }
 
 // ---------------------------------------------------------------------------
+// Employee self-service
+// ---------------------------------------------------------------------------
+
+/**
+ * Assets assigned to the signed-in employee.
+ *
+ * Takes no parameters at all. That is the point: there is no employee_uuid to
+ * tamper with, and the answer is derived from the session.
+ */
+export async function listMyAssets(req, res) {
+  const items = await assets.listMyAssets({
+    orgId: req.scopeOrgId,
+    userUuid: req.user?.uuid,
+  });
+  return ok(res, { items }, "My assets");
+}
+
+// ---------------------------------------------------------------------------
 // Attachments: purchase receipts and repair invoices
 // ---------------------------------------------------------------------------
 

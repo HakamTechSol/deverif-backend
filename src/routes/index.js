@@ -30,6 +30,7 @@ import verifyRoutes from "./verify.routes.js";
 import documentsRoutes from "./documents.routes.js";
 import leavesRoutes from "./leaves.routes.js";
 import myLettersRoutes from "./myLetters.routes.js";
+import myAssetsRoutes from "./myAssets.routes.js";
 import attendanceRoutes from "./attendance.routes.js";
 import salarySelfRoutes from "./salary.routes.js";
 import supportRoutes from "./support.routes.js";
@@ -88,6 +89,7 @@ router.use("/notifications", notificationRoutes);
 router.use("/leaves", leavesRoutes);
 // Employee portal: my own issued HR letters (self-service, any employee).
 router.use("/my-letters", myLettersRoutes);
+router.use("/my-assets", myAssetsRoutes);
 router.use("/attendance", attendanceRoutes);
 router.use("/salary-records", salarySelfRoutes);
 

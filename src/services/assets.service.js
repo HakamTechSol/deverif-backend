@@ -782,6 +782,74 @@ export async function completeMaintenance({ orgId, actorUuid, jobUuid, data = {}
 }
 
 // ---------------------------------------------------------------------------
+// Employee self-service: MY assets
+// ---------------------------------------------------------------------------
+
+/**
+ * The employee record behind the authenticated platform user, or null.
+ *
+ * Derived from the JWT + org scope, never from a request parameter. There is
+ * deliberately no employee_uuid on the route: a caller who could name an id
+ * could ask for someone else's hardware.
+ */
+async function employeeForUser(orgId, userUuid) {
+  const [rows] = await pool.query(
+    "SELECT uuid, full_name FROM employees WHERE organization_id=? AND linked_user_uuid=?",
+    [orgId, userUuid],
+  );
+  return rows[0] ?? null;
+}
+
+/**
+ * Assets currently assigned to the signed-in employee.
+ *
+ * CURRENTLY, ONLY. The custody history stays with HR; an employee asking "what
+ * do I have" wants what is in their hands, and showing a returned laptop as still
+ * theirs invites a support ticket about a device they do not have.
+ *
+ * Only non-sensitive columns are returned: tag, category, model, serial and the
+ * assignment date. Deliberately NOT purchase_cost or vendor — an employee has no
+ * business seeing what the company paid, and including it would make this
+ * endpoint a way to read procurement figures.
+ */
+export async function listMyAssets({ orgId, userUuid }) {
+  const employee = await employeeForUser(orgId, userUuid);
+  // A sub-admin or org admin with no employee record simply has no assets. Not
+  // an error, and worth not treating as one: the employee portal renders for
+  // every org user.
+  if (!employee) return [];
+
+  const [rows] = await pool.query(
+    `SELECT a.uuid, a.asset_tag, a.name, a.model_details, a.serial_number,
+            a.warranty_expires_at, c.name AS category_name,
+            g.assigned_at, g.uuid AS assignment_uuid
+       FROM asset_assignments g
+       JOIN assets a ON a.uuid = g.asset_uuid
+       JOIN asset_categories c ON c.uuid = a.category_uuid
+      WHERE g.employee_uuid=? AND g.organization_id=? AND g.returned_at IS NULL
+        -- Defence in depth. An asset on a repair bench is not "currently
+        -- assigned to" anybody in any sense an employee should act on, and the
+        -- syncStatus invariant should already prevent it. Belt and braces,
+        -- because exposing a broken laptop as usable is worse than hiding it.
+        AND a.status = 'assigned'
+      ORDER BY g.assigned_at DESC`,
+    [employee.uuid, orgId],
+  );
+
+  return rows.map((r) => ({
+    uuid: r.uuid,
+    assignment_uuid: r.assignment_uuid,
+    asset_tag: r.asset_tag,
+    name: r.name,
+    category_name: r.category_name,
+    model_details: r.model_details,
+    serial_number: r.serial_number,
+    warranty_expires_at: r.warranty_expires_at,
+    assigned_at: r.assigned_at,
+  }));
+}
+
+// ---------------------------------------------------------------------------
 // Attachments: purchase receipts and maintenance invoices
 // ---------------------------------------------------------------------------
 
