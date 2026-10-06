@@ -1,7 +1,6 @@
 import { Router } from "express";
 import asyncHandler from "../utils/asyncHandler.js";
 import authUser from "../middleware/authUser.js";
-import requireRole from "../middleware/requireRole.js";
 import requireActiveSubscription from "../middleware/requireActiveSubscription.js";
 import requireModuleFeature from "../middleware/requireModuleFeature.js";
 import { listMyAssets } from "../controllers/org/assets.controller.js";
@@ -27,8 +26,9 @@ const router = Router();
 
 router.use(authUser);
 
-// authUser first so req.user exists. requireActiveSubscription and the module
-// gate follow; the role check is intentionally absent, see the note above.
+// authUser first so req.user AND req.scopeOrgId exist. The role check is
+// intentionally absent, see the note above; authUser is what publishes the
+// organization the controller scopes the query to.
 const selfService = [
   requireActiveSubscription,
   requireModuleFeature("asset_management"),

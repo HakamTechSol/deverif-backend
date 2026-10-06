@@ -422,7 +422,18 @@ export async function listEmployees(req, res) {
     // nothing at all. A sub-admin sees the whole org roster, which is also what
     // makes their approve/generate work meaningful — they need to see the people
     // whose documents they are reviewing.
-    if (req.user.org_role === ROLE_ORG_ADMIN) {
+    //
+    // ?scope=org opts OUT of it, and only out of it. The organization_id
+    // predicate above is unconditional, so this widens visibility WITHIN the
+    // caller's own org and can never reach another tenant.
+    //
+    // The asset Assign picker needs that: it is a picker over the company roster,
+    // not a work queue of "records I imported". With the filter applied, an
+    // org_admin physically could not hand a laptop to a colleague another admin
+    // had onboarded — the picker showed no such person, and the only visible
+    // symptom was that the company's own employees seemed not to exist.
+    const orgWide = req.query.scope === "org";
+    if (req.user.org_role === ROLE_ORG_ADMIN && !orgWide) {
       conditions.push("e.added_by_uuid = ?");
       params.push(req.user.uuid);
     }

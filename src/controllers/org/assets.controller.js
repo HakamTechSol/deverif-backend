@@ -169,7 +169,10 @@ export async function completeMaintenance(req, res) {
  */
 export async function listMyAssets(req, res) {
   const items = await assets.listMyAssets({
-    orgId: req.scopeOrgId,
+    // Same fallback the subscription lock and the module gate use. An orgId of
+    // undefined does not throw here - it matches no employee, so the employee
+    // holding a laptop is told they hold nothing.
+    orgId: req.scopeOrgId ?? req.user?.organization,
     userUuid: req.user?.uuid,
   });
   return ok(res, { items }, "My assets");

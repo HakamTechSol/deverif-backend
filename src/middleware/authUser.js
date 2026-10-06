@@ -46,6 +46,11 @@ export default async function authUser(req, res, next) {
     }
 
     req.user = rows[0];
+    // The authenticated org, exposed under the same name requireRole uses, so a
+    // controller on a route that only runs authUser reads the same field instead
+    // of `req.scopeOrgId` quietly being undefined and turning every
+    // organization_id = ? into organization_id = NULL.
+    req.scopeOrgId = rows[0].organization;
     next();
   } catch (e) {
     next(e);

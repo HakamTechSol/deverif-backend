@@ -338,7 +338,12 @@ export async function getAsset({ orgId, assetUuid }) {
     [assetUuid],
   );
   const [jobs] = await pool.query(
-    `SELECT uuid, title, description, status, vendor, cost, reported_at, completed_at
+    // completion_notes is selected because the column exists and the drawer shows
+    // it: how a job closed is the whole record of whether a repair happened, and
+    // a job that was CANCELLED rather than completed is indistinguishable from a
+    // completed one without it.
+    `SELECT uuid, title, description, status, vendor, cost, reported_at, completed_at,
+            completion_notes
        FROM asset_maintenance
       WHERE asset_uuid=?
       ORDER BY reported_at DESC`,
@@ -1063,7 +1068,7 @@ export async function assetSummary({ orgId }) {
     byStatus[r.status] = r.n;
     if (r.status !== "retired") totalValue += Number(r.value);
   }
-  const [[[{ n: maintenanceCost }]]] = await pool.query(
+  const [[{ n: maintenanceCost }]] = await pool.query(
     "SELECT COALESCE(SUM(cost),0) AS n FROM asset_maintenance WHERE organization_id=? AND status='completed'",
     [orgId],
   );

@@ -712,7 +712,7 @@ describe("listing", () => {
         ],
         [],
       ])
-      .mockResolvedValueOnce([[[{ n: "150.00" }]], []]);
+      .mockResolvedValueOnce([[{ n: "150.00" }], []]);
 
     const summary = await assets.assetSummary({ orgId: ORG });
     expect(summary.by_status.available).toBe(2);
