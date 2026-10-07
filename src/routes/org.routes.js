@@ -90,6 +90,19 @@ import {
   decideOvertimeRequest,
 } from "../controllers/org/overtime.controller.js";
 import {
+  listExitRequests,
+  listExitChecklistPending,
+  getExitRequestDetail,
+  submitExitRequest,
+  reviewExitRequest,
+  clearExitChecklistItem,
+  listExitAssets,
+  previewSettlement,
+  draftSettlement,
+  advanceSettlement,
+  completeExitRequest,
+} from "../controllers/org/offboarding.controller.js";
+import {
   orgDashboardAnalytics,
 } from "../controllers/org/orgDashboardAnalytics.controller.js";
 import {
@@ -254,6 +267,35 @@ router.post("/payroll/generate", payrollMgmt, asyncHandler(generatePayroll));
 router.get("/overtime-requests", payrollMgmt, asyncHandler(listOvertimeRequests));
 router.post("/overtime-requests", payrollMgmt, asyncHandler(createOvertimeRequest));
 router.post("/overtime-requests/:uuid/decide", payrollMgmt, asyncHandler(decideOvertimeRequest));
+
+// ---- Offboarding / exit management (staff) ----
+// Gated on separation_management, which already exists as a module flag; no new
+// entitlement was introduced for this.
+//
+// Ordering note: the literal "/offboarding/clearances" path is registered before
+// the "/offboarding/:uuid" pattern so "clearances" cannot be read as a uuid.
+// Same defensive pattern used for "/employees/reference" and "/hr-letters".
+const separationMgmt = [...staff, requireModuleFeature("separation_management")];
+
+router.get("/offboarding/clearances", separationMgmt, asyncHandler(listExitChecklistPending));
+router.get("/offboarding/exit-requests", separationMgmt, asyncHandler(listExitRequests));
+router.post("/offboarding/exit-requests", separationMgmt, asyncHandler(submitExitRequest));
+router.get("/offboarding/exit-requests/:uuid", separationMgmt, asyncHandler(getExitRequestDetail));
+router.post("/offboarding/exit-requests/:uuid/review", separationMgmt, asyncHandler(reviewExitRequest));
+router.post(
+  "/offboarding/exit-requests/:uuid/checklist/:checklistUuid",
+  separationMgmt,
+  asyncHandler(clearExitChecklistItem),
+);
+router.get("/offboarding/exit-requests/:uuid/assets", separationMgmt, asyncHandler(listExitAssets));
+router.get("/offboarding/exit-requests/:uuid/settlement", separationMgmt, asyncHandler(previewSettlement));
+router.post("/offboarding/exit-requests/:uuid/settlement", separationMgmt, asyncHandler(draftSettlement));
+router.post(
+  "/offboarding/exit-requests/:uuid/settlement/advance",
+  separationMgmt,
+  asyncHandler(advanceSettlement),
+);
+router.post("/offboarding/exit-requests/:uuid/complete", separationMgmt, asyncHandler(completeExitRequest));
 
 // ---- HR Letters ----
 // Ordering note: the literal "/letter-templates" and "/hr-letters/preview" paths

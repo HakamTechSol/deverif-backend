@@ -6,11 +6,9 @@ import { parsePagination, paginatedResponse } from "../utils/pagination.js";
 import { logAudit, getActorFromReq } from "../utils/auditLog.js";
 import { generatePayslipPdf } from "../utils/payslipPdf.js";
 import { randomUUID } from "node:crypto";
-import {
-  computeAutomaticLines,
-  getMonthlyAttendanceAndLeaveSummary,
-  insertSalaryRecordLines,
-} from "../services/payroll.service.js";
+import * as payrollService from "../services/payroll.service.js";
+const { computeAutomaticLines, getMonthlyAttendanceAndLeaveSummary, insertSalaryRecordLines } =
+  payrollService;
 
 const MONTHS = [
   "January", "February", "March", "April", "May", "June",
@@ -51,15 +49,6 @@ async function findEmployee(employeeUuid, orgId) {
 // ---------------------------------------------------------------------------
 // Payroll generation (automatic, from salary history + components)
 // ---------------------------------------------------------------------------
-
-function monthRange(month, year) {
-  const first = new Date(Date.UTC(year, month - 1, 1));
-  const last = new Date(Date.UTC(year, month, 0));
-  return {
-    firstDay: first.toISOString().slice(0, 10),
-    lastDay: last.toISOString().slice(0, 10),
-  };
-}
 
 /**
  * Everything about one employee for one month, with nothing written.
@@ -144,21 +133,16 @@ async function computeEmployeePayroll({ employeeUuid, orgId, m, y, conn }) {
   };
 }
 
-// Pick the effective (numeric) basic salary for a given month by matching the
-// month's last day against each period's [effective_from, effective_to] range.
+/**
+ * The employee's basic salary for the month, from the shared payroll service.
+ *
+ * Previously a local function. It now lives in payroll.service.js because the
+ * Full & Final settlement needs the identical figure to price a day of unused
+ * leave, and two copies of this rule is how FnF ends up quoting a daily rate
+ * that disagrees with the payslip it accompanies.
+ */
 async function effectiveBasicForMonth(employeeUuid, month, year, conn = pool) {
-  const { lastDay } = monthRange(month, year);
-  const [rows] = await conn.query(
-    `SELECT basic_salary
-     FROM employee_salary_history
-     WHERE employee_uuid=?
-       AND effective_from <= ?
-       AND (effective_to IS NULL OR effective_to >= ?)
-     ORDER BY effective_from DESC
-     LIMIT 1`,
-    [employeeUuid, lastDay, lastDay]
-  );
-  return rows.length ? rows[0].basic_salary : 0;
+  return payrollService.effectiveBasicForMonth({ employeeUuid, month, year, conn });
 }
 
 function computedNet(basicSalary, allowancesTotal, deductionsTotal) {

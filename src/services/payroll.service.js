@@ -1,6 +1,7 @@
 import ApiError from "../utils/ApiError.js";
 import { pool } from "../config/db.js";
 import { assertUuid } from "../utils/publicResponse.js";
+import { isoDate as normaliseIsoDate } from "../utils/dateRange.js";
 
 /**
  * Payroll's view of what actually happened in a month.
@@ -42,6 +43,35 @@ const LATES_PER_HALF_DAY = 3;
 
 /** Overtime is paid at this multiple of the hourly rate derived from basic. */
 const OVERTIME_RATE_MULTIPLIER = 1.5;
+
+/**
+ * The effective basic salary for a given month.
+ *
+ * Matched on the month's LAST day against each period's [effective_from,
+ * effective_to] range, newest period first.
+ *
+ * Lives here, not in the salary controller, because two features now need it and
+ * must not be able to disagree: monthly payroll, and the Full & Final settlement
+ * that pays out unused leave at a per-day rate. A second implementation of "the
+ * employee's salary that month" would let FnF quote a different daily rate from
+ * the payslip it sits beside, with no error anywhere - just a number nobody can
+ * reconcile.
+ */
+export async function effectiveBasicForMonth({ employeeUuid, orgId, month, year, conn = pool }) {
+  const { m, y } = assertMonthYear(month, year);
+  const { lastDay } = monthBounds(m, y);
+  const [rows] = await conn.query(
+    `SELECT basic_salary
+       FROM employee_salary_history
+      WHERE employee_uuid=?
+        AND effective_from <= ?
+        AND (effective_to IS NULL OR effective_to >= ?)
+      ORDER BY effective_from DESC
+      LIMIT 1`,
+    [employeeUuid, lastDay, lastDay],
+  );
+  return rows.length ? rows[0].basic_salary : 0;
+}
 
 export const PAYROLL_RULES = {
   LATE_AFTER_MINUTES,
@@ -131,28 +161,21 @@ export async function getWorkingDaysForMonth({ orgId, month, year, conn = pool }
 /**
  * Normalise a DATE column to YYYY-MM-DD.
  *
- * mysql2 hands DATE columns back as a JS Date at LOCAL midnight - '2026-10-01'
- * on a UTC+5 server arrives as 2026-09-30T19:00:00Z. Calling toISOString() on
- * that converts to UTC and silently shifts the calendar day BACKWARDS by one,
- * which in this module is not cosmetic: a holiday stored as 1 October stops
- * matching, leave lands on the wrong days, and attendance rows attach to the
- * wrong date. Every one of those produces a wrong pay figure rather than an
- * error, so the reading has to be local.
+ * Delegates to the shared helper in utils/leaveBalance.js, which is where this
+ * logic belongs and where it was WRONG until Phase 4: it read the UTC calendar
+ * fields of a value mysql2 had built at LOCAL midnight, so on this server (UTC+5)
+ * a stored 2026-10-01 came back as 2026-09-30. Holidays stopped matching, leave
+ * attached to the wrong days, and a 2-day leave request was charged 3.
  *
- * DATETIME columns are unaffected: they carry a real time of day and nothing
- * here normalises them.
+ * This function previously carried its own corrected copy, which is how the same
+ * bug existed in two places - one fixed, one live. One definition now, imported,
+ * because a payroll figure and a leave day count that disagree by a day are both
+ * wrong and neither reports an error.
+ *
+ * DATETIME columns are unaffected: they carry a real time of day and nothing here
+ * normalises them.
  */
-function isoDate(value) {
-  if (value instanceof Date) {
-    if (Number.isNaN(value.getTime())) return null;
-    const y = value.getFullYear();
-    const m = String(value.getMonth() + 1).padStart(2, "0");
-    const d = String(value.getDate()).padStart(2, "0");
-    return `${y}-${m}-${d}`;
-  }
-  // A string (dateStrings, or a driver configured otherwise) is already ISO.
-  return String(value).slice(0, 10);
-}
+const isoDate = (value) => normaliseIsoDate(value);
 
 /**
  * Approved leave in the month, split by whether it is paid.

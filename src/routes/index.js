@@ -31,6 +31,7 @@ import documentsRoutes from "./documents.routes.js";
 import leavesRoutes from "./leaves.routes.js";
 import myLettersRoutes from "./myLetters.routes.js";
 import myAssetsRoutes from "./myAssets.routes.js";
+import myResignationRoutes from "./myResignation.routes.js";
 import attendanceRoutes from "./attendance.routes.js";
 import salarySelfRoutes from "./salary.routes.js";
 import supportRoutes from "./support.routes.js";
@@ -95,6 +96,12 @@ router.use("/my-letters", myLettersRoutes);
 // with "Route not found" even though both halves existed and every unit test
 // passed. Nothing checked the mount path against the client's request.
 router.use("/my/assets", myAssetsRoutes);
+// Mounted at /my/resignation, NOT /my-resignation. The frontend and the API have
+// to agree on this one string exactly: the /my/assets sibling above shipped with
+// the two halves disagreeing (router mounted at /my-assets, client asking for
+// /my/assets) and the page 404'd with every unit test passing, because no test
+// read the mount path against the client's request.
+router.use("/my/resignation", myResignationRoutes);
 router.use("/attendance", attendanceRoutes);
 router.use("/salary-records", salarySelfRoutes);
 
