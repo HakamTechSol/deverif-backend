@@ -5,6 +5,12 @@ import { assertUuid } from "../utils/publicResponse.js";
 import { parsePagination, paginatedResponse } from "../utils/pagination.js";
 import { logAudit, getActorFromReq } from "../utils/auditLog.js";
 import { generatePayslipPdf } from "../utils/payslipPdf.js";
+import { randomUUID } from "node:crypto";
+import {
+  computeAutomaticLines,
+  getMonthlyAttendanceAndLeaveSummary,
+  insertSalaryRecordLines,
+} from "../services/payroll.service.js";
 
 const MONTHS = [
   "January", "February", "March", "April", "May", "June",
@@ -55,11 +61,94 @@ function monthRange(month, year) {
   };
 }
 
+/**
+ * Everything about one employee for one month, with nothing written.
+ *
+ * Deliberately side-effect free and shared by generate and preview, because the
+ * two MUST agree: a preview that computes a different number from the run it is
+ * previewing is worse than no preview, since it moves the number people approve.
+ * The previous code could not be reused this way because its component loop
+ * collapsed straight into an INSERT.
+ *
+ * Lines are produced in two groups. `componentLines` are the org's configured
+ * allowances and deductions; `autoLines` are the ones this module now derives
+ * from leave and attendance. They are kept apart because they are
+ * answerable-to differently: a component is "what we agreed", an automatic line
+ * is "what actually happened", and an employee disputing a payslip needs to be
+ * told which of the two they are looking at.
+ */
+async function computeEmployeePayroll({ employeeUuid, orgId, m, y, conn }) {
+  const basic = await effectiveBasicForMonth(employeeUuid, m, y, conn);
+
+  // Pull ONLY this employee's individually-assigned, active salary components.
+  // We use the per-employee amount (esc.amount), NOT the catalog's default_value,
+  // and never apply every active catalog component to every employee. Inactive
+  // assignments are excluded so they stop affecting future runs; already-generated
+  // records store computed totals and are never retroactively changed.
+  const [empComponents] = await conn.query(
+    `SELECT sc.name, sc.type, sc.is_percentage, esc.amount
+     FROM employee_salary_components esc
+     JOIN salary_components sc ON sc.id = esc.salary_component_id
+     WHERE esc.employee_uuid=? AND esc.is_active=1`,
+    [employeeUuid]
+  );
+
+  const componentLines = [];
+  let allowances = 0;
+  let deductions = 0;
+  for (const c of empComponents) {
+    let amt = Number(c.amount);
+    if (c.is_percentage) amt = Number(basic) * (amt / 100);
+    amt = moneyField(amt, c.name);
+    componentLines.push({
+      label: c.name,
+      type: c.type === "deduction" ? "deduction" : "earning",
+      source: "component",
+      amount: amt,
+      basis_value: null,
+      basis_unit: null,
+    });
+    if (c.type === "deduction") deductions += amt;
+    else allowances += amt;
+  }
+
+  const summary = await getMonthlyAttendanceAndLeaveSummary({
+    employeeUuid,
+    orgId,
+    month: m,
+    year: y,
+    conn,
+  });
+
+  const automatic = computeAutomaticLines({ summary, basicSalary: basic });
+
+  const lines = [
+    ...componentLines,
+    ...automatic.lines,
+  ];
+
+  const totalAllowances = moneyField(allowances + automatic.totalAddition, "allowances");
+  const totalDeductions = moneyField(deductions + automatic.totalDeduction, "deductions");
+
+  // Cap net at zero (deductions cannot exceed earnings).
+  const net = Math.max(0, computedNet(basic, totalAllowances, totalDeductions));
+
+  return {
+    basic,
+    allowances: totalAllowances,
+    deductions: totalDeductions,
+    net,
+    lines,
+    summary,
+    automatic,
+  };
+}
+
 // Pick the effective (numeric) basic salary for a given month by matching the
 // month's last day against each period's [effective_from, effective_to] range.
-async function effectiveBasicForMonth(employeeUuid, month, year) {
+async function effectiveBasicForMonth(employeeUuid, month, year, conn = pool) {
   const { lastDay } = monthRange(month, year);
-  const [rows] = await pool.query(
+  const [rows] = await conn.query(
     `SELECT basic_salary
      FROM employee_salary_history
      WHERE employee_uuid=?
@@ -180,42 +269,42 @@ export async function generatePayroll(req, res) {
     const createdBy = req.user?.id ?? null;
 
     for (const emp of employees) {
-      const basic = await effectiveBasicForMonth(emp.uuid, m, y);
+      const computed = await computeEmployeePayroll({ employeeUuid: emp.uuid, orgId, m, y, conn });
 
-      // Pull ONLY this employee's individually-assigned, active salary
-      // components (from employee_salary_components, joined with the catalog
-      // for type). We use the per-employee amount (esc.amount), NOT the
-      // catalog's default_value, and never apply every active catalog
-      // component to every employee. Inactive assignments are excluded so they
-      // stop affecting future runs; already-generated records store computed
-      // totals and are never retroactively changed.
-      const [empComponents] = await conn.query(
-        `SELECT sc.name, sc.type, sc.is_percentage, esc.amount
-         FROM employee_salary_components esc
-         JOIN salary_components sc ON sc.id = esc.salary_component_id
-         WHERE esc.employee_uuid=? AND esc.is_active=1`,
-        [emp.uuid]
-      );
-
-      let allowances = 0;
-      let deductions = 0;
-      for (const c of empComponents) {
-        let amt = Number(c.amount);
-        if (c.is_percentage) amt = basic * (amt / 100);
-        amt = Math.round(amt * 100) / 100;
-        if (c.type === "deduction") deductions += amt;
-        else allowances += amt;
-      }
-      // Cap net at zero (deductions cannot exceed earnings).
-      const net = Math.max(0, computedNet(basic, allowances, deductions));
+      // The record's own uuid is generated here rather than by the table, because
+      // salary_record_lines has to point at it and the two are written in the same
+      // transaction. UUID() inside the INSERT would return the value to nobody.
+      const recordUuid = randomUUID();
 
       await conn.query(
         `INSERT INTO salary_records
            (uuid, employee_uuid, organization_id, month, year, basic_salary,
             allowances, deductions, net_salary, notes, created_by, created_at)
-         VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
-        [emp.uuid, orgId, m, y, basic, allowances, deductions, net, null, createdBy]
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
+        [
+          recordUuid,
+          emp.uuid,
+          orgId,
+          m,
+          y,
+          computed.basic,
+          computed.allowances,
+          computed.deductions,
+          computed.net,
+          null,
+          createdBy,
+        ]
       );
+
+      await insertSalaryRecordLines({
+        conn,
+        recordUuid,
+        orgId,
+        employeeUuid: emp.uuid,
+        month: m,
+        year: y,
+        lines: computed.lines,
+      });
     }
 
     await conn.commit();
@@ -247,7 +336,88 @@ export async function generatePayroll(req, res) {
     req,
   });
 
-  return ok(res, { items: rows, month: m, year: y, count: rows.length, skipped }, "Payroll generated from salary history and components");
+  return ok(res, { items: rows, month: m, year: y, count: rows.length, skipped }, "Payroll generated from salary history, components, leave and attendance");
+}
+
+// ---------------------------------------------------------------------------
+// Preview: the same computation, written nowhere.
+//
+// Auto-computed deductions are the part of a payslip people contest, so the
+// number has to be inspectable BEFORE it is committed — not discoverable a month
+// later from a stored total. This runs the identical computeEmployeePayroll the
+// generate path runs, on the same connection shape, so a preview and the run it
+// precedes cannot disagree.
+//
+// It takes no transaction and writes nothing: no salary_records row, no
+// salary_record_lines row, no audit entry. A GET that mutated payroll state would
+// be a trap, and the endpoint is registered as POST only because the request body
+// carries month/year/employee selection rather than a query string.
+// ---------------------------------------------------------------------------
+
+export async function previewPayroll(req, res) {
+  const orgId = req.scopeOrgId;
+  const { month, year, employee_uuids } = req.body || {};
+  const { m, y } = monthYearFields(month, year);
+
+  const selected = Array.isArray(employee_uuids) ? employee_uuids.filter(Boolean) : [];
+  let employees;
+  if (selected.length) {
+    const placeholders = selected.map(() => "?").join(",");
+    [employees] = await pool.query(
+      `SELECT uuid, full_name FROM employees WHERE organization_id=? AND uuid IN (${placeholders})
+        ORDER BY full_name`,
+      [orgId, ...selected]
+    );
+    if (!employees.length) {
+      throw new ApiError(404, "None of the selected employees exist in this organization");
+    }
+  } else {
+    [employees] = await pool.query(
+      `SELECT uuid, full_name FROM employees WHERE organization_id=? ORDER BY full_name`,
+      [orgId]
+    );
+  }
+
+  const items = [];
+  for (const emp of employees) {
+    const computed = await computeEmployeePayroll({ employeeUuid: emp.uuid, orgId, m, y, conn: pool });
+    items.push({
+      employee_uuid: emp.uuid,
+      employee_name: emp.full_name,
+      basic_salary: computed.basic,
+      allowances: computed.allowances,
+      deductions: computed.deductions,
+      net_salary: computed.net,
+      lines: computed.lines,
+      attendance: {
+        working_days: computed.summary.workingDays,
+        attended_days: computed.summary.attendedDays,
+        absent_days: computed.summary.absentDays,
+        late_count: computed.summary.lateCount,
+        paid_leave_days: computed.summary.paidLeaveDays,
+        unpaid_leave_days: computed.summary.unpaidLeaveDays,
+        approved_overtime_hours: computed.summary.approvedOvertimeHours,
+        holidays_in_month: computed.summary.holidayCount,
+      },
+      rates: {
+        per_day: computed.automatic.perDayRate,
+        hourly: computed.automatic.hourlyRate,
+        skip_reason: computed.automatic.skipReason,
+      },
+    });
+  }
+
+  const totals = items.reduce(
+    (acc, i) => ({
+      basic: moneyField(acc.basic + Number(i.basic_salary), "basic"),
+      allowances: moneyField(acc.allowances + Number(i.allowances), "allowances"),
+      deductions: moneyField(acc.deductions + Number(i.deductions), "deductions"),
+      net: moneyField(acc.net + Number(i.net_salary), "net"),
+    }),
+    { basic: 0, allowances: 0, deductions: 0, net: 0 },
+  );
+
+  return ok(res, { month: m, year: y, items, totals, count: items.length }, "Payroll preview");
 }
 
 // ---------------------------------------------------------------------------

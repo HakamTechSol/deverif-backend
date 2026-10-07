@@ -37,7 +37,7 @@ async function resolveScopeOrgId(req) {
 export async function listLeaveTypes(req, res) {
   const orgId = await resolveScopeOrgId(req);
   const [rows] = await pool.query(
-    `SELECT lt.id, lt.name, lt.days_allowed_per_year, lt.created_at,
+    `SELECT lt.id, lt.name, lt.days_allowed_per_year, lt.is_paid, lt.created_at,
             o.uuid AS organization_uuid, o.name AS organization_name
      FROM leave_types lt
      JOIN organizations o ON o.id = lt.organization_id
@@ -48,9 +48,25 @@ export async function listLeaveTypes(req, res) {
   return ok(res, { leaveTypes: rows }, "Leave types");
 }
 
+/**
+ * Normalise a paid/unpaid marker to the column's enum.
+ *
+ * Defaults to 'yes' when absent, for the same reason the column itself defaults
+ * to 'yes': Annual and Sick are paid by law, and a missing flag must never be
+ * read as a reason to dock pay. "no" is the value that has to be asked for.
+ */
+function paidFlag(value) {
+  if (value === undefined || value === null || value === "") return "yes";
+  if (typeof value === "boolean") return value ? "yes" : "no";
+  const s = String(value).toLowerCase();
+  if (s === "no" || s === "false" || s === "0") return "no";
+  if (s === "yes" || s === "true" || s === "1") return "yes";
+  throw new ApiError(400, "is_paid must be yes/no");
+}
+
 export async function createLeaveType(req, res) {
   const orgId = await resolveScopeOrgId(req);
-  const { name, days_allowed_per_year } = req.body;
+  const { name, days_allowed_per_year, is_paid } = req.body;
   if (!name || !String(name).trim()) throw new ApiError(400, "name is required");
   // Leave types are now name-only definitions (allocations are assigned
   // individually per employee). The legacy days column is kept but no longer
@@ -61,8 +77,8 @@ export async function createLeaveType(req, res) {
   let result;
   try {
     [result] = await pool.query(
-      "INSERT INTO leave_types (organization_id, name, days_allowed_per_year) VALUES (?, ?, ?)",
-      [orgId, String(name).trim(), days]
+      "INSERT INTO leave_types (organization_id, name, days_allowed_per_year, is_paid) VALUES (?, ?, ?, ?)",
+      [orgId, String(name).trim(), days, paidFlag(is_paid)]
     );
   } catch (e) {
     if (String(e.message).includes("Duplicate")) {
@@ -72,7 +88,7 @@ export async function createLeaveType(req, res) {
   }
 
   const [rows] = await pool.query(
-    "SELECT id, name, days_allowed_per_year FROM leave_types WHERE id=?",
+    "SELECT id, name, days_allowed_per_year, is_paid FROM leave_types WHERE id=?",
     [result.insertId]
   );
   logAudit({
@@ -97,7 +113,7 @@ export async function updateLeaveType(req, res) {
   );
   if (!exists.length) throw new ApiError(404, "Leave type not found");
 
-  const { name, days_allowed_per_year } = req.body;
+  const { name, days_allowed_per_year, is_paid } = req.body;
   const updates = {};
   if (name !== undefined) {
     if (!String(name).trim()) throw new ApiError(400, "name cannot be empty");
@@ -107,6 +123,9 @@ export async function updateLeaveType(req, res) {
     const days = parseInt(days_allowed_per_year, 10);
     if (isNaN(days) || days < 0) throw new ApiError(400, "days_allowed_per_year must be a non-negative integer");
     updates.days_allowed_per_year = days;
+  }
+  if (is_paid !== undefined) {
+    updates.is_paid = paidFlag(is_paid);
   }
   if (!Object.keys(updates).length) throw new ApiError(400, "Nothing to update");
 
@@ -120,7 +139,7 @@ export async function updateLeaveType(req, res) {
   }
 
   const [rows] = await pool.query(
-    "SELECT id, name, days_allowed_per_year FROM leave_types WHERE id=?",
+    "SELECT id, name, days_allowed_per_year, is_paid FROM leave_types WHERE id=?",
     [id]
   );
   logAudit({

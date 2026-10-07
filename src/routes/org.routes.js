@@ -77,12 +77,18 @@ import {
 } from "../controllers/attendance.controller.js";
 import {
   generatePayroll,
+  previewPayroll,
   downloadPayslip,
   exportOrgSalaryRecords,
   listOrgSalaryRecords,
   deleteSalaryPeriod,
   deleteSalaryRecord,
 } from "../controllers/salary.controller.js";
+import {
+  listOvertimeRequests,
+  createOvertimeRequest,
+  decideOvertimeRequest,
+} from "../controllers/org/overtime.controller.js";
 import {
   orgDashboardAnalytics,
 } from "../controllers/org/orgDashboardAnalytics.controller.js";
@@ -232,7 +238,22 @@ router.put("/employees/:uuid/salary-components/:assignUuid", payrollMgmt, asyncH
 router.delete("/employees/:uuid/salary-components/:assignUuid", payrollMgmt, asyncHandler(removeEmployeeSalaryComponent));
 
 // ---- Payroll auto-generation (staff) ----
+// Preview is registered before generate and, more importantly, is POST because it
+// carries month/year/selection in the body. It writes NOTHING - no record, no
+// line, no audit entry - so it is safe to call as often as anyone likes while
+// deciding. It runs the identical computation the generate path runs, so the
+// number previewed and the number committed cannot diverge.
+router.post("/payroll/preview", payrollMgmt, asyncHandler(previewPayroll));
 router.post("/payroll/generate", payrollMgmt, asyncHandler(generatePayroll));
+
+// ---- Overtime requests (staff) ----
+// The input payroll's overtime addition reads. Registered here rather than on
+// the attendance routes because overtime is a pay decision with an approval, not
+// a clock event: attendance records that someone was present, this records that
+// the extra hours were authorised.
+router.get("/overtime-requests", payrollMgmt, asyncHandler(listOvertimeRequests));
+router.post("/overtime-requests", payrollMgmt, asyncHandler(createOvertimeRequest));
+router.post("/overtime-requests/:uuid/decide", payrollMgmt, asyncHandler(decideOvertimeRequest));
 
 // ---- HR Letters ----
 // Ordering note: the literal "/letter-templates" and "/hr-letters/preview" paths
