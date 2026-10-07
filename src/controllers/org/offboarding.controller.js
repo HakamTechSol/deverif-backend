@@ -342,7 +342,22 @@ export async function myExit(req, res) {
   const orgId = req.scopeOrgId ?? req.user?.organization;
   const employee = await callerEmployee(orgId, req);
   if (!employee) {
-    return ok(res, { exit_request: null, checklist: [], checklistSummary: null, settlement: null }, "No exit request");
+    // Same shape as a real response, including on_roster: a client branching on
+    // `exit_request === null` alone would render the resignation form for an
+    // account that cannot file one.
+    return ok(
+      res,
+      {
+        on_roster: false,
+        employee_status: null,
+        exit_request: null,
+        checklist: [],
+        checklistSummary: null,
+        settlement: null,
+        outstanding_assets: 0,
+      },
+      "No exit request",
+    );
   }
   return ok(res, await getMyExit({ orgId, employeeUuid: employee.uuid }), "My exit");
 }

@@ -742,6 +742,64 @@ describe.runIf(HAS_DB)("the employee's own view", () => {
     expect(mine.exit_request).toBeNull();
     expect(mine.checklist).toEqual([]);
   });
+
+  it("reports on_roster so the page never offers a form to someone who has left", async () => {
+    // THE BUG THIS FIXES. The employee page decided whether to show the
+    // resignation form from the exit status alone, keying on "pending or
+    // approved", so "show the form otherwise" included COMPLETED. A finished exit
+    // rendered a fresh submission form, and submitting it was refused with "this
+    // employee has already left the organization" - a dead end with nothing on the
+    // page to explain it.
+    const uuid = await newEmployee("LeftTheCompany");
+    const exit = await makeExit(uuid);
+    await decideExitRequest({ orgId, actorUuid: null, exitUuid: exit.uuid, decision: "approved" });
+    await allocateLeave(uuid, { typeId: paidTypeId, allocated: 20, used: 5 });
+    await saveSettlement({ orgId, actorUuid: null, exitUuid: exit.uuid });
+
+    let full = await getExitRequest({ orgId, exitUuid: exit.uuid });
+    for (const item of full.checklist) {
+      full = await clearChecklistItem({ orgId, actorUuid: null, exitUuid: exit.uuid, checklistUuid: item.uuid });
+    }
+    await processSettlement({ orgId, actorUuid: null, exitUuid: exit.uuid, target: "processed" });
+    await processSettlement({ orgId, actorUuid: null, exitUuid: exit.uuid, target: "paid" });
+    await completeExit({ orgId, actorUuid: null, exitUuid: exit.uuid });
+
+    const mine = await getMyExit({ orgId, employeeUuid: uuid });
+    expect(mine.exit_request.status).toBe("completed");
+    expect(mine.on_roster).toBe(false);
+    expect(mine.employee_status).toBe("ex_employee");
+  });
+
+  it("reports on_roster false for an ex-employee who has NO exit record", async () => {
+    // Someone can leave before this module exists, or HR can set the status by
+    // hand. Inferring roster status from the absence of an exit record gets this
+    // case exactly backwards and shows them a form they cannot use.
+    const uuid = await newEmployee("GoneBeforeTheModule");
+    await db.query("UPDATE employees SET status='ex_employee' WHERE uuid=?", [uuid]);
+
+    const mine = await getMyExit({ orgId, employeeUuid: uuid });
+    expect(mine.exit_request).toBeNull();
+    expect(mine.on_roster).toBe(false);
+    // And submitting against it is refused, not silently accepted.
+    await expect(makeExit(uuid)).rejects.toMatchObject({ statusCode: 409 });
+  });
+
+  it("reports on_roster true while the exit is still in flight, so a REJECTED one can be resubmitted", async () => {
+    const uuid = await newEmployee("RejectedResubmit");
+    const exit = await makeExit(uuid);
+    await decideExitRequest({ orgId, actorUuid: null, exitUuid: exit.uuid, decision: "rejected" });
+
+    const mine = await getMyExit({ orgId, employeeUuid: uuid });
+    // Still on the roster, so the form returns - a rejection is a genuine
+    // resubmission, unlike a completion.
+    expect(mine.on_roster).toBe(true);
+    expect(mine.exit_request.status).toBe("rejected");
+
+    // And the database guard permits the new request, because rejected is not in
+    // the open set.
+    const second = await makeExit(uuid);
+    expect(second.uuid).not.toBe(exit.uuid);
+  });
 });
 
 describe("notice arithmetic is pure and total", () => {

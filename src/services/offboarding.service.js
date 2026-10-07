@@ -841,12 +841,27 @@ export async function completeExit({ orgId, actorUuid, exitUuid, hrNotes, conn =
 }
 
 /**
- * The employee's own view: their exit request, its checklist, and the settlement.
+ * The employee's own exit view.
  *
  * Scoped to a single employee rather than paginated, because there is at most one
  * open exit at a time and the employee is looking at one thing.
+ *
+ * `on_roster` and `employee_status` are here because the page cannot know them any
+ * other way, and guessing wrong is how a person who has already LEFT ends up being
+ * offered a resignation form: the server would refuse it with "this employee has
+ * already left the organization", which is a dead end with no explanation on the
+ * page that produced it. Someone may be ex_employee with no exit record at all -
+ * they left before this module existed, or HR set the status by hand - and the
+ * form has to stay hidden for them too.
  */
 export async function getMyExit({ orgId, employeeUuid, conn = pool }) {
+  const [empRows] = await conn.query(
+    "SELECT uuid, status FROM employees WHERE uuid=? AND organization_id=?",
+    [employeeUuid, orgId],
+  );
+  const employeeStatus = empRows[0]?.status ?? null;
+  const onRoster = employeeStatus === "current_employee" || employeeStatus === "active";
+
   const [rows] = await conn.query(
     `SELECT er.uuid, er.status, er.request_type, er.notice_period_days, er.last_working_day,
             er.reason, er.decision_notes, er.created_at, er.decided_at, er.completed_at
@@ -856,7 +871,17 @@ export async function getMyExit({ orgId, employeeUuid, conn = pool }) {
       LIMIT 1`,
     [employeeUuid, orgId],
   );
-  if (!rows.length) return { exit_request: null, checklist: [], checklistSummary: null, settlement: null };
+  if (!rows.length) {
+    return {
+      on_roster: onRoster,
+      employee_status: employeeStatus,
+      exit_request: null,
+      checklist: [],
+      checklistSummary: null,
+      settlement: null,
+      outstanding_assets: (await getOutstandingAssets({ orgId, employeeUuid, conn })).count,
+    };
+  }
 
   const exit = rows[0];
   const full = await getExitRequest({ orgId, exitUuid: exit.uuid, conn });
@@ -869,6 +894,11 @@ export async function getMyExit({ orgId, employeeUuid, conn = pool }) {
   );
 
   return {
+    // A COMPLETED exit means the employee is gone, so the roster answer comes from
+    // the exit record rather than from the roster, which may not have been flipped
+    // yet by whoever completed it manually.
+    on_roster: full.status === "completed" ? false : onRoster,
+    employee_status: full.status === "completed" ? "ex_employee" : employeeStatus,
     exit_request: {
       uuid: full.uuid,
       status: full.status,
