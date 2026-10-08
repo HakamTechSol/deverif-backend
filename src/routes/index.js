@@ -31,6 +31,7 @@ import documentsRoutes from "./documents.routes.js";
 import leavesRoutes from "./leaves.routes.js";
 import myLettersRoutes from "./myLetters.routes.js";
 import myAssetsRoutes from "./myAssets.routes.js";
+import myExpensesRoutes from "./myExpenses.routes.js";
 import myResignationRoutes from "./myResignation.routes.js";
 import attendanceRoutes from "./attendance.routes.js";
 import salarySelfRoutes from "./salary.routes.js";
@@ -102,6 +103,10 @@ router.use("/my/assets", myAssetsRoutes);
 // /my/assets) and the page 404'd with every unit test passing, because no test
 // read the mount path against the client's request.
 router.use("/my/resignation", myResignationRoutes);
+// Mounted at /my/expenses, NOT /my-expenses, and for the same reason as the two
+// siblings above: the API mount path and the client request path have to be the
+// same string or the page 404s with every unit test still green.
+router.use("/my/expenses", myExpensesRoutes);
 router.use("/attendance", attendanceRoutes);
 router.use("/salary-records", salarySelfRoutes);
 

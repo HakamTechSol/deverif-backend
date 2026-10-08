@@ -9,6 +9,7 @@ import { randomUUID } from "node:crypto";
 import * as payrollService from "../services/payroll.service.js";
 const { computeAutomaticLines, getMonthlyAttendanceAndLeaveSummary, insertSalaryRecordLines } =
   payrollService;
+import * as expenses from "../services/expenses.service.js";
 
 const MONTHS = [
   "January", "February", "March", "April", "May", "June",
@@ -111,9 +112,36 @@ async function computeEmployeePayroll({ employeeUuid, orgId, m, y, conn }) {
 
   const automatic = computeAutomaticLines({ summary, basicSalary: basic });
 
+  /**
+   * Expense reimbursements for the month, as one payslip line.
+   *
+   * Read on the SAME connection as the writes, because "which claims are still
+   * unpaid" is a question about the state payroll is about to change. Reading on
+   * the pool and writing on a transaction is how a claim gets paid by a run that
+   * then rolls back - and 'paid' is exactly the state that stops a claim being
+   * picked up again, so a rolled-back run that marked them paid would lose the
+   * reimbursement permanently.
+   *
+   * The claim list is returned as well, because the generate path has to mark
+   * them paid in the same transaction. The preview path must NOT: it writes
+   * nothing, so a preview must not consume anything.
+   */
+  const approvedClaims = await expenses.getApprovedClaimsForPeriod({
+    orgId,
+    employeeUuid,
+    month: m,
+    year: y,
+    conn,
+  });
+  const expenseLine = expenses.expenseReimbursementLine(approvedClaims);
+
   const lines = [
     ...componentLines,
     ...automatic.lines,
+    // Reimbursement is money COMING to the employee, so it is an earning alongside
+    // allowances rather than a negative anywhere. Folding it into the deduction
+    // side would hide it from a payslip that already nets off to zero.
+    ...(expenseLine ? [expenseLine] : []),
   ];
 
   const totalAllowances = moneyField(allowances + automatic.totalAddition, "allowances");
@@ -130,6 +158,8 @@ async function computeEmployeePayroll({ employeeUuid, orgId, m, y, conn }) {
     lines,
     summary,
     automatic,
+    expenseLine,
+    approvedClaims,
   };
 }
 
@@ -168,6 +198,16 @@ export async function generatePayroll(req, res) {
 
   const conn = await pool.getConnection();
   let skipped = 0;
+  // Declared outside the transaction block because it is reported after the commit.
+  let claimsPaid = 0;
+  /**
+   * auto_expense lines lifted off the records Regenerate is about to delete, keyed
+   * by employee. Populated inside the transaction and read back in the per-employee
+   * loop; an empty map for an ordinary generate, because there is nothing to carry.
+   */
+  const carriedExpenses = new Map();
+  /** salary_record uuids about to be deleted, so their claims can be re-pointed. */
+  let carriedClaimPointers = [];
   try {
     await conn.beginTransaction();
 
@@ -207,6 +247,59 @@ export async function generatePayroll(req, res) {
         );
       }
       const placeholders = employees.map(() => "?").join(",");
+
+      /**
+       * Preserve the reimbursements this period has already disbursed.
+       *
+       * salary_record_lines CASCADES from salary_records, so deleting the records
+       * deletes the auto_expense lines with them. The claims, however, stay 'paid'
+       * and keep pointing at a salary_record_uuid that no longer exists - so a
+       * regenerated payslip silently loses every reimbursement, while the claim
+       * list still says the employee was reimbursed. The employee is handed a
+       * payslip that no longer accounts for money they received.
+       *
+       * The claims are NOT released back to 'approved' to fix this. That would
+       * restore the line, but salary_records has no marker saying whether the
+       * period was actually disbursed, so "recompute before payout" and "recompute
+       * after the money went out" are indistinguishable - and un-consuming would
+       * pay the same expense a second time in the second case. That is the one
+       * failure this module must never have.
+       *
+       * So the lines are carried forward instead. A reimbursement is a disbursement
+       * that already happened, not a value derived from attendance and salary
+       * components, which is exactly what Regenerate exists to recompute. The claim
+       * stays paid, and its paid_via pointer is re-pointed at the new record below
+       * so the audit trail does not dangle.
+       *
+       * Read BEFORE the delete, because the cascade destroys the rows being read.
+       */
+      const [doomedRecords] = await conn.query(
+        `SELECT uuid, employee_uuid FROM salary_records
+          WHERE organization_id=? AND month=? AND year=? AND employee_uuid IN (${placeholders})`,
+        [orgId, m, y, ...employees.map((e) => e.uuid)]
+      );
+
+      carriedExpenses.clear();
+      if (doomedRecords.length) {
+        const recordPlaceholders = doomedRecords.map(() => "?").join(",");
+        const [oldLines] = await conn.query(
+          `SELECT l.salary_record_uuid, r.employee_uuid, l.label, l.type, l.source,
+                  l.amount, l.basis_value, l.basis_unit
+             FROM salary_record_lines l
+             JOIN salary_records r ON r.uuid = l.salary_record_uuid
+            WHERE l.source='auto_expense' AND l.salary_record_uuid IN (${recordPlaceholders})`,
+          doomedRecords.map((r) => r.uuid)
+        );
+        for (const line of oldLines) {
+          if (!carriedExpenses.has(line.employee_uuid)) carriedExpenses.set(line.employee_uuid, []);
+          carriedExpenses.get(line.employee_uuid).push(line);
+        }
+
+        // The claims each carried line disbursed, so they can be re-pointed at the
+        // replacement record once it exists.
+        carriedClaimPointers = doomedRecords.map((r) => r.uuid);
+      }
+
       await conn.query(
         `DELETE FROM salary_records
          WHERE organization_id=? AND month=? AND year=? AND employee_uuid IN (${placeholders})`,
@@ -255,6 +348,12 @@ export async function generatePayroll(req, res) {
     for (const emp of employees) {
       const computed = await computeEmployeePayroll({ employeeUuid: emp.uuid, orgId, m, y, conn });
 
+      // Counted across the run so the response can say how many claims were
+      // disbursed. Zero is the normal case and is worth stating explicitly,
+      // because "no expense claims paid" is an answer to a question people ask.
+      const paidForEmployee = computed.approvedClaims.length;
+      claimsPaid += paidForEmployee;
+
       // The record's own uuid is generated here rather than by the table, because
       // salary_record_lines has to point at it and the two are written in the same
       // transaction. UUID() inside the INSERT would return the value to nobody.
@@ -289,6 +388,63 @@ export async function generatePayroll(req, res) {
         year: y,
         lines: computed.lines,
       });
+
+      /**
+       * Re-attach the reimbursements carried forward from the deleted record.
+       *
+       * Appended AFTER computed.lines so the carried disbursement is visible on the
+       * payslip alongside anything newly computed - a claim approved since the last
+       * run is picked up in the same regeneration, which is the whole point of
+       * recomputing a period.
+       *
+       * Only the LINE is carried. No claim is re-consumed, because these claims are
+       * already paid; re-consuming them would be a second disbursement.
+       */
+      const carried = carriedExpenses.get(emp.uuid) ?? [];
+      if (carried.length) {
+        await insertSalaryRecordLines({
+          conn,
+          recordUuid,
+          orgId,
+          employeeUuid: emp.uuid,
+          month: m,
+          year: y,
+          lines: carried,
+        });
+      }
+
+      /**
+       * Consume the claims, in the SAME transaction as the salary record.
+       *
+       * The ordering matters. If this ran first and the payroll then failed, the
+       * claims would be 'paid' for money nobody received - and 'paid' is precisely
+       * the state that excludes them from the next run, so the reimbursement
+       * would be lost silently and appear on no payslip.
+       */
+      if (computed.approvedClaims.length) {
+        await expenses.markClaimsPaidByPayroll({
+          conn,
+          orgId,
+          salaryRecordUuid: recordUuid,
+          claims: computed.approvedClaims,
+        });
+      }
+
+      /**
+       * Re-point the carried claims at their replacement record.
+       *
+       * Left alone, paid_via_salary_record_uuid would name a row the regenerate just
+       * deleted, and the audit trail for a real disbursement would dead-end on a
+       * uuid that resolves to nothing.
+       */
+      if (carried.length && carriedClaimPointers.length) {
+        await expenses.repointClaimsPaidByPayroll({
+          conn,
+          orgId,
+          salaryRecordUuid: recordUuid,
+          previousRecordUuids: carriedClaimPointers,
+        });
+      }
     }
 
     await conn.commit();
@@ -316,11 +472,18 @@ export async function generatePayroll(req, res) {
     action: "payroll.generate",
     entityType: "payroll",
     entityId: `${y}-${String(m).padStart(2, "0")}`,
-    details: { month: m, year: y, records: rows.length },
+    details: {
+      month: m,
+      year: y,
+      records: rows.length,
+      // Named in the audit entry because money moving into a payroll is the thing
+      // an auditor asks about later, and "the payroll ran" does not answer it.
+      expense_claims_paid: claimsPaid,
+    },
     req,
   });
 
-  return ok(res, { items: rows, month: m, year: y, count: rows.length, skipped }, "Payroll generated from salary history, components, leave and attendance");
+  return ok(res, { items: rows, month: m, year: y, count: rows.length, skipped, expense_claims_paid: claimsPaid }, "Payroll generated from salary history, components, leave, attendance and expense claims");
 }
 
 // ---------------------------------------------------------------------------
@@ -387,6 +550,17 @@ export async function previewPayroll(req, res) {
         per_day: computed.automatic.perDayRate,
         hourly: computed.automatic.hourlyRate,
         skip_reason: computed.automatic.skipReason,
+      },
+      /**
+       * Expense reimbursement, broken out rather than folded into the allowances
+       * total. It is money the employee is owed back for their own spending, and
+       * an approver looking at a payslip deserves to see that it came from four
+       * taxi claims rather than from a component nobody can name.
+       */
+      expense_reimbursement: {
+        claim_count: computed.approvedClaims.length,
+        amount: computed.expenseLine ? computed.expenseLine.amount : 0,
+        claims: computed.approvedClaims,
       },
     });
   }

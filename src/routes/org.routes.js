@@ -37,6 +37,19 @@ import {
   updateLeaveType,
 } from "../controllers/leave.controller.js";
 import {
+  listExpenseCategories,
+  createExpenseCategory,
+  listExpenseClaims,
+  getExpenseClaim,
+  submitExpenseClaim,
+  reviewExpenseClaim,
+  payExpenseClaim,
+  bulkPayExpenseClaims,
+  uploadExpenseReceipts,
+  removeExpenseReceipt,
+  downloadExpenseReceipt,
+} from "../controllers/org/expenses.controller.js";
+import {
   getEmployeeLeaveHistory,
   listLeaveAllocations,
   setLeaveAllocation,
@@ -329,6 +342,10 @@ router.get("/hr-letters/:uuid/pdf", hrLettersMgmt, asyncHandler(downloadLetterPd
 // what the register reports on. So the GET joins the staff-level gate and only
 // the writes stay behind orgAdminsOnly.
 const assetMgmt = [...staff, requireModuleFeature("asset_management")];
+// Aliased: expense and asset categories are separate tables with separate
+// lifecycles, and both modules export a listCategories/createCategory pair. Same
+// name, different register - importing both unaliased would silently shadow one.
+const expenseCategoryMgmt = [...staff, requireModuleFeature("expense_management")];
 const assetCategoryMgmt = [...orgAdminsOnly, requireModuleFeature("asset_management")];
 
 router.get("/asset-categories", assetMgmt, asyncHandler(listCategories));
@@ -369,6 +386,38 @@ router.post(
 );
 router.delete("/asset-attachments/:attachmentUuid", assetMgmt, asyncHandler(removeAttachment));
 router.get("/asset-attachments/:attachmentUuid/download", assetMgmt, asyncHandler(downloadAttachment));
+
+// ---- Expense claims (staff) ----
+// Reuses the same attachments middleware and the shared `attachments` table via
+// entity_type='expense_claim'; no file column lives on expense_claims itself.
+router.get("/expense-categories", expenseCategoryMgmt, asyncHandler(listExpenseCategories));
+router.post("/expense-categories", expenseCategoryMgmt, asyncHandler(createExpenseCategory));
+router.get("/expense-claims", expenseCategoryMgmt, asyncHandler(listExpenseClaims));
+router.get("/expense-claims/:uuid", expenseCategoryMgmt, asyncHandler(getExpenseClaim));
+router.post("/expense-claims", expenseCategoryMgmt, asyncHandler(submitExpenseClaim));
+// Registered BEFORE the /:uuid routes deliberately. Express matches in
+// registration order, so a literal segment sitting behind a parameter is one
+// refactor away from being swallowed by it. `/bulk-pay` as a uuid string would
+// reach loadClaim and 404 with a confusing message instead of paying anything.
+router.post("/expense-claims/bulk-pay", expenseCategoryMgmt, asyncHandler(bulkPayExpenseClaims));
+router.post("/expense-claims/:uuid/review", expenseCategoryMgmt, asyncHandler(reviewExpenseClaim));
+router.post("/expense-claims/:uuid/pay", expenseCategoryMgmt, asyncHandler(payExpenseClaim));
+router.post(
+  "/expense-claims/:uuid/receipts",
+  expenseCategoryMgmt,
+  uploadAttachments.array("files", 10),
+  asyncHandler(uploadExpenseReceipts),
+);
+router.delete(
+  "/expense-attachments/:attachmentUuid",
+  expenseCategoryMgmt,
+  asyncHandler(removeExpenseReceipt),
+);
+router.get(
+  "/expense-attachments/:attachmentUuid/download",
+  expenseCategoryMgmt,
+  asyncHandler(downloadExpenseReceipt),
+);
 
 // ---- Org dashboard analytics (staff) ----
 router.get("/dashboard/analytics", staff, asyncHandler(orgDashboardAnalytics));

@@ -1,0 +1,75 @@
+-- Retract the one-approved-claim-per-employee-per-day guard.
+--
+-- 20261113_create_expense_claims.sql added a generated column
+-- `unpaid_approval_guard` and a UNIQUE key on
+-- (employee_uuid, expense_date, payment_mode, guard) so that approving a second
+-- claim while the first was still unpaid would be refused by the database. Its
+-- own header comment, however, said the opposite - that two legitimate same-day
+-- claims should be allowed. The comment and the constraint contradicted each
+-- other, and the constraint is what actually ran, so the comment was the thing
+-- that was wrong about reality and the policy it described was never enforced.
+--
+-- WHICH BEHAVIOUR IS CORRECT. The same-day duplicate is a legitimate claim, not a
+-- defect. An employee who takes two taxis to a client visit on one day files two
+-- claims, and a day that produced both a meal and a taxi produces two. Collapsing
+-- those into one would force the second real expense to be merged into the first,
+-- which misstates both amounts and quietly discards one receipt.
+--
+-- WHY DOUBLE PAYMENT IS STILL IMPOSSIBLE. Nothing about double-payment relied on
+-- this index. It was always enforced by guarded status transitions:
+--
+--   * approve: expense_claims.service.js issues its UPDATE with
+--     `status='pending' AND is_paid=0`, so a claim already approved or paid cannot
+--     be approved a second time regardless of date or amount.
+--   * pay: markClaimPaid updates `... WHERE is_paid=0`, and
+--     markClaimsPaidByPayroll updates `... WHERE status='approved' AND is_paid=0`
+--     and additionally refuses to settle an already-settled claim. Two concurrent
+--     payroll runs therefore cannot both consume the same claim - the loser
+--     matches zero rows.
+--   * pay-once is then recorded in paid_at / payment_reference / paid_via_salary_
+--     record_uuid, which are themselves the evidence a later audit reads.
+--
+-- The index was guarding a shape of duplicate (same day, same mode) rather than
+-- the property that actually matters (paid twice), and it was blocking valid
+-- claims while adding nothing to the guarantee.
+--
+-- WHAT THIS DOES NOT DO. It does not de-duplicate an accidental double SUBMISSION
+-- - the same expense filed twice by a confused user is now allowed through and
+-- becomes two approved claims, payable once each. Catching that is a review-time
+-- judgement for a human who can see two identical receipts, not something a
+-- uniqueness key can decide: legitimately identical claims exist (two employees
+-- each claiming the same shared taxi is not the same row, but one person paying
+-- the same fare twice on one day in two different currencies is). If that becomes
+-- a real problem the place to handle it is a reviewer-facing duplicate warning on
+-- the claims list, not a constraint that also blocks the valid case.
+--
+-- `expense_year` and `expense_month` are kept: those are indexes, not guards, and
+-- payroll still looks claims up by month.
+
+-- REPLACE THE FK'S SUPPORTING INDEX FIRST, and this is not incidental bookkeeping.
+--
+-- fk_expense_claims_employee is a foreign key on (employee_uuid) alone, but
+-- 20261113 declared no index beginning with that column on its own:
+-- idx_expense_claims_employee is (organization_id, employee_uuid, expense_date),
+-- which MySQL cannot use for this FK because the FK column is not its leftmost
+-- prefix. MySQL therefore adopted uk_expense_claims_unpaid_approval -- also
+-- starting with employee_uuid -- as the FK's supporting index, and dropping that
+-- key now fails with ER_FK_COLUMN_CANNOT_DROP (1553): "Cannot drop index ...
+-- needed in a foreign key constraint".
+--
+-- So the unique guard had quietly become load-bearing infrastructure. That is the
+-- second reason to retire it deliberately rather than leave it in place: an index
+-- whose stated purpose was a policy nobody wanted was also the only thing holding
+-- a foreign key up, and nobody would have known from reading the schema.
+--
+-- This index is the one the FK should have had all along. Adding it before the
+-- DROP is what makes the drop legal; adding it after would fail.
+ALTER TABLE `expense_claims`
+  ADD INDEX `idx_expense_claims_employee_uuid` (`employee_uuid`);
+
+DROP INDEX `uk_expense_claims_unpaid_approval` ON `expense_claims`;
+
+-- The column existed only to feed that index. Left in place it would be a
+-- generated column written on every status change and read by nothing, which is
+-- the exact silent-no-op shape this migration is removing the guard half of.
+ALTER TABLE `expense_claims` DROP COLUMN `unpaid_approval_guard`;
