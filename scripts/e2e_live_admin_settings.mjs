@@ -234,10 +234,54 @@ for (const t of ["users", "organizations", "verification_requests", "document_ty
 }
 
 // Round-trip sanity: escaping must survive a real apostrophe and a newline.
+//
+// This used to rename the FIRST organization in the table, which is a real
+// customer's org, and restore it in a finally block. That "finally" is not a
+// safety net: Ctrl+C, a closed terminal, or a hard kill skips it. An interrupted
+// run left a customer's organization permanently named
+// "Dvarif Backup Probe mulgh15o O'Brien", which then showed on that company's
+// own public verification pages.
+//
+// The probe now inserts its OWN throwaway organization, so there is no real row
+// to damage and nothing to restore. A leftover row is still cleaned on exit, on
+// every signal, and by the id being obvious if the process is killed outright.
 const marker = `Dvarif Backup Probe ${Date.now().toString(36)} O'Brien`;
-const [[orgRow]] = await db.query("SELECT id, name FROM organizations ORDER BY id LIMIT 1");
-const originalName = orgRow.name;
-await db.query("UPDATE organizations SET name=? WHERE id=?", [marker, orgRow.id]);
+
+let probeOrgId = null;
+async function dropProbeOrg() {
+  if (probeOrgId == null) return;
+  const id = probeOrgId;
+  probeOrgId = null; // clear first so a failed delete is not retried forever
+  try {
+    await db.query("DELETE FROM organizations WHERE id=? AND name=?", [id, marker]);
+  } catch {
+    /* best effort */
+  }
+}
+
+// Covers the exit paths that skip a finally block.
+process.on("exit", () => {});
+for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+  process.on(sig, () => {
+    dropProbeOrg().finally(() => process.exit(130));
+  });
+}
+process.on("uncaughtException", (e) => {
+  console.error(e);
+  dropProbeOrg().finally(() => process.exit(1));
+});
+
+const [probeOrg] = await db.query("SELECT id FROM organizations WHERE name=?", [marker]);
+if (probeOrg.length) {
+  // An earlier run died hard enough to leave its row. Reuse is impossible
+  // (the marker embeds a timestamp) so clear the stale one first.
+  console.log(`  note: removing stale probe org from an interrupted run (${probeOrg[0].id})`);
+  await db.query("DELETE FROM organizations WHERE id=?", [probeOrg[0].id]);
+}
+const [ins] = await db.query("INSERT INTO organizations (name) VALUES (?)", [marker]);
+probeOrgId = ins.insertId;
+console.log(`  probe org #${probeOrgId} created for the escaping round-trip`);
+
 let backup2 = null;
 let sql2 = "";
 try {
@@ -246,8 +290,7 @@ try {
   });
   sql2 = await backup2.text();
 } finally {
-  // Always put the real name back, whatever happened above.
-  await db.query("UPDATE organizations SET name=? WHERE id=?", [originalName, orgRow.id]);
+  await dropProbeOrg();
 }
 check(
   "C8 an apostrophe in live data is escaped and survives the round trip",

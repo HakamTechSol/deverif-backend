@@ -5,6 +5,13 @@ import { assertUuid } from "../utils/publicResponse.js";
 import { parsePagination, paginatedResponse } from "../utils/pagination.js";
 import { logAudit, getActorFromReq } from "../utils/auditLog.js";
 import { generatePayslipPdf } from "../utils/payslipPdf.js";
+import { CURRENCY } from "../utils/currency.js";
+import { randomUUID } from "node:crypto";
+import * as payrollService from "../services/payroll.service.js";
+const { computeAutomaticLines, getMonthlyAttendanceAndLeaveSummary, insertSalaryRecordLines } =
+  payrollService;
+import * as expenses from "../services/expenses.service.js";
+import { queueNotificationEmail, notificationActionUrl } from "../services/notificationEmail.service.js";
 
 const MONTHS = [
   "January", "February", "March", "April", "May", "June",
@@ -46,30 +53,141 @@ async function findEmployee(employeeUuid, orgId) {
 // Payroll generation (automatic, from salary history + components)
 // ---------------------------------------------------------------------------
 
-function monthRange(month, year) {
-  const first = new Date(Date.UTC(year, month - 1, 1));
-  const last = new Date(Date.UTC(year, month, 0));
+/**
+ * Everything about one employee for one month, with nothing written.
+ *
+ * Deliberately side-effect free and shared by generate and preview, because the
+ * two MUST agree: a preview that computes a different number from the run it is
+ * previewing is worse than no preview, since it moves the number people approve.
+ * The previous code could not be reused this way because its component loop
+ * collapsed straight into an INSERT.
+ *
+ * Lines are produced in two groups. `componentLines` are the org's configured
+ * allowances and deductions; `autoLines` are the ones this module now derives
+ * from leave and attendance. They are kept apart because they are
+ * answerable-to differently: a component is "what we agreed", an automatic line
+ * is "what actually happened", and an employee disputing a payslip needs to be
+ * told which of the two they are looking at.
+ */
+async function computeEmployeePayroll({ employeeUuid, orgId, m, y, conn }) {
+  const basic = await effectiveBasicForMonth(employeeUuid, m, y, conn);
+
+  // Pull ONLY this employee's individually-assigned, active salary components.
+  // We use the per-employee amount (esc.amount), NOT the catalog's default_value,
+  // and never apply every active catalog component to every employee. Inactive
+  // assignments are excluded so they stop affecting future runs; already-generated
+  // records store computed totals and are never retroactively changed.
+  //
+  // The catalog's own is_active flag is checked as well. Deactivating a component
+  // in the catalog is documented as stopping it being applied to future payroll
+  // generations, and the status toggle writes only `salary_components.is_active`.
+  // Without this predicate the assignment kept paying an "inactive" component
+  // forever, while the screen showed it as switched off.
+  const [empComponents] = await conn.query(
+    `SELECT sc.name, sc.type, sc.is_percentage, esc.amount
+     FROM employee_salary_components esc
+     JOIN salary_components sc ON sc.id = esc.salary_component_id
+     WHERE esc.employee_uuid=? AND esc.is_active=1 AND sc.is_active=1`,
+    [employeeUuid]
+  );
+
+  const componentLines = [];
+  let allowances = 0;
+  let deductions = 0;
+  for (const c of empComponents) {
+    let amt = Number(c.amount);
+    if (c.is_percentage) amt = Number(basic) * (amt / 100);
+    amt = moneyField(amt, c.name);
+    componentLines.push({
+      label: c.name,
+      type: c.type === "deduction" ? "deduction" : "earning",
+      source: "component",
+      amount: amt,
+      basis_value: null,
+      basis_unit: null,
+    });
+    if (c.type === "deduction") deductions += amt;
+    else allowances += amt;
+  }
+
+  const summary = await getMonthlyAttendanceAndLeaveSummary({
+    employeeUuid,
+    orgId,
+    month: m,
+    year: y,
+    conn,
+  });
+
+  const automatic = computeAutomaticLines({ summary, basicSalary: basic });
+
+  /**
+   * Expense reimbursements for the month, as one payslip line.
+   *
+   * Read on the SAME connection as the writes, because "which claims are still
+   * unpaid" is a question about the state payroll is about to change. Reading on
+   * the pool and writing on a transaction is how a claim gets paid by a run that
+   * then rolls back - and 'paid' is exactly the state that stops a claim being
+   * picked up again, so a rolled-back run that marked them paid would lose the
+   * reimbursement permanently.
+   *
+   * The claim list is returned as well, because the generate path has to mark
+   * them paid in the same transaction. The preview path must NOT: it writes
+   * nothing, so a preview must not consume anything.
+   */
+  const approvedClaims = await expenses.getApprovedClaimsForPeriod({
+    orgId,
+    employeeUuid,
+    month: m,
+    year: y,
+    conn,
+  });
+  const expenseLine = expenses.expenseReimbursementLine(approvedClaims);
+
+  const lines = [
+    { label: `Basic salary (${summary.policy.pay_frequency})`, type: "earning", source: "basic", amount: Number(basic), basis_value: null, basis_unit: null },
+    ...componentLines,
+    ...automatic.lines,
+    // Reimbursement is money COMING to the employee, so it is an earning alongside
+    // allowances rather than a negative anywhere. Folding it into the deduction
+    // side would hide it from a payslip that already nets off to zero.
+    ...(expenseLine ? [expenseLine] : []),
+  ];
+
+  const totalAllowances = moneyField(allowances + automatic.totalAddition, "allowances");
+  const totalDeductions = moneyField(deductions + automatic.totalDeduction, "deductions");
+
+  const expenseReimbursement = expenseLine?.amount ?? 0;
+  // Reimbursements are payable earnings but remain separate from contractual
+  // allowances in the stored salary record.
+  const net = Math.max(
+    0,
+    computedNet(basic, totalAllowances + expenseReimbursement, totalDeductions),
+  );
+
   return {
-    firstDay: first.toISOString().slice(0, 10),
-    lastDay: last.toISOString().slice(0, 10),
+    basic,
+    allowances: totalAllowances,
+    deductions: totalDeductions,
+    expenseReimbursement,
+    net,
+    lines,
+    summary,
+    automatic,
+    expenseLine,
+    approvedClaims,
   };
 }
 
-// Pick the effective (numeric) basic salary for a given month by matching the
-// month's last day against each period's [effective_from, effective_to] range.
-async function effectiveBasicForMonth(employeeUuid, month, year) {
-  const { lastDay } = monthRange(month, year);
-  const [rows] = await pool.query(
-    `SELECT basic_salary
-     FROM employee_salary_history
-     WHERE employee_uuid=?
-       AND effective_from <= ?
-       AND (effective_to IS NULL OR effective_to >= ?)
-     ORDER BY effective_from DESC
-     LIMIT 1`,
-    [employeeUuid, lastDay, lastDay]
-  );
-  return rows.length ? rows[0].basic_salary : 0;
+/**
+ * The employee's basic salary for the month, from the shared payroll service.
+ *
+ * Previously a local function. It now lives in payroll.service.js because the
+ * Full & Final settlement needs the identical figure to price a day of unused
+ * leave, and two copies of this rule is how FnF ends up quoting a daily rate
+ * that disagrees with the payslip it accompanies.
+ */
+async function effectiveBasicForMonth(employeeUuid, month, year, conn = pool) {
+  return payrollService.effectiveBasicForMonth({ employeeUuid, month, year, conn });
 }
 
 function computedNet(basicSalary, allowancesTotal, deductionsTotal) {
@@ -84,8 +202,8 @@ function computedNet(basicSalary, allowancesTotal, deductionsTotal) {
 /**
  * Generate payroll for a whole month. For every employee (whether or not they
  * are a linked platform user) we look up their effective basic salary from
- * employee_salary_history and apply this org's salary_components â€” fixed
- * amounts and percentages â€” then store the totals in salary_records.
+ * employee_salary_history and apply this org's salary_components —” fixed
+ * amounts and percentages —” then store the totals in salary_records.
  * Net is computed automatically; it is never entered manually.
  */
 export async function generatePayroll(req, res) {
@@ -95,6 +213,17 @@ export async function generatePayroll(req, res) {
 
   const conn = await pool.getConnection();
   let skipped = 0;
+  const generatedEmployeeUuids = [];
+  // Declared outside the transaction block because it is reported after the commit.
+  let claimsPaid = 0;
+  /**
+   * auto_expense lines lifted off the records Regenerate is about to delete, keyed
+   * by employee. Populated inside the transaction and read back in the per-employee
+   * loop; an empty map for an ordinary generate, because there is nothing to carry.
+   */
+  const carriedExpenses = new Map();
+  /** salary_record uuids about to be deleted, so their claims can be re-pointed. */
+  let carriedClaimPointers = [];
   try {
     await conn.beginTransaction();
 
@@ -134,6 +263,59 @@ export async function generatePayroll(req, res) {
         );
       }
       const placeholders = employees.map(() => "?").join(",");
+
+      /**
+       * Preserve the reimbursements this period has already disbursed.
+       *
+       * salary_record_lines CASCADES from salary_records, so deleting the records
+       * deletes the auto_expense lines with them. The claims, however, stay 'paid'
+       * and keep pointing at a salary_record_uuid that no longer exists - so a
+       * regenerated payslip silently loses every reimbursement, while the claim
+       * list still says the employee was reimbursed. The employee is handed a
+       * payslip that no longer accounts for money they received.
+       *
+       * The claims are NOT released back to 'approved' to fix this. That would
+       * restore the line, but salary_records has no marker saying whether the
+       * period was actually disbursed, so "recompute before payout" and "recompute
+       * after the money went out" are indistinguishable - and un-consuming would
+       * pay the same expense a second time in the second case. That is the one
+       * failure this module must never have.
+       *
+       * So the lines are carried forward instead. A reimbursement is a disbursement
+       * that already happened, not a value derived from attendance and salary
+       * components, which is exactly what Regenerate exists to recompute. The claim
+       * stays paid, and its paid_via pointer is re-pointed at the new record below
+       * so the audit trail does not dangle.
+       *
+       * Read BEFORE the delete, because the cascade destroys the rows being read.
+       */
+      const [doomedRecords] = await conn.query(
+        `SELECT uuid, employee_uuid FROM salary_records
+          WHERE organization_id=? AND month=? AND year=? AND employee_uuid IN (${placeholders})`,
+        [orgId, m, y, ...employees.map((e) => e.uuid)]
+      );
+
+      carriedExpenses.clear();
+      if (doomedRecords.length) {
+        const recordPlaceholders = doomedRecords.map(() => "?").join(",");
+        const [oldLines] = await conn.query(
+          `SELECT l.salary_record_uuid, r.employee_uuid, l.label, l.type, l.source,
+                  l.amount, l.basis_value, l.basis_unit
+             FROM salary_record_lines l
+             JOIN salary_records r ON r.uuid = l.salary_record_uuid
+            WHERE l.source='auto_expense' AND l.salary_record_uuid IN (${recordPlaceholders})`,
+          doomedRecords.map((r) => r.uuid)
+        );
+        for (const line of oldLines) {
+          if (!carriedExpenses.has(line.employee_uuid)) carriedExpenses.set(line.employee_uuid, []);
+          carriedExpenses.get(line.employee_uuid).push(line);
+        }
+
+        // The claims each carried line disbursed, so they can be re-pointed at the
+        // replacement record once it exists.
+        carriedClaimPointers = doomedRecords.map((r) => r.uuid);
+      }
+
       await conn.query(
         `DELETE FROM salary_records
          WHERE organization_id=? AND month=? AND year=? AND employee_uuid IN (${placeholders})`,
@@ -180,42 +362,119 @@ export async function generatePayroll(req, res) {
     const createdBy = req.user?.id ?? null;
 
     for (const emp of employees) {
-      const basic = await effectiveBasicForMonth(emp.uuid, m, y);
-
-      // Pull ONLY this employee's individually-assigned, active salary
-      // components (from employee_salary_components, joined with the catalog
-      // for type). We use the per-employee amount (esc.amount), NOT the
-      // catalog's default_value, and never apply every active catalog
-      // component to every employee. Inactive assignments are excluded so they
-      // stop affecting future runs; already-generated records store computed
-      // totals and are never retroactively changed.
-      const [empComponents] = await conn.query(
-        `SELECT sc.name, sc.type, sc.is_percentage, esc.amount
-         FROM employee_salary_components esc
-         JOIN salary_components sc ON sc.id = esc.salary_component_id
-         WHERE esc.employee_uuid=? AND esc.is_active=1`,
-        [emp.uuid]
-      );
-
-      let allowances = 0;
-      let deductions = 0;
-      for (const c of empComponents) {
-        let amt = Number(c.amount);
-        if (c.is_percentage) amt = basic * (amt / 100);
-        amt = Math.round(amt * 100) / 100;
-        if (c.type === "deduction") deductions += amt;
-        else allowances += amt;
+      const computed = await computeEmployeePayroll({ employeeUuid: emp.uuid, orgId, m, y, conn });
+      if (computed.automatic.skipReason === "no_basic_salary") {
+        throw new ApiError(409, `Payroll setup is incomplete for employee ${emp.uuid}: no positive effective basic salary exists for ${MONTHS[m - 1]} ${y}. Add an effective salary record, then preview again.`);
       }
-      // Cap net at zero (deductions cannot exceed earnings).
-      const net = Math.max(0, computedNet(basic, allowances, deductions));
+
+      // Counted across the run so the response can say how many claims were
+      // disbursed. Zero is the normal case and is worth stating explicitly,
+      // because "no expense claims paid" is an answer to a question people ask.
+      const paidForEmployee = computed.approvedClaims.length;
+      claimsPaid += paidForEmployee;
+
+      // The record's own uuid is generated here rather than by the table, because
+      // salary_record_lines has to point at it and the two are written in the same
+      // transaction. UUID() inside the INSERT would return the value to nobody.
+      const recordUuid = randomUUID();
+      generatedEmployeeUuids.push(emp.uuid);
+      const carried = carriedExpenses.get(emp.uuid) ?? [];
+      const carriedExpenseReimbursement = moneyField(
+        carried.reduce((sum, line) => sum + Number(line.amount || 0), 0),
+        "expense reimbursement",
+      );
+      const expenseReimbursement = moneyField(
+        computed.expenseReimbursement + carriedExpenseReimbursement,
+        "expense reimbursement",
+      );
+      const netSalary = moneyField(computed.net + carriedExpenseReimbursement, "net salary");
 
       await conn.query(
         `INSERT INTO salary_records
            (uuid, employee_uuid, organization_id, month, year, basic_salary,
-            allowances, deductions, net_salary, notes, created_by, created_at)
-         VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
-        [emp.uuid, orgId, m, y, basic, allowances, deductions, net, null, createdBy]
+            allowances, deductions, expense_reimbursement, net_salary, notes, created_by, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
+        [
+          recordUuid,
+          emp.uuid,
+          orgId,
+          m,
+          y,
+          computed.basic,
+          computed.allowances,
+          computed.deductions,
+          expenseReimbursement,
+          netSalary,
+          null,
+          createdBy,
+        ]
       );
+
+      await insertSalaryRecordLines({
+        conn,
+        recordUuid,
+        orgId,
+        employeeUuid: emp.uuid,
+        month: m,
+        year: y,
+        lines: computed.lines,
+      });
+
+      /**
+       * Re-attach the reimbursements carried forward from the deleted record.
+       *
+       * Appended AFTER computed.lines so the carried disbursement is visible on the
+       * payslip alongside anything newly computed - a claim approved since the last
+       * run is picked up in the same regeneration, which is the whole point of
+       * recomputing a period.
+       *
+       * Only the LINE is carried. No claim is re-consumed, because these claims are
+       * already paid; re-consuming them would be a second disbursement.
+       */
+      if (carried.length) {
+        await insertSalaryRecordLines({
+          conn,
+          recordUuid,
+          orgId,
+          employeeUuid: emp.uuid,
+          month: m,
+          year: y,
+          lines: carried,
+        });
+      }
+
+      /**
+       * Consume the claims, in the SAME transaction as the salary record.
+       *
+       * The ordering matters. If this ran first and the payroll then failed, the
+       * claims would be 'paid' for money nobody received - and 'paid' is precisely
+       * the state that excludes them from the next run, so the reimbursement
+       * would be lost silently and appear on no payslip.
+       */
+      if (computed.approvedClaims.length) {
+        await expenses.markClaimsPaidByPayroll({
+          conn,
+          orgId,
+          salaryRecordUuid: recordUuid,
+          claims: computed.approvedClaims,
+        });
+      }
+
+      /**
+       * Re-point the carried claims at their replacement record.
+       *
+       * Left alone, paid_via_salary_record_uuid would name a row the regenerate just
+       * deleted, and the audit trail for a real disbursement would dead-end on a
+       * uuid that resolves to nothing.
+       */
+      if (carried.length && carriedClaimPointers.length) {
+        await expenses.repointClaimsPaidByPayroll({
+          conn,
+          orgId,
+          salaryRecordUuid: recordUuid,
+          previousRecordUuids: carriedClaimPointers,
+        });
+      }
     }
 
     await conn.commit();
@@ -228,6 +487,7 @@ export async function generatePayroll(req, res) {
 
   const [rows] = await pool.query(
     `SELECT sr.*, e.full_name AS employee_name, e.email AS employee_email,
+            e.linked_user_uuid AS employee_user_uuid,
             dg.name AS designation, o.name AS organization_name
      FROM salary_records sr
      JOIN employees e ON e.uuid = sr.employee_uuid
@@ -238,16 +498,248 @@ export async function generatePayroll(req, res) {
     [orgId, m, y]
   );
 
+  try {
+    const generated = new Set(generatedEmployeeUuids);
+    const period = `${MONTHS[m - 1]} ${y}`;
+    const employeeEmails = rows.filter((row) => generated.has(row.employee_uuid) && row.employee_user_uuid);
+    const notificationJobs = employeeEmails.map((row) => queueNotificationEmail({
+      category: "payroll",
+      eventKey: `payroll:${row.uuid}:payslip-ready`,
+      userUuid: row.employee_user_uuid,
+      subject: `Your ${period} payslip is ready`,
+      title: `Your ${period} payslip is ready`,
+      message: `Your payslip for ${period} has been generated. Sign in to Dverif to view it securely. Salary details are not included in this email.`,
+      actionUrl: notificationActionUrl("/payroll"),
+    }));
+    if (generatedEmployeeUuids.length) {
+      const [admins] = await pool.query(
+        `SELECT uuid FROM users WHERE organization=? AND status='active' AND deleted_at IS NULL
+          AND org_role IN ('org_admin','sub_admin')`,
+        [orgId]
+      );
+      notificationJobs.push(...admins.map((admin) => queueNotificationEmail({
+        category: "payroll",
+        eventKey: `payroll:${orgId}:${y}-${m}:completed:${admin.uuid}`,
+        userUuid: admin.uuid,
+        subject: `${period} payroll generated`,
+        title: "Payroll generation complete",
+        message: `Payroll for ${period} was generated for ${generatedEmployeeUuids.length} employee(s). ${skipped} selected employee(s) were skipped because a record already existed. Review the payroll in Dverif.`,
+        actionUrl: notificationActionUrl("/org/payroll"),
+      })));
+    }
+    await Promise.allSettled(notificationJobs);
+  } catch (error) {
+    console.error("Payroll email enqueue failed:", error?.message);
+  }
+
   logAudit({
     ...getActorFromReq(req),
     action: "payroll.generate",
     entityType: "payroll",
     entityId: `${y}-${String(m).padStart(2, "0")}`,
-    details: { month: m, year: y, records: rows.length },
+    details: {
+      month: m,
+      year: y,
+      records: rows.length,
+      // Named in the audit entry because money moving into a payroll is the thing
+      // an auditor asks about later, and "the payroll ran" does not answer it.
+      expense_claims_paid: claimsPaid,
+    },
     req,
   });
 
-  return ok(res, { items: rows, month: m, year: y, count: rows.length, skipped }, "Payroll generated from salary history and components");
+  return ok(res, { items: rows, month: m, year: y, count: rows.length, skipped, expense_claims_paid: claimsPaid }, "Payroll generated from salary history, components, leave, attendance and expense claims");
+}
+
+// ---------------------------------------------------------------------------
+// Preview: the same computation, written nowhere.
+//
+// Auto-computed deductions are the part of a payslip people contest, so the
+// number has to be inspectable BEFORE it is committed — not discoverable a month
+// later from a stored total. This runs the identical computeEmployeePayroll the
+// generate path runs, on the same connection shape, so a preview and the run it
+// precedes cannot disagree.
+//
+// It takes no transaction and writes nothing: no salary_records row, no
+// salary_record_lines row, no audit entry. A GET that mutated payroll state would
+// be a trap, and the endpoint is registered as POST only because the request body
+// carries month/year/employee selection rather than a query string.
+// ---------------------------------------------------------------------------
+
+export async function previewPayroll(req, res) {
+  const orgId = req.scopeOrgId;
+  const { month, year, employee_uuids } = req.body || {};
+  const { m, y } = monthYearFields(month, year);
+
+  const selected = Array.isArray(employee_uuids) ? employee_uuids.filter(Boolean) : [];
+  let employees;
+  if (selected.length) {
+    const placeholders = selected.map(() => "?").join(",");
+    [employees] = await pool.query(
+      `SELECT uuid, full_name FROM employees WHERE organization_id=? AND uuid IN (${placeholders})
+        ORDER BY full_name`,
+      [orgId, ...selected]
+    );
+    if (!employees.length) {
+      throw new ApiError(404, "None of the selected employees exist in this organization");
+    }
+  } else {
+    [employees] = await pool.query(
+      `SELECT uuid, full_name FROM employees WHERE organization_id=? ORDER BY full_name`,
+      [orgId]
+    );
+  }
+
+  const items = [];
+  for (const emp of employees) {
+    const computed = await computeEmployeePayroll({ employeeUuid: emp.uuid, orgId, m, y, conn: pool });
+    items.push({
+      employee_uuid: emp.uuid,
+      employee_name: emp.full_name,
+      basic_salary: computed.basic,
+      allowances: computed.allowances,
+      deductions: computed.deductions,
+      expense_reimbursement: computed.expenseReimbursement,
+      net_salary: computed.net,
+      lines: computed.lines,
+      attendance: {
+        working_days: computed.summary.workingDays,
+        attended_days: computed.summary.attendedDays,
+        absent_days: computed.summary.absentDays,
+        late_count: computed.summary.lateCount,
+        paid_leave_days: computed.summary.paidLeaveDays,
+        unpaid_leave_days: computed.summary.unpaidLeaveDays,
+        approved_overtime_hours: computed.summary.approvedOvertimeHours,
+        holidays_in_month: computed.summary.holidayCount,
+      },
+      rates: {
+        per_day: computed.automatic.perDayRate,
+        hourly: computed.automatic.hourlyRate,
+        skip_reason: computed.automatic.skipReason,
+        divisor: computed.automatic.divisor,
+        daily_rate_basis: computed.summary.policy.daily_rate_basis,
+        currency: computed.summary.policy.currency,
+        pay_frequency: computed.summary.policy.pay_frequency,
+      },
+      /**
+       * Expense reimbursement, broken out rather than folded into the allowances
+       * total. It is money the employee is owed back for their own spending, and
+       * an approver looking at a payslip deserves to see that it came from four
+       * taxi claims rather than from a component nobody can name.
+       *
+       * The NUMERIC total is `expense_reimbursement` above, which is what the
+       * totals reducer and the preview dialog read. This detailed object used to
+       * also be called `expense_reimbursement`, and because it came second in the
+       * literal it silently replaced the number with an object. Every preview
+       * then crashed in the totals reducer ("expense reimbursement must be a
+       * non-negative number"), because Number(object) is NaN. One name per shape:
+       * the number keeps the field the client already expects, the breakdown gets
+       * its own key.
+       */
+      expense_reimbursement_details: {
+        claim_count: computed.approvedClaims.length,
+        amount: computed.expenseLine ? computed.expenseLine.amount : 0,
+        claims: computed.approvedClaims,
+      },
+    });
+  }
+
+  const totals = items.reduce(
+    (acc, i) => ({
+      basic: moneyField(acc.basic + Number(i.basic_salary), "basic"),
+      allowances: moneyField(acc.allowances + Number(i.allowances), "allowances"),
+      deductions: moneyField(acc.deductions + Number(i.deductions), "deductions"),
+      expense_reimbursement: moneyField(
+        acc.expense_reimbursement + Number(i.expense_reimbursement),
+        "expense reimbursement",
+      ),
+      net: moneyField(acc.net + Number(i.net_salary), "net"),
+    }),
+    { basic: 0, allowances: 0, deductions: 0, expense_reimbursement: 0, net: 0 },
+  );
+
+  return ok(res, { month: m, year: y, items, totals, count: items.length }, "Payroll preview");
+}
+
+/** Read the explicitly configured organization payroll policy without exposing other tenants. */
+export async function getPayrollPolicy(req, res) {
+  const orgId = req.scopeOrgId;
+  const [policies] = await pool.query("SELECT * FROM organization_payroll_policies WHERE organization_id=?", [orgId]);
+  const [weeks] = policies.length ? await pool.query("SELECT mon,tue,wed,thu,fri,sat,sun FROM work_week_config WHERE organization_id=?", [orgId]) : [[]];
+  // Normalized on the way out for the same reason getConfiguredPayrollPolicy does
+  // it: a row written before the currency was fixed may still hold NULL or a
+  // stale code, and the client must never see one.
+  const policy = policies[0] ? { ...policies[0], currency: CURRENCY } : null;
+  return ok(res, {
+    configured: policies[0]?.is_configured === 1 || policies[0]?.is_configured === true,
+    policy,
+    work_week: weeks[0] ?? null,
+  }, "Payroll policy");
+}
+
+/** Save and explicitly confirm the org's payroll assumptions and work calendar. */
+export async function updatePayrollPolicy(req, res) {
+  const orgId = req.scopeOrgId;
+  const body = req.body ?? {};
+  const dayKeys = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+  const week = body.work_week ?? {};
+  if (!dayKeys.every((day) => typeof week[day] === "boolean") || !dayKeys.some((day) => week[day])) {
+    throw new ApiError(400, "Choose at least one working day; each weekday must be explicitly set on or off.");
+  }
+  // Currency is no longer an input. Anything a client sends in `currency` is
+  // ignored rather than rejected, so an older client (or a stale saved form)
+  // keeps working and cannot reintroduce a second currency; the value written
+  // below is always the single application currency.
+  const currency = CURRENCY;
+  const payFrequency = String(body.pay_frequency ?? "");
+  if (!["weekly", "biweekly", "semi_monthly", "monthly"].includes(payFrequency)) throw new ApiError(400, "Select a supported pay frequency.");
+  const basis = String(body.daily_rate_basis ?? "");
+  if (!["actual_working_days", "calendar_days", "fixed_30"].includes(basis)) throw new ApiError(400, "Select a daily-rate divisor policy.");
+  const shiftStartTime = String(body.shift_start_time ?? "");
+  if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(shiftStartTime)) throw new ApiError(400, "Enter the organization shift start time in HH:MM format.");
+  const numeric = (key, min, max, allowZero = true) => {
+    const n = Number(body[key]);
+    if (!Number.isFinite(n) || n < (allowZero ? min : Math.max(min, Number.EPSILON)) || n > max) throw new ApiError(400, `${key} must be between ${min} and ${max}.`);
+    return n;
+  };
+  const flag = (key) => {
+    if (typeof body[key] !== "boolean") throw new ApiError(400, `${key} must be explicitly enabled or disabled.`);
+    return body[key] ? 1 : 0;
+  };
+  const values = {
+    currency, pay_frequency: payFrequency, daily_rate_basis: basis, shift_start_time: shiftStartTime,
+    hours_per_workday: numeric("hours_per_workday", 1, 24, false),
+    late_grace_minutes: numeric("late_grace_minutes", 0, 720),
+    late_arrivals_per_penalty: numeric("late_arrivals_per_penalty", 1, 100, false),
+    late_penalty_days: numeric("late_penalty_days", 0, 1),
+    overtime_multiplier: numeric("overtime_multiplier", 0, 10),
+    deduct_unpaid_leave: flag("deduct_unpaid_leave"), deduct_absences: flag("deduct_absences"),
+    deduct_late_arrivals: flag("deduct_late_arrivals"), pay_approved_overtime: flag("pay_approved_overtime"),
+  };
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    await conn.query(
+      `INSERT INTO work_week_config (organization_id,mon,tue,wed,thu,fri,sat,sun)
+       VALUES (?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE mon=VALUES(mon),tue=VALUES(tue),wed=VALUES(wed),thu=VALUES(thu),fri=VALUES(fri),sat=VALUES(sat),sun=VALUES(sun),updated_at=NOW()`,
+      [orgId, ...dayKeys.map((day) => week[day] ? 1 : 0)],
+    );
+    await conn.query(
+      `INSERT INTO organization_payroll_policies
+       (organization_id,currency,pay_frequency,daily_rate_basis,shift_start_time,hours_per_workday,late_grace_minutes,late_arrivals_per_penalty,late_penalty_days,overtime_multiplier,deduct_unpaid_leave,deduct_absences,deduct_late_arrivals,pay_approved_overtime,is_configured,configured_by_uuid,configured_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,NOW())
+       ON DUPLICATE KEY UPDATE currency=VALUES(currency),pay_frequency=VALUES(pay_frequency),daily_rate_basis=VALUES(daily_rate_basis),shift_start_time=VALUES(shift_start_time),hours_per_workday=VALUES(hours_per_workday),late_grace_minutes=VALUES(late_grace_minutes),late_arrivals_per_penalty=VALUES(late_arrivals_per_penalty),late_penalty_days=VALUES(late_penalty_days),overtime_multiplier=VALUES(overtime_multiplier),deduct_unpaid_leave=VALUES(deduct_unpaid_leave),deduct_absences=VALUES(deduct_absences),deduct_late_arrivals=VALUES(deduct_late_arrivals),pay_approved_overtime=VALUES(pay_approved_overtime),is_configured=1,configured_by_uuid=VALUES(configured_by_uuid),configured_at=NOW()`,
+      [orgId, values.currency, values.pay_frequency, values.daily_rate_basis, values.shift_start_time, values.hours_per_workday, values.late_grace_minutes, values.late_arrivals_per_penalty, values.late_penalty_days, values.overtime_multiplier, values.deduct_unpaid_leave, values.deduct_absences, values.deduct_late_arrivals, values.pay_approved_overtime, req.user?.uuid ?? null],
+    );
+    await conn.commit();
+  } catch (error) {
+    await conn.rollback();
+    throw error;
+  } finally { conn.release(); }
+  logAudit({ ...getActorFromReq(req), action: "payroll.policy.configure", entityType: "payroll_policy", entityId: String(orgId), details: values, req });
+  const [policy] = await pool.query("SELECT * FROM organization_payroll_policies WHERE organization_id=?", [orgId]);
+  const [workWeek] = await pool.query("SELECT mon,tue,wed,thu,fri,sat,sun FROM work_week_config WHERE organization_id=?", [orgId]);
+  return ok(res, { configured: true, policy: policy[0], work_week: workWeek[0] }, "Payroll policy saved");
 }
 
 // ---------------------------------------------------------------------------
@@ -343,7 +835,7 @@ export async function listOrgSalaryRecords(req, res) {
   );
   const [rows] = await pool.query(
     `SELECT sr.uuid, sr.employee_uuid, sr.month, sr.year, sr.basic_salary,
-            sr.allowances, sr.deductions, sr.net_salary, sr.notes, sr.created_at,
+            sr.allowances, sr.deductions, sr.expense_reimbursement, sr.net_salary, sr.notes, sr.created_at,
             e.full_name AS employee_name, e.email AS employee_email, dg.name AS designation,
             o.name AS organization_name
      FROM salary_records sr
@@ -407,7 +899,7 @@ export async function listAllSalaryRecords(req, res) {
   );
   const [rows] = await pool.query(
     `SELECT sr.uuid, sr.employee_uuid, sr.month, sr.year, sr.basic_salary,
-            sr.allowances, sr.deductions, sr.net_salary, sr.notes, sr.created_at,
+            sr.allowances, sr.deductions, sr.expense_reimbursement, sr.net_salary, sr.notes, sr.created_at,
             e.full_name AS employee_name, e.email AS employee_email, dg.name AS designation,
             o.uuid AS organization_uuid, o.name AS organization_name
      FROM salary_records sr
@@ -450,9 +942,52 @@ async function getSalaryRecordForPayslip(uuid, orgId, isAdmin) {
     params
   );
   if (!rows.length) throw new ApiError(404, "Salary record not found");
-  return rows[0];
+  const record = rows[0];
+
+  /*
+   * THE ITEMISED LINES, from the table the payroll generator already writes.
+   *
+   * `salary_record_lines` has held every earning and deduction since payroll
+   * auto-computation was introduced — basic, each component, each
+   * attendance-derived line, the expense reimbursement — and the payslip has been
+   * showing only the two rollups from `salary_records` anyway. So the data was
+   * already itemised and the document was the part that was not.
+   *
+   * Scoped by organization as well as record: these rows are employee-level
+   * financial detail, and the parent select above joins on
+   * `sr.organization_id` only in the non-admin branch, so the line query has to
+   * stand on its own rather than assume the parent was org-filtered.
+   *
+   * `id` ordering is not cosmetic — it is the order the generator inserted the
+   * lines in, which is basic, then components, then automatic, then expense.
+   * Re-sorting alphabetically would move "Overtime" above "Basic salary".
+   */
+  const [lines] = await pool.query(
+    `SELECT uuid, label, type, source, amount, basis_value, basis_unit
+       FROM salary_record_lines
+      WHERE salary_record_uuid = ? AND organization_id = ?
+      ORDER BY FIELD(type, 'earning', 'deduction'), id`,
+    [uuid, record.organization_id]
+  );
+  record.lines = lines;
+  return record;
 }
 
+/**
+ * Render the payslip and send it, as either a download or an inline preview.
+ *
+ * The `inline` mode exists because a payslip is a document people READ before
+ * they keep: the previous behaviour opened a file chooser for a filename nobody
+ * cared about, and the only way to see what the button produced was to save it
+ * somewhere first. `Content-Disposition: inline` lets the browser's PDF viewer
+ * show it in a new tab, and the download path still exists as the action beside
+ * it for people who want the file.
+ *
+ * BOTH MODES RENDER FROM THE SAME RECORD. One function, one query, one PDF. If
+ * the preview and the download were produced by two code paths they would
+ * eventually disagree, and the number a recruiter signs off on would not be the
+ * number the employee is handed.
+ */
 export async function downloadPayslip(req, res) {
   const isAdmin = Boolean(req.admin);
   const orgId = isAdmin ? null : req.scopeOrgId;
@@ -465,8 +1000,10 @@ export async function downloadPayslip(req, res) {
   });
 
   const filename = `dverif-payslip-${record.uuid.slice(0, 8)}.pdf`;
+  const dispositionType = req.query.disposition === "inline" ? "inline" : "attachment";
   res.setHeader("Content-Type", "application/pdf");
-  res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+  const disposition = req.query?.view === "inline" ? "inline" : "attachment";
+  res.setHeader("Content-Disposition", `${disposition}; filename="${filename}"`);
   res.send(pdf);
 }
 
@@ -515,7 +1052,7 @@ export async function exportOrgSalaryRecords(req, res) {
 
   const [rows] = await pool.query(
     `SELECT sr.employee_uuid, sr.month, sr.year, sr.basic_salary,
-            sr.allowances, sr.deductions, sr.net_salary, sr.notes, sr.created_at,
+            sr.allowances, sr.deductions, sr.expense_reimbursement, sr.net_salary, sr.notes, sr.created_at,
             e.full_name AS employee_name, e.email AS employee_email, dg.name AS designation
      FROM salary_records sr
      JOIN employees e ON e.uuid = sr.employee_uuid
@@ -525,7 +1062,7 @@ export async function exportOrgSalaryRecords(req, res) {
     params
   );
 
-  const header = "Employee,Email,Designation,Month,Year,Basic Salary,Allowances,Deductions,Net Salary,Notes";
+  const header = "Employee,Email,Designation,Month,Year,Basic Salary,Allowances,Expense Reimbursement,Deductions,Net Salary,Notes";
   const lines = rows.map((r) => [
     r.employee_name,
     r.employee_email,
@@ -534,6 +1071,7 @@ export async function exportOrgSalaryRecords(req, res) {
     r.year,
     r.basic_salary,
     r.allowances,
+    r.expense_reimbursement,
     r.deductions,
     r.net_salary,
     r.notes,
@@ -583,7 +1121,7 @@ export async function mySalaryRecords(req, res) {
   );
   const [rows] = await pool.query(
     `SELECT sr.uuid, sr.employee_uuid, sr.month, sr.year, sr.basic_salary,
-            sr.allowances, sr.deductions, sr.net_salary, sr.notes, sr.created_at,
+            sr.allowances, sr.deductions, sr.expense_reimbursement, sr.net_salary, sr.notes, sr.created_at,
             e.full_name AS employee_name, e.email AS employee_email, dg.name AS designation,
             o.name AS organization_name
      FROM salary_records sr
@@ -595,5 +1133,37 @@ export async function mySalaryRecords(req, res) {
      LIMIT ? OFFSET ?`,
     [...params, limit, offset]
   );
+
+  /*
+   * THE ITEMISED LINES, for the on-screen payslip dialog.
+   *
+   * The dialog used to show four numbers — basic, allowances, deductions, net —
+   * which is a summary an employee has no way to act on. "What am I actually
+   * paid for, and why is this taken off?" was answerable only as a total.
+   * `salary_record_lines` already holds the answer, so this fetches it.
+   *
+   * One query for the whole page rather than one per row: the page is at most
+   * `limit` records and the alternative is N round trips for a page that was
+   * already being fetched in one. Scoped by employee, which the `whereClause`
+   * already established.
+   */
+  const uuids = rows.map((r) => r.uuid);
+  if (uuids.length) {
+    const [lineRows] = await pool.query(
+      `SELECT salary_record_uuid, label, type, source, amount, basis_value, basis_unit
+         FROM salary_record_lines
+        WHERE salary_record_uuid IN (?)
+        ORDER BY salary_record_uuid, FIELD(type, 'earning', 'deduction'), id`,
+      [uuids]
+    );
+    const byRecord = new Map();
+    for (const line of lineRows) {
+      const key = line.salary_record_uuid;
+      if (!byRecord.has(key)) byRecord.set(key, []);
+      byRecord.get(key).push(line);
+    }
+    for (const row of rows) row.lines = byRecord.get(row.uuid) ?? [];
+  }
+
   return ok(res, paginatedResponse(rows, total, page, limit), "Salary records");
 }

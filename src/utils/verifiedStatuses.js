@@ -43,3 +43,28 @@ export const VERIFIED_STATUS_SQL = `'verified','auto_verified'`;
 
 /** `(?, ?)` placeholders matching VERIFIED_STATUSES, for a bound-parameter query. */
 export const VERIFIED_STATUS_PLACEHOLDERS = VERIFIED_STATUSES.map(() => "?").join(", ");
+
+/**
+ * The `verification_requests.verification_method` values that mean "no human
+ * reviewed this".
+ *
+ * `person_documents` cannot answer this question on its own: its `status` is a
+ * plain enum('verified','unverified'), so a manual approval and an auto
+ * approval are the same value there. The method only survives on the joined
+ * request row, which is why every "how many times was this auto-verified"
+ * query has to reach through `verified_by_verification_request_id`.
+ *
+ * Every OTHER method value is a human decision: 'portal' (a reviewer clicked
+ * approve), 'admin' / 'admin_sla' (a platform admin intervened). A request row
+ * with no method at all, or one whose request was deleted (the FK is
+ * ON DELETE SET NULL), is treated as NOT auto: an auto-only ledger must not
+ * claim an outcome it cannot prove.
+ *
+ * Lives here beside VERIFIED_STATUSES for the same reason those do — adding a
+ * new automatic method should be one edit, not an audit of every query that
+ * counts.
+ */
+export const AUTO_VERIFICATION_METHODS = ["auto", "automatic_match"];
+
+/** The same list as a quoted, comma-joined SQL fragment for MySQL. */
+export const AUTO_VERIFICATION_METHOD_SQL = AUTO_VERIFICATION_METHODS.map((m) => `'${m}'`).join(", ");

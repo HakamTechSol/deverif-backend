@@ -147,3 +147,76 @@ describe("the fix does not widen visibility across organizations", () => {
     expect(count.sql).not.toContain("org_role");
   });
 });
+
+/**
+ * ?scope=org - the asset Assign picker.
+ *
+ * The per-admin filter is right for the Employees page, which is a work queue of
+ * "records I imported", and wrong for a picker over the company. Handing a laptop
+ * to a colleague another admin onboarded is a normal thing to do, so the picker
+ * needs the whole org roster; with the filter on, that person was not hidden
+ * behind a "show more" but ABSENT, and the only symptom was that the company's
+ * own employees seemed not to exist.
+ *
+ * So the opt-out is deliberate and narrow. The tenant boundary is what must not
+ * move, and it is asserted separately below.
+ */
+describe("listEmployees — ?scope=org gives an org_admin the whole roster", () => {
+  it("drops the added_by_uuid filter", async () => {
+    await listEmployees(staffReq(orgAdmin, { scope: "org" }), mockRes());
+
+    const count = countStmt();
+    expect(count.sql).not.toContain("e.added_by_uuid = ?");
+    expect(count.params).not.toContain(ADMIN_UUID);
+  });
+
+  it("keeps the organization boundary — this is not a cross-tenant switch", async () => {
+    await listEmployees(staffReq(orgAdmin, { scope: "org" }), mockRes());
+
+    const count = countStmt();
+    expect(count.sql).toContain("e.organization_id = ?");
+    expect(count.params).toContain(ORG_ID);
+  });
+
+  it("applies the same scope to the COUNT and the row query", async () => {
+    // A filter on one side only makes the total disagree with the page, so
+    // pagination reports rows that are not there and hides rows that are.
+    await listEmployees(staffReq(orgAdmin, { scope: "org" }), mockRes());
+    expect(countStmt().sql).not.toContain("e.added_by_uuid = ?");
+    expect(rowStmt().sql).not.toContain("e.added_by_uuid = ?");
+  });
+
+  it("still excludes ex-employees", async () => {
+    // Widening to the org roster must not turn the picker into the full history:
+    // an ex-employee must not be assignable company property.
+    await listEmployees(staffReq(orgAdmin, { scope: "org" }), mockRes());
+    expect(countStmt().sql).toContain("e.status IN (");
+    expect(countStmt().sql).not.toContain("record_type");
+  });
+
+  it("is opt-in: the default list is unchanged", async () => {
+    // Guard against the opt-out being made the default later, which would quietly
+    // undo the per-admin isolation the Employees page depends on.
+    await listEmployees(staffReq(orgAdmin), mockRes());
+    expect(countStmt().sql).toContain("e.added_by_uuid = ?");
+    expect(countStmt().params).toContain(ADMIN_UUID);
+  });
+
+  it("ignores any other scope value", async () => {
+    // Only the exact literal widens. An unrecognised value must not be treated as
+    // "close enough", because this parameter is a visibility control.
+    await listEmployees(staffReq(orgAdmin, { scope: "everything" }), mockRes());
+    expect(countStmt().sql).toContain("e.added_by_uuid = ?");
+
+    pool.query.mockClear();
+    await listEmployees(staffReq(orgAdmin, { scope: "" }), mockRes());
+    expect(countStmt().sql).toContain("e.added_by_uuid = ?");
+  });
+
+  it("changes nothing for a sub-admin, who already saw the whole roster", async () => {
+    await listEmployees(staffReq(subAdmin, { scope: "org" }), mockRes());
+    const count = countStmt();
+    expect(count.sql).not.toContain("e.added_by_uuid = ?");
+    expect(count.sql).toContain("e.organization_id = ?");
+  });
+});

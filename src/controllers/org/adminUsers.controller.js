@@ -9,7 +9,8 @@ import { sendInviteEmail } from "../../utils/mailer.js";
 import { firstFrontendUrl } from "../../utils/frontendUrl.js";
 import { logAudit, getActorFromReq } from "../../utils/auditLog.js";
 import { normalizedFeatureAccess } from "../../utils/permissions.js";
-import { assertIdentityAvailable, rethrowIdentityDuplicate } from "../../utils/identityUniqueness.js";
+import { assertIdentityAvailable, rethrowIdentityDuplicate, assertEmailAvailable } from "../../utils/identityUniqueness.js";
+import { cnicError, normalizeCnic } from "../../utils/contactFormat.js";
 
 /**
  * Sub-admins are organization users with org_role='sub_admin'. They are
@@ -67,13 +68,17 @@ export async function createAdminUser(req, res) {
   if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     throw new ApiError(400, "email is required and must be valid");
   }
-  const normalizedCnic = cnic ? String(cnic).replace(/\D/g, "") : "";
-  if (!/^\d{13}$/.test(normalizedCnic)) {
+  const normalizedCnic = normalizeCnic(cnic);
+  if (!normalizedCnic || cnicError(cnic)) {
     throw new ApiError(400, "cnic must be a valid 13-digit CNIC");
   }
 
-  const [dupeEmail] = await pool.query("SELECT uuid FROM users WHERE email=?", [email]);
-  if (dupeEmail.length) throw new ApiError(409, "A platform user with this email already exists");
+  // One email, one identity — across `users` AND `employees`. Replaces the
+  // users-only lookup above: `users.email` is unique so that half was already
+  // guaranteed by the index, but `employees.email` is not, and creating an
+  // account for an address that already has an employee record would leave one
+  // person as an unlinked employee plus an unrelated login.
+  await assertEmailAvailable({ email, executor: pool });
 
   const [dupeCnic] = await pool.query(
     "SELECT uuid FROM users WHERE cnic=? AND deleted_at IS NULL",
@@ -220,68 +225,28 @@ export async function updateAdminUser(req, res) {
 
 export async function revokeAdminUser(req, res) {
   const { uuid } = req.params;
-  const action = req.body?.action === "deactivate" ? "deactivate" : "demote";
-  const target = await loadSubAdminInScope(uuid, req.scopeOrgId, req.user.uuid);
-
-  const conn = await pool.getConnection();
-  try {
-    await conn.beginTransaction();
-
-    if (action === "deactivate") {
-      await conn.query("UPDATE users SET status='inactive' WHERE uuid=?", [uuid]);
-    } else {
-      // Demote to a regular employee. Sub-admins created via createAdminUser
-      // have NO employees record — we must create one so they remain visible
-      // in the Employees / My Team table. Without this, the demoted person
-      // vanishes from the org's employee list entirely.
-      const [[empCheck]] = await conn.query(
-        "SELECT uuid FROM employees WHERE linked_user_uuid=?",
-        [uuid]
-      );
-
-      if (!empCheck) {
-        const [userRow] = await conn.query(
-          "SELECT full_name, email, phone, cnic, organization FROM users WHERE uuid=?",
-          [uuid]
-        );
-        const u = userRow[0];
-        await conn.query(
-          `INSERT INTO employees
-           (uuid, organization_id, full_name, email, phone, cnic,
-            status, joining_date, emergency_contact,
-            is_platform_user, linked_user_uuid, added_by_uuid, created_at)
-           VALUES (UUID(), ?, ?, ?, ?, ?, 'active', NULL, NULL,
-                   'yes', ?, ?, NOW())`,
-          [u.organization, u.full_name, u.email, u.phone, u.cnic, uuid, req.user.uuid]
-        );
-      }
-
-      await conn.query(
-        "UPDATE users SET org_role='employee', feature_access=NULL WHERE uuid=?",
-        [uuid]
-      );
-    }
-
-    await conn.commit();
-  } catch (err) {
-    await conn.rollback();
-    throw err;
-  } finally {
-    conn.release();
+  // Deactivation is the only revoke action. Demotion to a regular member is
+  // deliberately not supported: an org admin removing elevated access should
+  // disable the account, not silently turn it into an employee record.
+  if (req.body?.action !== "deactivate") {
+    throw new ApiError(400, "Only deactivation is supported");
   }
+  await loadSubAdminInScope(uuid, req.scopeOrgId, req.user.uuid);
+
+  await pool.query("UPDATE users SET status='inactive' WHERE uuid=?", [uuid]);
 
   const [rows] = await pool.query(`${ADMIN_USER_SELECT} WHERE uuid=?`, [uuid]);
 
   logAudit({
     ...getActorFromReq(req),
-    action: "subadmin.revoke",
+    action: "subadmin.deactivate",
     entityType: "user",
     entityId: uuid,
-    details: { full_name: rows[0].full_name, email: rows[0].email, action },
+    details: { full_name: rows[0].full_name, email: rows[0].email, action: "deactivate" },
     req,
   });
 
-  return ok(res, { user: rows[0] }, action === "deactivate" ? "Sub-admin deactivated" : "Sub-admin demoted to employee");
+  return ok(res, { user: rows[0] }, "Sub-admin deactivated");
 }
 
 /**

@@ -120,3 +120,101 @@ export function rethrowIdentityDuplicate(err, context = {}) {
   // surfacing the conflict, but strip the raw index name.
   throw new ApiError(409, "That value is already in use by another record.");
 }
+
+/**
+ * One email address, one identity — across BOTH `users` and `employees`.
+ *
+ * WHY THIS IS NOT JUST THE DATABASE'S JOB
+ *     `users.email` is UNIQUE, so two login accounts can never share one. But
+ *     `employees.email` has no unique constraint and, until the migration
+ *     alongside this file, no index at all. So an employee row and a user row
+ *     could both hold the same address and the database was perfectly happy:
+ *     the person ended up with an HR record showing "no portal access" and a
+ *     separate login that nothing pointed at. `employees.linked_user_uuid` is
+ *     what ties the two together, and creating a user through the admin path
+ *     never set it.
+ *
+ *     One person must not exist as an unlinked employee AND an unrelated
+ *     account. That split is invisible in the UI (the employee keeps claiming
+ *     no portal access forever) and unfixable once the two have diverged.
+ *
+ * WHY IT REFUSES RATHER THAN LINKS
+ *     utils/services/employeeAccess.service.js deliberately never links
+ *     accounts by email alone, and that judgement still holds here: emails get
+ *     shared, mistyped and reassigned, and silently merging two records on a
+ *     string match is worse than refusing. The intended path for giving an
+ *     employee portal access is that service, which creates the account AND
+ *     writes `is_platform_user='yes', linked_user_uuid=...` in one transaction.
+ *     This check exists to make sure nobody reaches it by the side door.
+ *
+ * `linkedUserUuid` is what keeps the check from firing on the legitimate pairs.
+ * An employee already linked to the account being edited IS the same person,
+ * re-saving their own profile must not report them as a duplicate of
+ * themselves — the same reason `excludeUserId` exists above.
+ */
+export async function assertEmailAvailable({
+  email,
+  executor,
+  excludeUserUuid = null,
+  // The account being edited is also the account its employee record may be
+  // linked to, so the two exclusions are the same value. Defaulting it here
+  // means a caller cannot exclude the user half and forget the employee half,
+  // which would block the very profile save this is meant to allow.
+  linkedUserUuid = excludeUserUuid,
+  emailLabel = "email address",
+} = {}) {
+  if (!hasValue(email)) return;
+  const value = String(email).trim();
+
+  // `users` first: this is the one the DB would reject anyway, and naming the
+  // existing account is more useful than the raw index name. `excludeUserUuid`
+  // is the account being edited — without it, saving a profile whose email has
+  // not changed would report that account as a duplicate of itself.
+  let userSql = "SELECT uuid, full_name, email FROM users WHERE email = ?";
+  const userParams = [value];
+  if (excludeUserUuid) {
+    userSql += " AND uuid <> ?";
+    userParams.push(excludeUserUuid);
+  }
+  userSql += " LIMIT 1";
+  const [userRows] = await executor.query(userSql, userParams);
+  if (userRows.length) {
+    throw new ApiError(
+      409,
+      `This ${emailLabel} is already registered to ${describe(userRows[0])}. ` +
+        `Each person can have only one account on the platform.`
+    );
+  }
+
+  // Any employee row blocks, whatever their employment status: the product rule
+  // is one email, one identity, and an ex-employee record is still a person who
+  // was here. Reporting status in the message is enough to explain a refusal
+  // without making it conditional.
+  let sql =
+    "SELECT e.uuid, e.full_name, e.email, e.employee_code, e.status, e.is_platform_user," +
+    "       e.linked_user_uuid, o.name AS organization_name" +
+    "  FROM employees e" +
+    "  LEFT JOIN organizations o ON o.id = e.organization_id" +
+    " WHERE e.email = ?";
+  const params = [value];
+  if (linkedUserUuid) {
+    // Skip the employee who IS this account. Without this, every save of a
+    // linked employee's profile would 409 against their own record.
+    sql += " AND (e.linked_user_uuid IS NULL OR e.linked_user_uuid <> ?)";
+    params.push(linkedUserUuid);
+  }
+  sql += " LIMIT 1";
+
+  const [empRows] = await executor.query(sql, params);
+  if (empRows.length) {
+    const e = empRows[0];
+    const code = e.employee_code ? ` (${e.employee_code})` : "";
+    const org = e.organization_name ? ` at ${e.organization_name}` : "";
+    throw new ApiError(
+      409,
+      `This ${emailLabel} is already used by employee ${e.full_name}${code}${org}. ` +
+        `An employee and a user account cannot share one ${emailLabel}. ` +
+        `Give that employee portal access from their employee record instead of creating a separate account.`
+    );
+  }
+}

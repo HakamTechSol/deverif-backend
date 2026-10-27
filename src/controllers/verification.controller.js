@@ -1,6 +1,7 @@
 import ApiError from "../utils/ApiError.js";
 import { pool } from "../config/db.js";
 import { encryptCnic, decryptCnic, hashCnic } from "../utils/personCrypto.js";
+import { cnicError, normalizeCnic } from "../utils/contactFormat.js";
 import { recordPersonDocument } from "../utils/personDocuments.js";
 import { assertDocumentValid, VALIDATION_FLAGGED, VALIDATION_PASSED } from "../utils/documentValidate.js";
 import { created, ok } from "../utils/response.js";
@@ -12,7 +13,7 @@ import { enforceRequestQuota } from "../utils/requestQuota.js";
 import { resolveUnmatchedOrg } from "../utils/unmatchedOrg.js";
 import { logAudit, getActorFromReq } from "../utils/auditLog.js";
 import { generateQrForRequest, withVerifyUrl, withVerifyUrls } from "../utils/qrCertificate.js";
-import { VERIFIED_STATUS_SQL, isVerifiedStatus } from "../utils/verifiedStatuses.js";
+import { VERIFIED_STATUS_SQL, isVerifiedStatus, AUTO_VERIFICATION_METHOD_SQL } from "../utils/verifiedStatuses.js";
 import { runSlaChecks } from "../utils/slaChecks.js";
 import { runAutoMatchChecks, hasMatchMismatchRisk, computeMatchConfidence, autoApprove } from "../utils/autoMatch.js";
 import { buildDocumentCrossCheck } from "../utils/documentConsistency.js";
@@ -198,8 +199,8 @@ export async function createRequest(req, res) {
   if (!rawOwnerCnic) {
     throw new ApiError(400, "document_owner_cnic is required");
   }
-  const normalized = rawOwnerCnic.replace(/\D/g, "");
-  if (!/^\d{13}$/.test(normalized)) {
+  const normalized = normalizeCnic(rawOwnerCnic);
+  if (cnicError(rawOwnerCnic) || !normalized) {
     throw new ApiError(400, "document_owner_cnic must be a valid CNIC (XXXXX-XXXXXXX-X)");
   }
   const documentOwnerCnic = encryptCnic(normalized);
@@ -757,8 +758,8 @@ export async function updateMySentRequest(req, res) {
   if ("document_owner_cnic" in req.body) {
     const submittedCnic = String(req.body.document_owner_cnic ?? "").trim();
     if (submittedCnic) {
-      const normalized = submittedCnic.replace(/\D/g, "");
-      if (!/^\d{13}$/.test(normalized)) {
+      const normalized = normalizeCnic(submittedCnic);
+      if (cnicError(submittedCnic)) {
         throw new ApiError(400, "document_owner_cnic must be a valid CNIC (XXXXX-XXXXXXX-X)");
       }
     }
@@ -1117,8 +1118,14 @@ export async function myInboxCount(req, res) {
  * read-only ledger of those outcomes.
  *
  * doc_verification_count is a cross-organization total: how many times this
- * same person's document of this type has been verified anywhere on the
+ * same person's document of this type has been AUTO-verified anywhere on the
  * platform (2 by one company + 3 by another = 5).
+ *
+ * It counts automatic outcomes ONLY. A document a human also approved by hand
+ * is not one of these — this is the ledger of what the system decided on its
+ * own, so folding a 'portal' approval into it would overstate how much of the
+ * ledger was unattended. person_documents cannot make that distinction on its
+ * own (its status is just 'verified'), so the count joins the request row.
  *
  * Results are grouped by (person, document type) so a document verified ten
  * times occupies a single row showing "10", rather than ten near-identical rows.
@@ -1185,9 +1192,11 @@ export async function myAutoVerifiedRequests(req, res) {
             issuing_org.name AS issuing_org_name,
             issuing_org.logo AS issuing_org_logo,
             (SELECT COUNT(*) FROM person_documents pd
+              JOIN verification_requests pd_vr ON pd_vr.id = pd.verified_by_verification_request_id
               WHERE pd.person_id = vr.linked_person_id
                 AND pd.document_type = vr.document_type
                 AND pd.status = 'verified'
+                AND pd_vr.verification_method IN (${AUTO_VERIFICATION_METHOD_SQL})
             ) AS doc_verification_count
      FROM verification_requests vr
      JOIN (${groupedSql}) g ON g.latest_id = vr.id
@@ -1203,11 +1212,25 @@ export async function myAutoVerifiedRequests(req, res) {
 }
 
 /**
- * Full verification history for one auto-verified request's document.
+ * Verification history for one auto-verified request's document.
  *
  * Reads the person_documents ledger for the same person + document type across
- * EVERY organization, newest first, so the caller can see which companies have
- * verified this document and how many times. Read-only: no delete, no mutation.
+ * EVERY organization, newest first, so the caller can see which companies
+ * auto-verified this document and how many times. Read-only: no delete, no
+ * mutation.
+ *
+ * AUTOMATIC OUTCOMES ONLY — a document a human also approved by hand is not
+ * listed, and does not add to total_verifications. This endpoint is reached
+ * from the Auto Verified ledger, so everything it shows is read as "the system
+ * did this"; a 'portal' approval in the list would contradict the page it was
+ * opened from and inflate the count. person_documents.status cannot separate
+ * the two (it is 'verified' either way), so the method comes off the joined
+ * request. See utils/verifiedStatuses.js.
+ *
+ * The request join is a LEFT JOIN but the method filter sits in WHERE, which
+ * makes it behave as an inner join — deliberate. A document whose request row
+ * was deleted (FK is ON DELETE SET NULL) has no recorded method, and an
+ * auto-only ledger must not claim an outcome it cannot prove.
  */
 export async function getAutoVerifiedRequestHistory(req, res) {
   requirePermission(req.user, "approve_request");
@@ -1245,6 +1268,7 @@ export async function getAutoVerifiedRequestHistory(req, res) {
      LEFT JOIN organizations org ON org.id = pd.verified_by_organization_id
      LEFT JOIN verification_requests vr ON vr.id = pd.verified_by_verification_request_id
      WHERE pd.person_id = ? AND pd.document_type <=> ? AND pd.status = 'verified'
+       AND vr.verification_method IN (${AUTO_VERIFICATION_METHOD_SQL})
      ORDER BY pd.verified_at DESC, pd.id DESC`,
     [vr.linked_person_id, vr.document_type]
   );

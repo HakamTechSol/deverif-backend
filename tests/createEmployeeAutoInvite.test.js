@@ -1,8 +1,6 @@
 /**
- * createEmployee auto-invite: an employee saved WITH an email is created as a
- * platform user and a set-password link is emailed, and — critically — this is
- * NOT gated on the organization's subscription. The invite is the employee's
- * way in; what they can see afterwards is decided per-request by the plan.
+ * Employee portal access is an explicit choice; an email by itself creates only
+ * a roster record. Portal accounts use a one-time set-password invitation.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
@@ -59,6 +57,9 @@ function installRouter() {
     const s = String(sql);
     if (s.includes("SELECT id FROM organizations")) return [[{ id: 1 }]];
     if (s.includes("SELECT uuid FROM users WHERE email")) return [[]];
+    if (s.includes("SELECT id, uuid, email") && s.includes("FROM users")) return [[]];
+    if (s.includes("SELECT uuid FROM users WHERE `phone_normalized`")) return [[]];
+    if (s.includes("SELECT uuid FROM users WHERE `cnic`")) return [[]];
     if (s.includes("SELECT id FROM organizations WHERE id")) return [[{ id: 1 }]];
     if (s.includes("INSERT INTO users")) return [{ insertId: 55 }];
     if (s.includes("SELECT uuid FROM users WHERE id")) return [[{ uuid: "user-uuid-1" }]];
@@ -87,7 +88,7 @@ function connSql() {
 describe("createEmployee — automatic platform-user invite", () => {
   it("creates a platform user, an invite token and links the employee when an email is given", async () => {
     const res = mockRes();
-    await createEmployee(makeReq({ document_type: undefined, ...OWNER, email: EMAIL }), res);
+    await createEmployee(makeReq({ document_type: undefined, ...OWNER, email: EMAIL, send_invite: true }), res);
 
     const sql = connSql().join("\n");
     expect(sql).toContain("INSERT INTO users");
@@ -99,7 +100,7 @@ describe("createEmployee — automatic platform-user invite", () => {
 
   it("emails a set-password link containing the raw token", async () => {
     const res = mockRes();
-    await createEmployee(makeReq({ ...OWNER, email: EMAIL }), res);
+    await createEmployee(makeReq({ ...OWNER, email: EMAIL, send_invite: true }), res);
 
     expect(sendInviteEmail).toHaveBeenCalledTimes(1);
     const arg = sendInviteEmail.mock.calls[0][0];
@@ -113,7 +114,7 @@ describe("createEmployee — automatic platform-user invite", () => {
     // module-flag lookup. If a subscription gate were reintroduced it would show
     // up as an extra subscription/module query here.
     const res = mockRes();
-    await createEmployee(makeReq({ ...OWNER, email: EMAIL }), res);
+    await createEmployee(makeReq({ ...OWNER, email: EMAIL, send_invite: true }), res);
 
     const allSql = [...connSql(), ...pool.query.mock.calls.map(([s]) => String(s))].join("\n");
     expect(allSql).not.toMatch(/subscription_plans/);
@@ -134,12 +135,21 @@ describe("createEmployee — automatic platform-user invite", () => {
   it("reports a mail failure without losing the created employee", async () => {
     sendInviteEmail.mockRejectedValueOnce(new Error("smtp down"));
     const res = mockRes();
-    await createEmployee(makeReq({ ...OWNER, email: EMAIL }), res);
+    await createEmployee(makeReq({ ...OWNER, email: EMAIL, send_invite: true }), res);
 
     const body = res.json.mock.calls[0][0];
     // The transaction is already committed by the time mail is attempted.
     expect(h.conn.commit).toHaveBeenCalled();
-    expect(body.message).toContain("invite email failed");
-    expect(body.data?._email_warning ?? body._email_warning).toContain("Invite email failed");
+    expect(body.message).toContain("invite delivery failed");
+    expect(body.data?._email_warning ?? body._email_warning).toContain("could not be delivered");
+  });
+
+  it("creates a roster-only employee when email exists but portal access is off", async () => {
+    const res = mockRes();
+    await createEmployee(makeReq({ ...OWNER, email: EMAIL, send_invite: false }), res);
+    const sql = connSql().join("\n");
+    expect(sql).not.toContain("INSERT INTO users");
+    expect(sql).not.toContain("INSERT INTO invite_tokens");
+    expect(sendInviteEmail).not.toHaveBeenCalled();
   });
 });

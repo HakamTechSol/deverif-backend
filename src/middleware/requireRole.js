@@ -36,8 +36,19 @@ export default function requireRole(...allowedRoles) {
       if (await isBlacklisted(token)) throw new ApiError(401, "Token has been revoked");
 
       const [rows] = await pool.query(
+        // `feature_access` added deliberately. It was missing here while being
+        // present in authUser's SELECT, which meant any requirePermission() placed
+        // after requireRole read `undefined` — and parseFeatureAccess(undefined)
+        // returns the DEFAULTS, so a sub-admin was denied permissions they had
+        // genuinely been granted, with no error anywhere to explain why. The failure
+        // was silent because a missing column and an empty permission map look the
+        // same from the outside.
+        //
+        // Nothing on a requireRole route read it until now, which is why it was
+        // never noticed: the two middlewares disagreed and only the one that read
+        // the column was exercised.
         `SELECT id, uuid, full_name, email, phone, cnic, status, org_role,
-                organization,
+                feature_access, organization,
                 profile_image, is_verified, created_at
          FROM users WHERE uuid=?`,
         [decoded.userId]

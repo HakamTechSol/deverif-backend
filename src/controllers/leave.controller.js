@@ -37,7 +37,7 @@ async function resolveScopeOrgId(req) {
 export async function listLeaveTypes(req, res) {
   const orgId = await resolveScopeOrgId(req);
   const [rows] = await pool.query(
-    `SELECT lt.id, lt.name, lt.days_allowed_per_year, lt.created_at,
+    `SELECT lt.id, lt.name, lt.days_allowed_per_year, lt.is_paid, lt.created_at,
             o.uuid AS organization_uuid, o.name AS organization_name
      FROM leave_types lt
      JOIN organizations o ON o.id = lt.organization_id
@@ -48,10 +48,27 @@ export async function listLeaveTypes(req, res) {
   return ok(res, { leaveTypes: rows }, "Leave types");
 }
 
+/**
+ * Normalise a paid/unpaid marker to the column's enum.
+ *
+ * Defaults to 'yes' when absent, for the same reason the column itself defaults
+ * to 'yes': Annual and Sick are paid by law, and a missing flag must never be
+ * read as a reason to dock pay. "no" is the value that has to be asked for.
+ */
+function paidFlag(value) {
+  if (value === undefined || value === null || value === "") return "yes";
+  if (typeof value === "boolean") return value ? "yes" : "no";
+  const s = String(value).toLowerCase();
+  if (s === "no" || s === "false" || s === "0") return "no";
+  if (s === "yes" || s === "true" || s === "1") return "yes";
+  throw new ApiError(400, "is_paid must be yes/no");
+}
+
 export async function createLeaveType(req, res) {
   const orgId = await resolveScopeOrgId(req);
-  const { name, days_allowed_per_year } = req.body;
+  const { name, days_allowed_per_year, is_paid } = req.body;
   if (!name || !String(name).trim()) throw new ApiError(400, "name is required");
+  if (is_paid === undefined || is_paid === null || is_paid === "") throw new ApiError(400, "Choose whether this leave type is paid or unpaid.");
   // Leave types are now name-only definitions (allocations are assigned
   // individually per employee). The legacy days column is kept but no longer
   // drives employee balances — it defaults to 0.
@@ -61,8 +78,8 @@ export async function createLeaveType(req, res) {
   let result;
   try {
     [result] = await pool.query(
-      "INSERT INTO leave_types (organization_id, name, days_allowed_per_year) VALUES (?, ?, ?)",
-      [orgId, String(name).trim(), days]
+      "INSERT INTO leave_types (organization_id, name, days_allowed_per_year, is_paid) VALUES (?, ?, ?, ?)",
+      [orgId, String(name).trim(), days, paidFlag(is_paid)]
     );
   } catch (e) {
     if (String(e.message).includes("Duplicate")) {
@@ -72,7 +89,7 @@ export async function createLeaveType(req, res) {
   }
 
   const [rows] = await pool.query(
-    "SELECT id, name, days_allowed_per_year FROM leave_types WHERE id=?",
+    "SELECT id, name, days_allowed_per_year, is_paid FROM leave_types WHERE id=?",
     [result.insertId]
   );
   logAudit({
@@ -97,7 +114,7 @@ export async function updateLeaveType(req, res) {
   );
   if (!exists.length) throw new ApiError(404, "Leave type not found");
 
-  const { name, days_allowed_per_year } = req.body;
+  const { name, days_allowed_per_year, is_paid } = req.body;
   const updates = {};
   if (name !== undefined) {
     if (!String(name).trim()) throw new ApiError(400, "name cannot be empty");
@@ -107,6 +124,9 @@ export async function updateLeaveType(req, res) {
     const days = parseInt(days_allowed_per_year, 10);
     if (isNaN(days) || days < 0) throw new ApiError(400, "days_allowed_per_year must be a non-negative integer");
     updates.days_allowed_per_year = days;
+  }
+  if (is_paid !== undefined) {
+    updates.is_paid = paidFlag(is_paid);
   }
   if (!Object.keys(updates).length) throw new ApiError(400, "Nothing to update");
 
@@ -120,7 +140,7 @@ export async function updateLeaveType(req, res) {
   }
 
   const [rows] = await pool.query(
-    "SELECT id, name, days_allowed_per_year FROM leave_types WHERE id=?",
+    "SELECT id, name, days_allowed_per_year, is_paid FROM leave_types WHERE id=?",
     [id]
   );
   logAudit({
@@ -319,6 +339,13 @@ export async function createLeave(req, res) {
         message: `${req.user.full_name} requested ${days} day(s) of ${ltRows[0].name} leave.`,
         link: "/org/leaves",
         referenceId: rows[0].uuid,
+        email: {
+          category: "leave",
+          eventKey: `leave:${rows[0].uuid}:submitted`,
+          subject: `Leave request needs review — ${req.user.full_name}`,
+          title: "New leave request",
+          message: `${req.user.full_name} requested ${days} day(s) of ${ltRows[0].name} leave. Please review the request in Dverif.`,
+        },
       });
     }
   } catch (e) {
@@ -387,63 +414,6 @@ export async function listOrgLeaves(req, res) {
     [...params, limit, offset]
   );
   return ok(res, paginatedResponse(rows, total, page, limit), "Org leave requests");
-}
-
-export async function listAllLeaves(req, res) {
-  const { page, limit, offset } = parsePagination(req.query);
-  const status = typeof req.query.status === "string" && req.query.status.trim()
-    ? req.query.status.trim() : "";
-  const search = typeof req.query.search === "string" ? req.query.search.trim() : "";
-  const orgUuid = typeof req.query.organization_uuid === "string" && req.query.organization_uuid.trim()
-    ? req.query.organization_uuid.trim() : "";
-
-  let whereClause = "WHERE 1=1";
-  const params = [];
-  if (["pending", "approved", "rejected"].includes(status)) {
-    whereClause += " AND lr.status = ?";
-    params.push(status);
-  }
-  if (orgUuid) {
-    assertUuid(orgUuid, "Organization UUID");
-    whereClause += " AND o.uuid = ?";
-    params.push(orgUuid);
-  }
-  if (search) {
-    whereClause += " AND (e.full_name LIKE ? OR e.email LIKE ? OR lt.name LIKE ?)";
-    const like = `%${search}%`;
-    params.push(like, like, like);
-  }
-
-  const [[{ total }]] = await pool.query(
-    `SELECT COUNT(*) AS total
-     FROM leave_requests lr
-     JOIN employees e ON e.uuid = lr.employee_uuid
-     JOIN leave_types lt ON lt.id = lr.leave_type_id
-     JOIN organizations o ON o.id = e.organization_id
-     ${whereClause}`,
-    params
-  );
-  const [rows] = await pool.query(
-    `SELECT lr.uuid,
-            DATE_FORMAT(lr.start_date, '%Y-%m-%d') AS start_date,
-            DATE_FORMAT(lr.end_date, '%Y-%m-%d') AS end_date,
-            lr.reason, lr.status,
-            lr.approved_by, lr.approved_at, lr.created_at,
-            e.uuid AS employee_uuid, e.full_name AS employee_name,
-            e.email AS employee_email, dg.name AS designation,
-            o.uuid AS organization_uuid, o.name AS organization_name,
-            lt.id AS leave_type_id, lt.name AS leave_type_name
-     FROM leave_requests lr
-     JOIN employees e ON e.uuid = lr.employee_uuid
-     LEFT JOIN designations dg ON dg.id = e.designation_id
-     JOIN leave_types lt ON lt.id = lr.leave_type_id
-     JOIN organizations o ON o.id = e.organization_id
-     ${whereClause}
-     ORDER BY lr.created_at DESC
-     LIMIT ? OFFSET ?`,
-    [...params, limit, offset]
-  );
-  return ok(res, paginatedResponse(rows, total, page, limit), "Leave requests");
 }
 
 export async function decideLeave(req, res) {
@@ -542,6 +512,13 @@ export async function decideLeave(req, res) {
         message: `Your ${lr.leave_type_name} leave request (${isoDate(lr.start_date)} → ${isoDate(lr.end_date)}) was ${statusText.toLowerCase()}.`,
         link: "/leaves",
         referenceId: uuid,
+        email: {
+          category: "leave",
+          eventKey: `leave:${uuid}:decision:${status}`,
+          subject: `Your ${lr.leave_type_name} leave was ${statusText.toLowerCase()}`,
+          title: `Leave ${statusText.toLowerCase()}`,
+          message: `Your ${lr.leave_type_name} leave request (${isoDate(lr.start_date)} to ${isoDate(lr.end_date)}) was ${statusText.toLowerCase()}.`,
+        },
       });
     } catch (e) {
       console.error("Leave decision notification failed:", e.message);

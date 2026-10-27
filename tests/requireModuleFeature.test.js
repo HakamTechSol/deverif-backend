@@ -2,16 +2,19 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 
 vi.mock("../src/config/db.js", () => ({ pool: { query: vi.fn() } }));
 
-import requireModuleFeature, { MODULE_FEATURE_KEYS, assertModuleFeature, FEATURE_NOT_INCLUDED_MESSAGE, NO_ACTIVE_SUBSCRIPTION_MESSAGE } from "../src/middleware/requireModuleFeature.js";
+import requireModuleFeature, { MODULE_FEATURE_KEYS, assertModuleFeature, upgradeRequiredError, FEATURE_NOT_INCLUDED_MESSAGE, NO_ACTIVE_SUBSCRIPTION_MESSAGE } from "../src/middleware/requireModuleFeature.js";
+import { ALL_MODULE_KEYS, ORIGINAL_MODULE_KEYS } from "./helpers/moduleKeyFixtures.js";
 import { pool } from "../src/config/db.js";
 
-const FULL_TRUES = JSON.stringify({
-  employee_management: true,
-  attendance_management: true,
-  user_management: true,
-  leave_management: true,
-  payroll_management: true,
-});
+/**
+ * A fully provisioned plan, i.e. what every `subscription_plans.module_flags`
+ * row looks like AFTER migrations/20261101_hr_modules_backfill_module_flags.sql.
+ * Kept as one literal rather than derived so a test that accidentally depends on
+ * a module key no longer existing fails loudly instead of quietly passing.
+ */
+const FULL_TRUES = JSON.stringify(
+  Object.fromEntries(ALL_MODULE_KEYS.map((key) => [key, true]))
+);
 
 let orgRow;
 
@@ -44,14 +47,75 @@ describe("requireModuleFeature", () => {
     expect(() => requireModuleFeature("billing_management")).toThrowError(/Invalid module feature key/);
   });
 
-  it("exposes the five allowed module keys", () => {
+  it("exposes every allowed module key, in the documented order", () => {
+    // The five pre-existing core-HR modules must stay FIRST and in this exact
+    // order — utils/moduleFlags.js documents that the leading order is pinned
+    // so diffs against older revisions stay small. The thirteen workforce /
+    // money-ops / automation modules follow.
     expect(MODULE_FEATURE_KEYS).toEqual([
       "employee_management",
       "attendance_management",
       "user_management",
       "leave_management",
       "payroll_management",
+      "manpower_management",
+      "recruitment_management",
+      "onboarding_management",
+      "separation_management",
+      "training_management",
+      "performance_management",
+      "piece_work_management",
+      "expense_management",
+      "travel_management",
+      "asset_management",
+      "helpdesk_management",
+      "scheduled_reports",
+      "hr_letters_management",
     ]);
+  });
+
+  it("has no duplicate module keys", () => {
+    expect(new Set(MODULE_FEATURE_KEYS).size).toBe(MODULE_FEATURE_KEYS.length);
+  });
+
+  // Every newly added module must behave identically to the original five, or
+  // a module could ship unreachable (locked) or silently ungated (open) while
+  // every other gate test still passed.
+  it.each(MODULE_FEATURE_KEYS.filter((k) => !ORIGINAL_MODULE_KEYS.includes(k)))(
+    "%s is gated by the plan's module_flags like any other module",
+    async (key) => {
+      // ON -> allowed.
+      orgRow.module_flags = JSON.stringify({ [key]: true });
+      const allow = mockNext();
+      await requireModuleFeature(key)(reqWith(), {}, allow);
+      expect(allow).toHaveBeenCalledTimes(1);
+      expect(allow.mock.calls[0][0]).toBeUndefined();
+
+      // OFF -> the distinct UPGRADE_REQUIRED 403 naming that module.
+      orgRow.module_flags = JSON.stringify({ [key]: false });
+      const deny = mockNext();
+      await requireModuleFeature(key)(reqWith(), {}, deny);
+      expect(deny.mock.calls[0][0].code).toBe("UPGRADE_REQUIRED");
+      expect(deny.mock.calls[0][0].extra).toMatchObject({ module: key, can_retry: false });
+
+      // ABSENT -> also locked. isModuleIncluded() is `flags[key] === true`, so a
+      // key the plan never stored reads as undefined and is blocked. This is
+      // exactly the trap migrations/20261101_hr_modules_backfill_module_flags.sql
+      // exists to close, so it is pinned here deliberately.
+      orgRow.module_flags = JSON.stringify({ employee_management: true });
+      const absent = mockNext();
+      await requireModuleFeature(key)(reqWith(), {}, absent);
+      expect(absent.mock.calls[0][0].code).toBe("UPGRADE_REQUIRED");
+    }
+  );
+
+  it("gives every module a human label, so no user sees a raw snake_case key", () => {
+    for (const key of MODULE_FEATURE_KEYS) {
+      const err = upgradeRequiredError(key);
+      expect(err.extra.module_label, key).toBeTruthy();
+      expect(err.extra.module_label, key).toMatch(/^[A-Z]/);
+      expect(err.message, key).toContain(err.extra.module_label);
+    }
   });
 
   it("403s when the request has no organization", async () => {

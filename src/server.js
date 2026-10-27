@@ -6,6 +6,7 @@ import { checkAndSendExpiryReminders } from "./controllers/admin/organizations.c
 import { applyDueSubscriptionChanges } from "./services/subscriptionLifecycle.service.js";
 import { syncDocumentTypesOnBoot } from "./services/documentTypeSync.js";
 import { assertVerifyBaseUrlConfigured } from "./utils/qrCertificate.js";
+import { startEmailOutboxWorker } from "./services/notificationEmail.worker.js";
 
 const PORT = process.env.PORT || 5000;
 
@@ -50,6 +51,7 @@ try {
     }
 
     app.listen(PORT, () => console.log(`✅ Server running on http://localhost:${PORT}`));
+    startEmailOutboxWorker();
 
     // Push the document-type catalogue to the Python document service so a type
     // added from the admin UI resolves to a real extraction schema there. The

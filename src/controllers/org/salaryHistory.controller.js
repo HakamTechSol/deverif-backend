@@ -1,6 +1,7 @@
 import ApiError from "../../utils/ApiError.js";
 import { pool } from "../../config/db.js";
 import { ok } from "../../utils/response.js";
+import { isoDate } from "../../utils/leaveBalance.js";
 import { assertUuid } from "../../utils/publicResponse.js";
 import { logAudit, getActorFromReq } from "../../utils/auditLog.js";
 
@@ -65,7 +66,28 @@ export async function listEmployeeSalaryHistory(req, res) {
     [employee.uuid]
   );
 
-  return ok(res, { history: rows }, "Employee salary history");
+  /*
+   * DATES ARE NORMALISED BEFORE THEY LEAVE, and this is the fix for a live bug.
+   *
+   * The pool is created without `dateStrings`, so mysql2 parses a MySQL DATE into
+   * a JS Date at LOCAL midnight. On a UTC+5 server a stored 2026-10-01 arrives as
+   * 2026-09-30T19:00:00Z, serialises to that instant, and the client reads the
+   * 30th. Every salary history row therefore displayed a day EARLIER than it was,
+   * which reads as "your raise took effect yesterday" about a raise that took
+   * effect today — and on the Effective Period column it is the only thing the
+   * recruiter uses to tell two adjacent rows apart.
+   *
+   * This is the same correction payroll.service.js and leaveBalance.js already
+   * carry: read the LOCAL calendar fields, which round-trip a local-midnight Date
+   * exactly. Imported rather than re-derived so the fix lives in one place.
+   */
+  const history = rows.map((row) => ({
+    ...row,
+    effective_from: isoDate(row.effective_from),
+    effective_to: row.effective_to === null ? null : isoDate(row.effective_to),
+  }));
+
+  return ok(res, { history }, "Employee salary history");
 }
 
 // ---------------------------------------------------------------------------

@@ -26,6 +26,10 @@ export async function listLeaveAllocations(req, res) {
     "SELECT id, name FROM leave_types WHERE organization_id=? ORDER BY name",
     [orgId]
   );
+  const [designations] = await pool.query(
+    "SELECT uuid, name FROM designations WHERE organization_id=? ORDER BY name",
+    [orgId]
+  );
 
   // `e.status <> 'removed'` was here and was ALWAYS TRUE: 'removed' has never been
   // a member of the status enum, so MySQL coerced the literal to index 0 and the
@@ -37,7 +41,8 @@ export async function listLeaveAllocations(req, res) {
   // and are still accruing/entitling leave, so excluding them would let an
   // admin assign nothing to a colleague they merely switched off.
   const [employees] = await pool.query(
-    `SELECT e.uuid AS employee_uuid, e.full_name, e.email, dg.name AS designation, dp.name AS department, e.status
+    `SELECT e.uuid AS employee_uuid, e.full_name, e.email, dg.uuid AS designation_uuid,
+            dg.name AS designation, dp.name AS department, e.status
      FROM employees e
      LEFT JOIN designations dg ON dg.id = e.designation_id
      LEFT JOIN departments dp ON dp.id = e.department_id
@@ -66,6 +71,7 @@ export async function listLeaveAllocations(req, res) {
     employee_uuid: e.employee_uuid,
     full_name: e.full_name,
     email: e.email,
+    designation_uuid: e.designation_uuid,
     designation: e.designation,
     department: e.department,
     status: e.status,
@@ -80,7 +86,87 @@ export async function listLeaveAllocations(req, res) {
     }),
   }));
 
-  return ok(res, { year, leaveTypes: types, employees: employeeRows }, "Leave allocations");
+  return ok(res, { year, leaveTypes: types, designations, employees: employeeRows }, "Leave allocations");
+}
+
+/**
+ * PUT /org/leave-allocations/designation
+ * Saves a type/year policy and applies it to every eligible employee currently
+ * assigned to the designation. New employees inherit this policy on hire.
+ */
+export async function setDesignationLeaveAllocation(req, res) {
+  const orgId = req.scopeOrgId;
+  const { designation_uuid, leave_type_id, year, allocated_days } = req.body || {};
+  assertUuid(designation_uuid, "Designation UUID");
+  const typeId = parseInt(leave_type_id, 10);
+  const yr = parseYear(year);
+  if (isNaN(typeId)) throw new ApiError(400, "leave_type_id is required");
+  const alloc = parseInt(allocated_days, 10);
+  if (isNaN(alloc) || alloc < 0) {
+    throw new ApiError(400, "allocated_days must be a non-negative integer");
+  }
+
+  const [[designation]] = await pool.query(
+    "SELECT id, name FROM designations WHERE uuid=? AND organization_id=?",
+    [designation_uuid, orgId]
+  );
+  if (!designation) throw new ApiError(404, "Designation not found");
+  const [[lt]] = await pool.query(
+    "SELECT id, name FROM leave_types WHERE id=? AND organization_id=?",
+    [typeId, orgId]
+  );
+  if (!lt) throw new ApiError(404, "Leave type not found");
+
+  const conn = await pool.getConnection();
+  let employeeCount = 0;
+  try {
+    await conn.beginTransaction();
+    const [[count]] = await conn.query(
+      `SELECT COUNT(*) AS employee_count FROM employees
+       WHERE organization_id=? AND designation_id=? AND status IN ('active','current_employee')`,
+      [orgId, designation.id]
+    );
+    employeeCount = Number(count.employee_count);
+
+    await conn.query(
+      `INSERT INTO designation_leave_policies
+         (uuid, organization_id, designation_id, leave_type_id, year, allocated_days)
+       VALUES (UUID(), ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE allocated_days=VALUES(allocated_days)`,
+      [orgId, designation.id, typeId, yr, alloc]
+    );
+
+    if (employeeCount) {
+      await conn.query(
+        `INSERT INTO employee_leave_allocations
+           (uuid, employee_uuid, leave_type_id, year, allocated_days, used_days, remaining_days)
+         SELECT UUID(), e.uuid, ?, ?, ?, 0, ?
+         FROM employees e
+         WHERE e.organization_id=? AND e.designation_id=? AND e.status IN ('active','current_employee')
+         ON DUPLICATE KEY UPDATE
+           allocated_days=VALUES(allocated_days),
+           remaining_days=GREATEST(0, VALUES(allocated_days)-used_days)`,
+        [typeId, yr, alloc, alloc, orgId, designation.id]
+      );
+    }
+    await conn.commit();
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+
+  logAudit({
+    ...getActorFromReq(req),
+    action: "leave_allocation.set_designation",
+    entityType: "designation_leave_allocation",
+    entityId: designation_uuid,
+    details: { designation_uuid, designation: designation.name, leave_type_id: typeId, year: yr, allocated_days: alloc, employee_count: employeeCount },
+    req,
+  });
+
+  return ok(res, { designation_uuid, designation: designation.name, leave_type_name: lt.name, year: yr, allocated_days: alloc, employee_count: employeeCount }, "Designation leave policy saved");
 }
 
 /**

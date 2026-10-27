@@ -42,10 +42,18 @@ export async function loginUser(req, res) {
   const user = rows[0];
   if (user.status !== "active") throw new ApiError(403, "User inactive");
 
-  // NEW: Check if the linked employee record is inactive and the user is a platform user.
+  // Check if the linked employee record is inactive and the user is a platform user.
+  // This blocks login immediately even if the users table status is still 'active'.
+  //
+  // Match on users.uuid, NOT users.id. employees.linked_user_uuid holds a UUID -
+  // employeeAccess.service.js writes `linked_user_uuid = user.uuid` when an
+  // employee is granted portal access. Comparing that column against the integer
+  // primary key silently matches nothing, so `employees` comes back empty and this
+  // guard never fires. This is a security control, so a lookup that quietly matches
+  // zero rows is the worst possible failure mode for it.
   const [employees] = await pool.query(
     `SELECT is_platform_user, status FROM employees WHERE linked_user_uuid = ?`,
-    [user.id]
+    [user.uuid]
   );
   if (employees.length && employees[0].is_platform_user === 'yes' && employees[0].status === 'inactive') {
     throw new ApiError(403, "Your account has been deactivated. Contact your organization admin.");

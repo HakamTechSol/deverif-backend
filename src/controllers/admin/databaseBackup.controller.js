@@ -7,7 +7,7 @@ import { logAudit, getActorFromReq } from "../../utils/auditLog.js";
  * Full logical database backup: schema + data, as a .sql file.
  *
  * WHAT THIS CONTAINS: every table's CREATE TABLE statement, every index, every
- * view and every row of every table â€” which includes hashed user passwords, the
+ * view and every row of every table —” which includes hashed user passwords, the
  * AES-encrypted CNIC values on `persons`, JWT secrets if any were ever stored,
  * and every uploaded document's metadata. A backup file is therefore a
  * credential-equivalent artifact: anyone holding it can impersonate an account.
@@ -148,7 +148,7 @@ export async function downloadDatabaseBackup(req, res) {
 
   // The CALLBACK connection, not mysql2/promise: only the callback API returns a
   // Query object that is async-iterable, and streaming row by row is the whole
-  // point â€” a promise connection would buffer every row of a table in memory
+  // point —” a promise connection would buffer every row of a table in memory
   // before the first byte of the dump is written. The few metadata reads are
   // promisified individually by `q()` below.
   try {

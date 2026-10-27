@@ -20,6 +20,14 @@ import ApiError from "../utils/ApiError.js";
 // .env file. Reading process.env per request guarantees the configured values.
 const TIMEOUT_MS = 8000;
 
+// /ocr/extract additionally runs the Laya decision engine on the OCR text.
+// That is an inference, not a file read: the first checkpoint build measured
+// 60-124s and a warm inference 1.7-35s on CPU, so it needs its own budget
+// rather than the file-oriented one above. The engine is off by default and
+// fails open, so this only has to cover the budget it is actually configured
+// with (LAYA_TIMEOUT_S, default 30s) plus the extraction it rides along with.
+const OCR_EXTRACT_TIMEOUT_MS = 45000;
+
 function baseUrl() {
   return String(process.env.DOC_SERVICE_URL || "http://localhost:5001").replace(/\/+$/, "");
 }
@@ -37,7 +45,7 @@ export class DocumentServiceError extends ApiError {
   }
 }
 
-async function request(endpoint, files, textFields = {}) {
+async function request(endpoint, files, textFields = {}, { timeoutMs = TIMEOUT_MS } = {}) {
   const serviceKey = apiKey();
   if (!serviceKey) {
     throw new DocumentServiceError(
@@ -61,7 +69,7 @@ async function request(endpoint, files, textFields = {}) {
   }
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   let response;
   try {
@@ -75,7 +83,7 @@ async function request(endpoint, files, textFields = {}) {
     if (error.name === "AbortError") {
       throw new DocumentServiceError(
         503,
-        `Document service timed out after ${TIMEOUT_MS}ms (${endpoint})`,
+        `Document service timed out after ${timeoutMs}ms (${endpoint})`,
         { kind: "timeout", cause: error }
       );
     }
@@ -118,16 +126,73 @@ export function validate(filePath) {
 /**
  * Schema-driven OCR identity extraction.
  * UseResult: data.document_type (canonical key) and data.fields, where each
- * canonical field is {value, confidence: "high"|"low"|"not_visible"}.
+ * canonical field is {value, confidence: "high"|"low"|"not_visible"}, plus the
+ * advisory data.laya block (see `layaAssessment`).
  * documentType is the verification request's document_type; unknown or omitted
  * types fall back to the generic (name + cnic) schema.
+ *
+ * Gets a longer budget than the other endpoints because it now runs an
+ * inference as well as the OCR extraction.
  */
 export function ocrExtract(filePath, documentType) {
   return request(
     "/ocr/extract",
     { file: filePath },
-    documentType ? { document_type: documentType } : {}
+    documentType ? { document_type: documentType } : {},
+    { timeoutMs: OCR_EXTRACT_TIMEOUT_MS }
   );
+}
+
+/**
+ * Pull the advisory Laya block off an /ocr/extract result.
+ *
+ * UseResult: `{enabled, reason, documentType, documentTypeProbabilities}` or,
+ * when the engine did not answer, `{enabled: false, reason}`.
+ *
+ * FAILS OPEN BY DESIGN. Every call here is wrapped so that any transport or
+ * payload problem degrades to `{enabled: false}` instead of throwing: the
+ * authoritative verification signals are data.fields and data.document_type,
+ * and an advisory feature must never be able to fail a verification request.
+ *
+ * `documentType` is the ONLY field a caller may act on. `document_risk` and
+ * `is_official_document` come back from the model uncalibrated — measured high
+ * risk on a clean CNIC at 0.33-0.58 and on random noise at 0.27-0.53, against
+ * 0.65 for an actually tampered payslip — so gating on them would reject
+ * legitimate employee documents. `riskScore` is deliberately not exported.
+ */
+export function layaAssessment(extractResult) {
+  const off = (reason) => ({ enabled: false, reason });
+
+  try {
+    const laya = extractResult?.data?.laya;
+    if (!laya) return off("not_reported");
+    if (laya.available !== true) return off(laya.reason || "unavailable");
+
+    const type = laya.answers?.document_type;
+    if (!type) return off("no_document_type");
+
+    return {
+      enabled: true,
+      model: laya.model || null,
+      checkpoint: laya.checkpoint || null,
+      elapsedMs: typeof laya.elapsed_ms === "number" ? laya.elapsed_ms : null,
+      truncated: laya.truncated === true,
+      documentType: type.value,
+      documentTypeProbability: type.probability,
+      documentTypeProbabilities: type.probabilities || {},
+      // Present but explicitly untrusted, so a UI can show them without a
+      // caller having to re-derive which questions were calibrated.
+      advisory: {
+        isOfficialDocument: laya.answers?.is_official_document?.value ?? null,
+        isOfficialDocumentProbability: laya.answers?.is_official_document?.probability ?? null,
+        riskLabel: laya.answers?.document_risk?.value ?? null,
+        riskProbability: laya.answers?.document_risk?.probability ?? null,
+        trusted: false
+      }
+    };
+  } catch (error) {
+    return off("malformed");
+  }
 }
 
 /**

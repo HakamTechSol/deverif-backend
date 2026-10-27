@@ -368,6 +368,25 @@ function emailWrapper(bodyHtml, lang = "en", preheader = "") {
 </html>`;
 }
 
+/** Shared branded template for queued workflow notifications. */
+export async function sendWorkflowNotificationEmail({ to, subject, title, message, actionUrl, lang = "en" }) {
+  const transporter = getMailerTransport();
+  if (!transporter) throw new Error("SMTP is not configured");
+  const bodyHtml = [
+    badge(lang === "ur" ? "خودکار اطلاع" : "Workflow notification", "info"),
+    h1(esc(title)),
+    p(esc(message).replace(/\n/g, "<br>")),
+    actionUrl ? button(actionUrl, lang === "ur" ? "کھولیں" : "Open in Dverif", lang) : "",
+    actionUrl ? linkFallback(actionUrl, lang) : "",
+  ].join("");
+  await transporter.sendMail(buildMail({
+    to,
+    subject,
+    text: [title, "", message, actionUrl ? `\n${actionUrl}` : ""].join("\n"),
+    html: emailWrapper(bodyHtml, lang, title),
+  }));
+}
+
 function requireTransport() {
   const transporter = getMailerTransport();
   if (!transporter) {
@@ -379,6 +398,67 @@ function requireTransport() {
 // ─────────────────────────────────────────────────────────────
 // Emails
 // ─────────────────────────────────────────────────────────────
+export async function sendRecruitmentOfferEmail({ to, candidateName, openingTitle, renderedBody }) {
+  const transporter = requireTransport();
+  if (!to) throw new Error("Candidate email is required to send an offer");
+  const safeName = esc(candidateName || "Candidate");
+  const safeOpening = esc(openingTitle || "your application");
+  const safeBody = esc(renderedBody || "");
+  const appName = process.env.APP_NAME || "Dverif";
+  return transporter.sendMail(buildMail({
+    to,
+    subject: `${appName} ? Offer for ${openingTitle || "your application"}`,
+    text: `Dear ${candidateName || "Candidate"},\n\n${renderedBody}\n\nRegards,\n${appName}`,
+    html: emailWrapper([
+      h1("Your employment offer"),
+      p(`Dear ${safeName}, we are pleased to share an offer for ${safeOpening}.`),
+      `<pre style="white-space:pre-wrap;font-family:${FONT};line-height:1.6;color:${INK};background:#fff;padding:16px;border:1px solid ${BORDER};border-radius:8px">${safeBody}</pre>`,
+    ].join(""), "en", "Employment offer"),
+  }));
+}
+
+export async function sendOffboardingUpdateEmail({
+  to,
+  employeeName,
+  requestType,
+  status,
+  lastWorkingDay,
+  daysUntilLastWorkingDay,
+  reason,
+}) {
+  if (!to) throw new Error("Employee email is required to send an offboarding update");
+  const transporter = requireTransport();
+  const appName = process.env.APP_NAME || "Dverif";
+  const safeName = esc(employeeName || "Employee");
+  const safeType = esc(requestType === "termination" ? "termination" : "resignation");
+  const safeStatus = esc(status);
+  const safeDate = esc(lastWorkingDay);
+  const safeReason = reason ? esc(reason) : "";
+  const days = Math.max(0, Number(daysUntilLastWorkingDay) || 0);
+  const text = [
+    `Dear ${employeeName || "Employee"},`,
+    "",
+    `Your ${requestType} request status is: ${status}.`,
+    `Last working day: ${lastWorkingDay}.`,
+    ...(reason ? [`Reason: ${reason}.`] : []),
+    `${days} calendar day(s) from the request date to the last working day.`,
+    "",
+    `Regards,\n${appName} HR`,
+  ].join("\n");
+  return transporter.sendMail(buildMail({
+    to,
+    subject: `${appName} - Offboarding update`,
+    text,
+    html: emailWrapper([
+      h1("Offboarding update"),
+      p(`Dear ${safeName}, your ${safeType} request status is: ${safeStatus}.`),
+      p(`Last working day: <strong>${safeDate}</strong>.`),
+      ...(safeReason ? [p(`Reason: ${safeReason}`)] : []),
+      p(`${days} calendar day(s) from the request date to the last working day.`),
+    ].join(""), "en", "Offboarding update"),
+  }));
+}
+
 export async function sendPasswordResetEmail({ to, resetLink, lang = "en" }) {
   const transporter = requireTransport();
 

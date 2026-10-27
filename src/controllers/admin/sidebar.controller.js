@@ -8,7 +8,7 @@ export async function getSidebarCounts(_req, res) {
     pool.query(`SELECT
       (SELECT COUNT(*) FROM contact_leads WHERE status='new') +
       (SELECT COUNT(*) FROM access_requests WHERE status='new') AS total`),
-    pool.query(`SELECT COUNT(*) AS total FROM support_tickets t WHERE t.status='open' AND ${OPEN_TICKET_NEEDS_ADMIN_REPLY}`),
+    pool.query(`SELECT COUNT(*) AS total FROM support_tickets t WHERE t.status='open' AND t.assigned_to_role='system_admin' AND ${OPEN_TICKET_NEEDS_ADMIN_REPLY}`),
     pool.query("SELECT COUNT(*) AS total FROM custom_plan_requests WHERE status='pending'"),
     pool.query("SELECT COUNT(*) AS total FROM unmatched_organizations WHERE status='pending'"),
   ]);

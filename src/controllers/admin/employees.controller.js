@@ -1,20 +1,22 @@
 import crypto from "crypto";
 import ApiError from "../../utils/ApiError.js";
-import { assertIdentityAvailable, rethrowIdentityDuplicate } from "../../utils/identityUniqueness.js";
+import { rethrowIdentityDuplicate } from "../../utils/identityUniqueness.js";
+import { createEmployeePortalInvite, deliverEmployeePortalInvite } from "../../services/employeeAccess.service.js";
 import { pool } from "../../config/db.js";
 import { ok, created } from "../../utils/response.js";
 import { assertUuid } from "../../utils/publicResponse.js";
-import { hashPassword } from "../../utils/password.js";
 import { parsePagination, paginatedResponse } from "../../utils/pagination.js";
 import { sendInviteEmail } from "../../utils/mailer.js";
 import { firstFrontendUrl } from "../../utils/frontendUrl.js";
 import { logAudit, getActorFromReq } from "../../utils/auditLog.js";
+import { applyDesignationLeavePolicies } from "../../utils/designationLeavePolicy.js";
 import { STAFF_ROLES, assertRole, ROLE_ORG_ADMIN } from "../../utils/roles.js";
+import { cnicError, isValidPhone as isValidContactPhone, normalizeCnic } from "../../utils/contactFormat.js";
 
-const EMPLOYEE_SELECT = `SELECT e.id, e.uuid, e.organization_id, e.full_name, e.email, e.phone,
+const EMPLOYEE_SELECT = `SELECT e.id, e.uuid, e.employee_code, e.organization_id, e.full_name, e.email, e.phone,
         e.cnic, dg.name AS designation, dp.name AS department, e.status, e.is_platform_user,
         e.linked_user_uuid, e.added_by_uuid, e.promoted_by_uuid, e.promoted_at,
-        e.joining_date, e.emergency_contact,
+        e.joining_date, e.employment_type, e.work_location, e.reporting_manager_uuid, manager.full_name AS reporting_manager_name, e.emergency_contact,
         e.created_at,
         o.uuid AS organization_uuid,
         o.name AS organization_name,
@@ -27,6 +29,8 @@ const EMPLOYEE_SELECT = `SELECT e.id, e.uuid, e.organization_id, e.full_name, e.
         it.expires_at AS invite_expires_at,
         it.used_at AS invite_used_at,
         it.created_at AS invite_sent_at,
+        it.delivery_status AS invite_delivery_status,
+        it.delivery_error AS invite_delivery_error,
         (SELECT COUNT(*) FROM employee_documents ed WHERE ed.employee_uuid = e.uuid) AS document_count,
         (SELECT h.basic_salary FROM employee_salary_history h
           WHERE h.employee_uuid = e.uuid AND h.effective_to IS NULL
@@ -40,6 +44,7 @@ const EMPLOYEE_SELECT = `SELECT e.id, e.uuid, e.organization_id, e.full_name, e.
  LEFT JOIN admin_profiles pu ON pu.uuid = e.promoted_by_uuid
  LEFT JOIN users pu2 ON pu2.uuid = e.promoted_by_uuid
  LEFT JOIN users u ON u.uuid = e.linked_user_uuid
+ LEFT JOIN employees manager ON manager.uuid=e.reporting_manager_uuid AND manager.organization_id=e.organization_id
  LEFT JOIN invite_tokens it ON it.user_uuid = e.linked_user_uuid
    AND it.id = (SELECT id FROM invite_tokens WHERE user_uuid = e.linked_user_uuid ORDER BY id DESC LIMIT 1)`;
 
@@ -110,7 +115,7 @@ async function resolveMetaId(conn, orgId, table, name) {
 }
 
 function normalizeEmployeePayload(body) {
-  const { full_name, email, phone, cnic, designation, department, status, joining_date, emergency_contact, current_salary } = body;
+  const { full_name, email, phone, cnic, designation, department, status, joining_date, emergency_contact, current_salary, employment_type, work_location, reporting_manager_uuid } = body;
   const errors = [];
 
   if (full_name === undefined || String(full_name).trim() === "") errors.push("full_name is required");
@@ -119,15 +124,41 @@ function normalizeEmployeePayload(body) {
   if (email !== undefined && email !== "" && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     errors.push("email is invalid");
   }
-  if (emergency_contact !== undefined && emergency_contact !== "" && !/^[0-9+\-() ]{6,30}$/.test(emergency_contact)) {
+  /*
+   * CNIC AND PHONE SHAPE, at the boundary.
+   *
+   * The frontend now validates both, and this is not a duplicate of that — a
+   * browser is not a trust boundary. The rule here is the SAME rule the shared
+   * `src/lib/contactFormat.ts` module applies in three screens, expressed once on
+   * the server: 13 bare digits for a CNIC (dashes and spaces accepted on input
+   * and stripped, because that is how they are typed), and a permissive phone
+   * pattern for digits, spaces and the punctuation people actually use.
+   *
+   * NOT tightened to be stricter. The employee form previously accepted "1", the
+   * candidate form accepted nothing at all, and the sub-admin form used a third
+   * regex — making them agree is the fix. Making them strict would reject numbers
+   * that are today stored and valid.
+   */
+  const cnicDigits = normalizeCnic(cnic);
+  if (cnicError(cnic)) {
+    errors.push("cnic must be 13 digits, e.g. 42101-2345678-9");
+  }
+  if (phone !== undefined && phone !== "" && !isValidContactPhone(String(phone))) {
+    errors.push("phone must be 7-15 digits and may contain spaces and + ( ) -");
+  }
+  if (emergency_contact !== undefined && emergency_contact !== "" && !isValidContactPhone(String(emergency_contact))) {
     errors.push("emergency_contact is invalid");
   }
+  const employmentTypes = ["full_time", "part_time", "contract", "temporary", "intern"];
+  if (employment_type !== undefined && employment_type !== null && employment_type !== "" && !employmentTypes.includes(employment_type)) errors.push("employment_type is invalid");
+  if (work_location !== undefined && String(work_location).trim().length > 150) errors.push("work_location must be 150 characters or fewer");
+  if (reporting_manager_uuid) assertUuid(reporting_manager_uuid, "Reporting manager UUID");
 
-  let normalizedCurrentSalary = 0;
+  let normalizedCurrentSalary = null;
   if (current_salary !== undefined && current_salary !== null && current_salary !== "") {
     const n = Number(current_salary);
-    if (!Number.isFinite(n) || n < 0) {
-      errors.push("current_salary must be a non-negative number");
+    if (!Number.isFinite(n) || n <= 0) {
+      errors.push("current_salary must be a positive number; omit it when compensation has not been agreed");
     } else {
       normalizedCurrentSalary = Math.round(n * 100) / 100;
     }
@@ -146,13 +177,19 @@ function normalizeEmployeePayload(body) {
     full_name: String(full_name).trim(),
     email: email ? String(email).trim() : null,
     phone: phone ? String(phone).trim() : null,
-    cnic: String(cnic).trim(),
+    // Bare digits, whatever the client sent. The display mask is a presentation
+    // concern; the column and every uniqueness check agree on this shape.
+    cnic: cnicDigits,
     designation: designation ? String(designation).trim() : null,
     department: department ? String(department).trim() : null,
     status: normalizedStatus,
     joining_date: joining_date ? String(joining_date).trim() : null,
+    employment_type: employment_type || null,
+    work_location: work_location ? String(work_location).trim() : null,
+    reporting_manager_uuid: reporting_manager_uuid || null,
     emergency_contact: emergency_contact ? String(emergency_contact).trim() : null,
     current_salary: normalizedCurrentSalary,
+    send_invite: body.send_invite === true,
   };
 }
 
@@ -175,6 +212,10 @@ export async function createEmployee(req, res) {
     );
     if (dupeEmp.length) throw new ApiError(409, "An employee with this email already exists");
   }
+  if (data.reporting_manager_uuid) {
+    const [manager] = await pool.query("SELECT uuid FROM employees WHERE uuid=? AND organization_id=? AND status IN ('active','current_employee')", [data.reporting_manager_uuid, orgId]);
+    if (!manager.length) throw new ApiError(400, "Choose an active reporting manager from this organization");
+  }
   const [dupeCnic] = await pool.query("SELECT uuid FROM employees WHERE cnic=?", [data.cnic]);
   if (dupeCnic.length) throw new ApiError(409, "An employee with this CNIC already exists");
 
@@ -188,10 +229,11 @@ export async function createEmployee(req, res) {
   // signs in and simply sees the plan-gated screens in their locked state.
   // Gating the invite itself would instead produce an account-less employee who
   // cannot be invited later without re-entering their details.
-  const wantsPlatformUser = !!data.email;
+  const wantsPlatformUser = data.send_invite;
+  if (wantsPlatformUser && !data.email) throw new ApiError(400, "A valid email is required when portal access is enabled");
   let createdEmployeeUuid = null;
   let linkedUserUuid = null;
-  let rawToken = null;
+  let portalInvite = null;
 
   const conn = await pool.getConnection();
   try {
@@ -201,64 +243,50 @@ export async function createEmployee(req, res) {
     const departmentId = await resolveMetaId(conn, orgId, "departments", data.department);
     const [res2] = await conn.query(
       `INSERT INTO employees
-       (uuid, organization_id, full_name, email, phone, cnic, designation_id, department_id, status,
+       (uuid, organization_id, full_name, email, phone, cnic, designation_id, department_id, employment_type, work_location, reporting_manager_uuid, status,
         joining_date, emergency_contact,
         is_platform_user, linked_user_uuid, added_by_uuid, promoted_by_uuid, promoted_at, created_at)
-       VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'no', NULL, ?, NULL, NULL, NOW())`,
+       VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'no', NULL, ?, NULL, NULL, NOW())`,
       [orgId, data.full_name, data.email, data.phone, data.cnic, designationId, departmentId,
-        data.status, data.joining_date, data.emergency_contact, addedByUuid]
+        data.employment_type, data.work_location, data.reporting_manager_uuid, data.status, data.joining_date, data.emergency_contact, addedByUuid]
     );
+    const employeeCode = `EMP-${String(res2.insertId).padStart(6, "0")}`;
+    await conn.query("UPDATE employees SET employee_code=? WHERE id=? AND organization_id=?", [employeeCode, res2.insertId, orgId]);
     const [[createdEmployee]] = await conn.query("SELECT uuid FROM employees WHERE id=?", [res2.insertId]);
     createdEmployeeUuid = createdEmployee.uuid;
+
+    if (designationId && ["active", "current_employee"].includes(data.status)) {
+      await applyDesignationLeavePolicies(conn, orgId, createdEmployeeUuid, designationId);
+    }
 
     // Requirement 2: capture the employee's starting salary as the first
     // employee_salary_history row (active period) at creation time.
     // created_by is intentionally NULL: this is an automatic/system row created
     // as a side-effect of employee creation, not a tracked admin action.
     const effFrom = data.joining_date || new Date().toISOString().slice(0, 10);
-    await conn.query(
-      `INSERT INTO employee_salary_history
-         (uuid, employee_uuid, year, basic_salary, effective_from, effective_to, created_at)
-       VALUES (UUID(), ?, ?, ?, ?, NULL, NOW())`,
-      [createdEmployeeUuid, Number(effFrom.slice(0, 4)), data.current_salary, effFrom]
-    );
+    if (data.current_salary !== null) {
+      await conn.query(
+        `INSERT INTO employee_salary_history
+           (uuid, employee_uuid, year, basic_salary, effective_from, effective_to, created_at)
+         VALUES (UUID(), ?, ?, ?, ?, NULL, NOW())`,
+        [createdEmployeeUuid, Number(effFrom.slice(0, 4)), data.current_salary, effFrom]
+      );
+    }
 
     if (wantsPlatformUser) {
-      const [existingUser] = await conn.query("SELECT uuid FROM users WHERE email=?", [data.email]);
-      if (existingUser.length) throw new ApiError(409, "A platform user with this email already exists");
       const [orgExists] = await conn.query("SELECT id FROM organizations WHERE id=?", [orgId]);
       if (!orgExists.length) throw new ApiError(400, "Organization no longer exists");
-
-      const orgRole = "employee";
-      const dummyHash = await hashPassword(crypto.randomBytes(16).toString("hex"));
-      // The employees table has its own per-organization CNIC check, but a phone
-      // number identifies the person across the whole platform, so it is checked
-      // globally here too — otherwise the same human could be onboarded into two
-      // organizations.
-      await assertIdentityAvailable({ phone: data.phone, cnic: data.cnic, executor: conn });
-      const [userRes] = await conn.query(
-        `INSERT INTO users
-         (full_name, email, phone, password, cnic, status, org_role, feature_access,
-          organization, profile_image, is_verified, created_at)
-         VALUES (?, ?, ?, ?, ?, 'inactive', ?, NULL, ?, NULL, 'no', NOW())`,
-        [data.full_name, data.email, data.phone || null, dummyHash, data.cnic, orgRole, orgId]
-      );
-      const [[newUser]] = await conn.query("SELECT uuid FROM users WHERE id=?", [userRes.insertId]);
-      linkedUserUuid = newUser.uuid;
-
-      rawToken = crypto.randomBytes(32).toString("hex");
-      const tokenHash = crypto.createHash("sha256").update(rawToken).digest("hex");
-      const expiresInHours = parseInt(process.env.INVITE_EXPIRES_IN_HOURS || "72", 10);
-      await conn.query(
-        "INSERT INTO invite_tokens (user_uuid, token_hash, expires_at) VALUES (?, ?, DATE_ADD(NOW(), INTERVAL ? HOUR))",
-        [newUser.uuid, tokenHash, expiresInHours]
-      );
-
-      const promotedByUuid = req.admin?.uuid || req.user?.uuid || null;
-      await conn.query(
-        `UPDATE employees SET is_platform_user='yes', linked_user_uuid=?, promoted_by_uuid=?, promoted_at=NOW() WHERE uuid=?`,
-        [newUser.uuid, promotedByUuid, createdEmployeeUuid]
-      );
+      portalInvite = await createEmployeePortalInvite({
+        conn,
+        employeeUuid: createdEmployeeUuid,
+        organizationId: orgId,
+        fullName: data.full_name,
+        email: data.email,
+        phone: data.phone,
+        cnic: data.cnic,
+        actorUuid: addedByUuid,
+      });
+      linkedUserUuid = portalInvite.userUuid;
     }
 
     await conn.commit();
@@ -274,19 +302,14 @@ export async function createEmployee(req, res) {
 
   // Sent after the transaction commits so a mail failure can never roll back a
   // successfully created employee.
-  let emailSent = false;
-  let emailError = null;
-  if (wantsPlatformUser && rawToken) {
-    const setLinkBase = firstFrontendUrl(process.env.FRONTEND_SET_PASSWORD_URL, "http://localhost:8080/set-password");
-    const setLink = `${setLinkBase}?token=${encodeURIComponent(rawToken)}`;
-    const invitedByName = req.admin?.full_name || req.user?.full_name || "Org Admin";
-    try {
-      await sendInviteEmail({ to: data.email, setLink, invitedByName });
-      emailSent = true;
-    } catch (e) {
-      emailError = e.message;
-      console.error("Failed to send invite email:", e.message);
-    }
+  let inviteWarning = null;
+  if (wantsPlatformUser && portalInvite) {
+    const delivery = await deliverEmployeePortalInvite({
+      ...portalInvite,
+      to: data.email,
+      invitedByName: req.admin?.full_name || req.user?.full_name || "Organization administrator",
+    });
+    inviteWarning = delivery.warning;
   }
 
   logAudit({
@@ -299,7 +322,7 @@ export async function createEmployee(req, res) {
       email: data.email,
       organization_id: orgId,
       created_platform_user: !!linkedUserUuid,
-      email_sent: emailSent,
+      email_sent: wantsPlatformUser && !inviteWarning,
     },
     req,
   });
@@ -307,12 +330,8 @@ export async function createEmployee(req, res) {
   const payload = { employee: employeeRow[0] };
   let message = "Employee created successfully";
   if (wantsPlatformUser) {
-    message = emailSent
-      ? "Employee created. Set-password email sent."
-      : "Employee created but invite email failed.";
-    if (!emailSent) {
-      payload._email_warning = `Invite email failed: ${emailError}. The platform user cannot sign in until they set a password.`;
-    }
+    message = inviteWarning ? "Employee created but invite delivery failed." : "Employee created. Set-password invitation sent.";
+    if (inviteWarning) payload._email_warning = inviteWarning;
   }
 
   return created(res, payload, message);
@@ -322,20 +341,66 @@ export async function resendEmployeeInvite(req, res) {
   assertRole(req.user, STAFF_ROLES);
   const { uuid } = req.params;
   assertUuid(uuid, "Employee UUID");
+  const scope = await resolveScopeOrganization(req);
+  const scopeClause = scope.scoped ? " AND e.organization_id=?" : "";
+  const scopeParams = scope.scoped ? [scope.orgId] : [];
 
   const [empRows] = await pool.query(
     `SELECT e.uuid, e.email, e.full_name, e.linked_user_uuid, e.is_platform_user,
             u.status AS linked_user_status
      FROM employees e
      LEFT JOIN users u ON u.uuid = e.linked_user_uuid
-     WHERE e.uuid=?`,
-    [uuid]
+     WHERE e.uuid=?${scopeClause}`,
+    [uuid, ...scopeParams]
   );
   if (!empRows.length) throw new ApiError(404, "Employee not found");
 
   const emp = empRows[0];
   if (emp.is_platform_user !== "yes" || !emp.linked_user_uuid) {
-    throw new ApiError(400, "This employee does not have a platform user account yet. Select them from the roster and use \"Add as Platform User\".");
+    if (!emp.email) {
+      throw new ApiError(400, "Employee must have an email address to receive an invitation");
+    }
+    const [fullEmp] = await pool.query(
+      "SELECT full_name, email, phone, cnic, organization_id FROM employees WHERE uuid=?",
+      [uuid]
+    );
+    const eData = fullEmp[0] || emp;
+    const conn = await pool.getConnection();
+    let portalInvite;
+    try {
+      await conn.beginTransaction();
+      portalInvite = await createEmployeePortalInvite({
+        conn,
+        employeeUuid: uuid,
+        organizationId: eData.organization_id,
+        fullName: eData.full_name,
+        email: eData.email,
+        phone: eData.phone,
+        cnic: eData.cnic,
+        actorUuid: req.user?.uuid || null,
+      });
+      await conn.commit();
+    } catch (err) {
+      await conn.rollback();
+      throw err;
+    } finally {
+      conn.release();
+    }
+    const invitedByName = req.user?.full_name || "Org Admin";
+    await deliverEmployeePortalInvite({
+      tokenId: portalInvite.tokenId,
+      rawToken: portalInvite.rawToken,
+      to: eData.email,
+      invitedByName,
+    });
+    logAudit({
+      ...getActorFromReq(req),
+      action: "employee.invite_create",
+      entityType: "employee",
+      entityId: uuid,
+      req,
+    });
+    return ok(res, {}, "Invitation sent successfully");
   }
   if (emp.linked_user_status === "active") {
     throw new ApiError(400, "This user is already active. Use forgot password instead.");
@@ -354,8 +419,8 @@ export async function resendEmployeeInvite(req, res) {
   const tokenHash = crypto.createHash("sha256").update(rawToken).digest("hex");
   const expiresInHours = parseInt(process.env.INVITE_EXPIRES_IN_HOURS || "72", 10);
 
-  await pool.query(
-    "INSERT INTO invite_tokens (user_uuid, token_hash, expires_at) VALUES (?, ?, DATE_ADD(NOW(), INTERVAL ? HOUR))",
+  const [tokenInsert] = await pool.query(
+    "INSERT INTO invite_tokens (user_uuid, token_hash, expires_at, delivery_status) VALUES (?, ?, DATE_ADD(NOW(), INTERVAL ? HOUR), 'pending')",
     [userUuid, tokenHash, expiresInHours]
   );
 
@@ -365,7 +430,9 @@ export async function resendEmployeeInvite(req, res) {
 
   try {
     await sendInviteEmail({ to: emp.email, setLink, invitedByName });
+    await pool.query("UPDATE invite_tokens SET delivery_status='sent', delivery_error=NULL WHERE id=?", [tokenInsert.insertId]);
   } catch (e) {
+    await pool.query("UPDATE invite_tokens SET delivery_status='failed', delivery_error=? WHERE id=?", [String(e.message || "Delivery failed").slice(0, 500), tokenInsert.insertId]);
     throw new ApiError(500, e.message || "Failed to send invite email");
   }
 
@@ -422,7 +489,18 @@ export async function listEmployees(req, res) {
     // nothing at all. A sub-admin sees the whole org roster, which is also what
     // makes their approve/generate work meaningful — they need to see the people
     // whose documents they are reviewing.
-    if (req.user.org_role === ROLE_ORG_ADMIN) {
+    //
+    // ?scope=org opts OUT of it, and only out of it. The organization_id
+    // predicate above is unconditional, so this widens visibility WITHIN the
+    // caller's own org and can never reach another tenant.
+    //
+    // The asset Assign picker needs that: it is a picker over the company roster,
+    // not a work queue of "records I imported". With the filter applied, an
+    // org_admin physically could not hand a laptop to a colleague another admin
+    // had onboarded — the picker showed no such person, and the only visible
+    // symptom was that the company's own employees seemed not to exist.
+    const orgWide = req.query.scope === "org";
+    if (req.user.org_role === ROLE_ORG_ADMIN && !orgWide) {
       conditions.push("e.added_by_uuid = ?");
       params.push(req.user.uuid);
     }
@@ -482,7 +560,7 @@ export async function updateEmployee(req, res) {
     throw new ApiError(403, "You can only manage employees within your organization");
   }
 
-  const { full_name, email, phone, cnic, designation, department, status, joining_date, emergency_contact, organization_uuid } = req.body;
+  const { full_name, email, phone, cnic, designation, department, status, joining_date, emergency_contact, employment_type, work_location, reporting_manager_uuid, organization_uuid } = req.body;
 
   const updateFields = [];
   const updateValues = [];
@@ -504,13 +582,14 @@ export async function updateEmployee(req, res) {
     updateValues.push(phone ? String(phone).trim() : null);
   }
   if (cnic !== undefined) {
-    const trimmed = String(cnic).trim();
+    const trimmed = normalizeCnic(cnic);
+    if (cnicError(cnic)) throw new ApiError(400, "CNIC must be 13 digits, e.g. 42101-2345678-9");
     if (trimmed) {
       const [dupeCnic] = await pool.query("SELECT uuid FROM employees WHERE cnic=? AND uuid<>?", [trimmed, uuid]);
       if (dupeCnic.length) throw new ApiError(409, "An employee with this CNIC already exists");
     }
     updateFields.push("cnic = ?");
-    updateValues.push(trimmed);
+    updateValues.push(trimmed || null);
   }
   if (designation !== undefined) {
     const designationId = await resolveMetaId(pool, emp.organization_id, "designations", designation ? String(designation).trim() : null);
@@ -530,7 +609,7 @@ export async function updateEmployee(req, res) {
     // fixed default: defaulting to 'active' here would silently un-deactivate
     // someone the caller only meant to rename.
     updateValues.push(
-      ALLOWED_EMPLOYEE_STATUS.includes(status) ? status : (existing.status ?? "current_employee")
+      ALLOWED_EMPLOYEE_STATUS.includes(status) ? status : (emp.status ?? "current_employee")
     );
   }
   if (joining_date !== undefined) {
@@ -540,6 +619,29 @@ export async function updateEmployee(req, res) {
   if (emergency_contact !== undefined) {
     updateFields.push("emergency_contact = ?");
     updateValues.push(emergency_contact ? String(emergency_contact).trim() : null);
+  }
+  if (employment_type !== undefined) {
+    const allowed = ["full_time", "part_time", "contract", "temporary", "intern"];
+    if (employment_type && !allowed.includes(employment_type)) throw new ApiError(400, "employment_type is invalid");
+    updateFields.push("employment_type = ?");
+    updateValues.push(employment_type || null);
+  }
+  if (work_location !== undefined) {
+    const value = work_location ? String(work_location).trim() : null;
+    if (value && value.length > 150) throw new ApiError(400, "work_location must be 150 characters or fewer");
+    updateFields.push("work_location = ?");
+    updateValues.push(value);
+  }
+  if (reporting_manager_uuid !== undefined) {
+    let managerUuid = reporting_manager_uuid || null;
+    if (managerUuid) {
+      assertUuid(managerUuid, "Reporting manager UUID");
+      if (managerUuid === uuid) throw new ApiError(400, "An employee cannot report to themselves");
+      const [manager] = await pool.query("SELECT uuid FROM employees WHERE uuid=? AND organization_id=? AND status IN ('active','current_employee')", [managerUuid, emp.organization_id]);
+      if (!manager.length) throw new ApiError(400, "Choose an active reporting manager from this organization");
+    }
+    updateFields.push("reporting_manager_uuid = ?");
+    updateValues.push(managerUuid);
   }
   if (organization_uuid !== undefined) {
     if (scope.scoped) throw new ApiError(403, "Cannot change the organization of an employee in your scope");
@@ -646,7 +748,8 @@ export async function createReference(req, res) {
     orgId = await resolveOrganizationId(req.body.organization_uuid);
   }
 
-  const trimmedCnic = String(cnic).trim();
+  const trimmedCnic = normalizeCnic(cnic);
+  if (cnicError(cnic)) throw new ApiError(400, "CNIC must be 13 digits, e.g. 42101-2345678-9");
   const [dupeCnic] = await pool.query("SELECT uuid FROM employees WHERE cnic=? AND organization_id=?", [trimmedCnic, orgId]);
   if (dupeCnic.length) throw new ApiError(409, "An employee with this CNIC already exists in this organization");
 

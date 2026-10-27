@@ -1,4 +1,3 @@
-
 import PDFDocument from "pdfkit";
 import { existsSync } from "node:fs";
 import { dirname, resolve, sep } from "node:path";
@@ -18,6 +17,11 @@ const MONTHS = [
 const BACKEND_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const DVERIF_LOGO = resolve(BACKEND_ROOT, "assets/dverif-logo.png");
 const PAGE_MARGIN = 46;
+
+/* Panel geometry — declared once, read by drawPanel and panelHeight. */
+const PANEL_HEAD_H = 26;
+const PANEL_ROW_H = 27;
+const PANEL_TOTAL_H = 30;
 
 /* ---------- helpers ---------- */
 
@@ -161,11 +165,31 @@ function drawEmployeeCard(doc, fields, y) {
   return y + cardH;
 }
 
-function drawPanel(doc, { x, y, width, title, rows, totalLabel, totalAmount, rowCount }) {
-  const headH = 26;
-  const rowH = 27;
-  const totalH = 30;
-  const bodyH = rowCount * rowH;
+/**
+ * A titled panel of money rows and a total.
+ *
+ * LAYOUT RULE (the fix for overlapping allowance/deduction text):
+ * every row is split into two columns that can never intersect —
+ *   [ label (flexible, ellipsis) ] [ gap ] [ amount (fixed width, right aligned) ]
+ * The label width is derived from the panel width minus the amount column and
+ * the gap, so no combination of long names and large amounts can collide.
+ *
+ * The second line holds the provenance ("Salary component", "Late arrivals") and
+ * the basis ("3 late arrivals") joined into ONE string, drawn full width with an
+ * ellipsis. Previously the source sat left and the basis sat right on the same
+ * line, and they overlapped whenever either one was long.
+ */
+function drawPanel(doc, { x, y, width, title, rows, totalLabel, totalAmount }) {
+  const headH = PANEL_HEAD_H;
+  const rowH = PANEL_ROW_H;
+  const totalH = PANEL_TOTAL_H;
+  const bodyH = Math.max(rows.length, 1) * rowH;
+
+  const padX = 14;
+  const amountW = 110;
+  const colGap = 12;
+  const labelW = width - padX * 2 - amountW - colGap;
+  const amountX = x + width - padX - amountW;
 
   // outer border + header bar
   doc.roundedRect(x, y, width, headH + bodyH + totalH, 8).lineWidth(0.8).strokeColor(RULE).stroke();
@@ -174,19 +198,34 @@ function drawPanel(doc, { x, y, width, title, rows, totalLabel, totalAmount, row
   doc.rect(x, y, width, headH).fill(BRAND);
   doc.restore();
   doc.font("Helvetica-Bold").fontSize(8.5).fillColor("#ffffff")
-    .text(title.toUpperCase(), x + 14, y + 9, { lineBreak: false, characterSpacing: 0.8 });
-  doc.text("AMOUNT", x + width - 14 - 90, y + 9, { width: 90, align: "right", lineBreak: false, characterSpacing: 0.8 });
+    .text(title.toUpperCase(), x + padX, y + 9, { lineBreak: false, characterSpacing: 0.8 });
+  doc.text("AMOUNT", amountX, y + 9, { width: amountW, align: "right", lineBreak: false, characterSpacing: 0.8 });
 
   // rows
-  for (let i = 0; i < rowCount; i += 1) {
+  for (let i = 0; i < Math.max(rows.length, 1); i += 1) {
     const rowY = y + headH + i * rowH;
     if (i % 2 === 1) doc.rect(x + 0.5, rowY, width - 1, rowH).fill(SOFT_GRAY);
     const row = rows[i];
     if (!row) continue;
-    doc.font("Helvetica").fontSize(9.5).fillColor(MUTED)
-      .text(row[0], x + 14, rowY + 9, { width: width * 0.5, lineBreak: false });
+
+    // Line 1: label | amount, in separate columns.
     doc.font("Helvetica").fontSize(9.5).fillColor(INK)
-      .text(row[1], x + width - 14 - 120, rowY + 9, { width: 120, align: "right", lineBreak: false });
+      .text(row.label, x + padX, rowY + 5, {
+        width: labelW, height: 12, lineBreak: false, ellipsis: true,
+      });
+    doc.font("Helvetica-Bold").fontSize(9.5).fillColor(INK)
+      .text(row.amount, amountX, rowY + 5, {
+        width: amountW, height: 12, align: "right", lineBreak: false,
+      });
+
+    // Line 2: "source  ·  basis" as a single full-width muted string.
+    const meta = [row.source, row.basis].filter(Boolean).join("  ·  ");
+    if (meta) {
+      doc.font("Helvetica").fontSize(7.5).fillColor("#8a93a6")
+        .text(meta, x + padX, rowY + 17, {
+          width: width - padX * 2, height: 9, lineBreak: false, ellipsis: true,
+        });
+    }
   }
 
   // total row
@@ -197,9 +236,9 @@ function drawPanel(doc, { x, y, width, title, rows, totalLabel, totalAmount, row
   doc.restore();
   doc.moveTo(x, totalY).lineTo(x + width, totalY).lineWidth(0.8).strokeColor(RULE).stroke();
   doc.font("Helvetica-Bold").fontSize(9.5).fillColor(INK)
-    .text(totalLabel, x + 14, totalY + 10, { lineBreak: false });
+    .text(totalLabel, x + padX, totalY + 10, { width: labelW, lineBreak: false });
   doc.font("Helvetica-Bold").fontSize(10).fillColor(BRAND)
-    .text(totalAmount, x + width - 14 - 130, totalY + 10, { width: 130, align: "right", lineBreak: false });
+    .text(totalAmount, amountX, totalY + 10, { width: amountW, align: "right", lineBreak: false });
 
   return y + headH + bodyH + totalH;
 }
@@ -276,7 +315,86 @@ function drawFooter(doc, generatedDate, pageNumber, pageCount) {
 
 /* ---------- main ---------- */
 
-/** Builds a printable A4 payslip using only values stored on the salary record. */
+/**
+ * Human wording for a line's `source` column.
+ *
+ * `salary_record_lines.source` is a machine token (basic, component,
+ * auto_unpaid_leave, auto_absenteeism, auto_late, auto_overtime, auto_expense,
+ * manual). These say what produced the line, which is the question the column
+ * answers, instead of leaking the raw token onto a payment document.
+ */
+const SOURCE_LABELS = {
+  basic: "Salary record",
+  component: "Salary component",
+  auto_unpaid_leave: "Unpaid leave",
+  auto_absenteeism: "Absent days",
+  auto_late: "Late arrivals",
+  auto_overtime: "Approved overtime",
+  auto_expense: "Expense claims",
+  manual: "Manual adjustment",
+};
+
+const BASIS_UNIT_LABELS = {
+  days: "days",
+  hours: "hours",
+  late_arrivals: "late arrivals",
+  claims: "claims",
+};
+
+/**
+ * What a line's basis means in words: `basis_value` is the count and
+ * `basis_unit` is what was counted (2 days, 3 late arrivals, 2 claims).
+ * Omitted entirely rather than guessed when the unit is missing.
+ */
+function basisLabel(line) {
+  const unit = line.basis_unit ? BASIS_UNIT_LABELS[line.basis_unit] : null;
+  const value = line.basis_value;
+  if (!unit || value === null || value === undefined || String(value).trim() === "") return null;
+  const count = Number(value);
+  if (!Number.isFinite(count)) return null;
+  return `${count} ${unit}`;
+}
+
+/**
+ * Total height a panel will occupy, so the caller can chain a second one under
+ * it without drawPanel having to hand back its geometry. Reads the same
+ * PANEL_* constants as drawPanel, so a change to the row height moves both.
+ */
+function panelHeight(rows) {
+  return PANEL_HEAD_H + Math.max(rows.length, 1) * PANEL_ROW_H + PANEL_TOTAL_H;
+}
+
+/**
+ * Strips machine tokens (e.g. `actual_working_days`, snake_case) from a stored
+ * label so they never reach the printed payslip.
+ */
+function cleanLabel(raw) {
+  return String(raw ?? "Line item")
+    .replace(/actual_working_days/gi, "working")
+    .replace(/_/g, " ")
+    .replace(/\s+/g, " ")
+    .trim() || "Line item";
+}
+
+/** Split the stored lines into the earnings and deductions the panels show. */
+function splitLines(lines) {
+  const earnings = [];
+  const deductions = [];
+  for (const line of lines ?? []) {
+    const row = {
+      label: cleanLabel(line.label),
+      amount: money(line.amount),
+      source: line.source ? (SOURCE_LABELS[line.source] ?? line.source) : null,
+      basis: basisLabel(line),
+    };
+    if (String(line.type) === "deduction") deductions.push(row);
+    else earnings.push(row);
+  }
+  return { earnings, deductions };
+}
+
+/** Builds a printable A4 payslip using values stored on the salary record,
+ *  and the itemised lines that produced its totals. */
 export async function generatePayslipPdf({ record, employeeName, organizationName }) {
   const doc = new PDFDocument({
     size: "A4",
@@ -317,25 +435,68 @@ export async function generatePayslipPdf({ record, employeeName, organizationNam
 
   const basic = Number(record.basic_salary ?? 0) || 0;
   const allowances = Number(record.allowances ?? 0) || 0;
-  const totalEarnings = basic + allowances;
+  const expenseReimbursement = Number(record.expense_reimbursement ?? 0) || 0;
+  const totalEarnings = basic + allowances + expenseReimbursement;
   const gap = 16;
   const panelW = (contentW - gap) / 2;
 
-  const earningsEnd = drawPanel(doc, {
-    x: PAGE_MARGIN, y, width: panelW, title: "Earnings", rowCount: 2,
-    rows: [
-      ["Basic salary", money(record.basic_salary)],
-      ["Allowances (total)", money(record.allowances)],
-    ],
-    totalLabel: "Total earnings", totalAmount: money(totalEarnings),
-  });
-  drawPanel(doc, {
-    x: PAGE_MARGIN + panelW + gap, y, width: panelW, title: "Deductions", rowCount: 2,
-    rows: [["Deductions (total)", money(record.deductions)]],
-    totalLabel: "Total deductions", totalAmount: money(record.deductions),
-  });
+  /*
+   * ITEMISED WHEN THE LINES EXIST, rolled up when they do not.
+   *
+   * Records generated before `salary_record_lines` existed have no line rows;
+   * they get the old two-row aggregate view. Newer records show every allowance
+   * and deduction by name, with its source and basis.
+   *
+   * THE TOTALS COME FROM THE RECORD, NOT FROM THE LINES — the stored total is
+   * what the employee is owed; the lines are the explanation underneath it.
+   */
+  const { earnings, deductions } = splitLines(record.lines);
+  const anyLines = earnings.length + deductions.length > 0;
 
-  y = earningsEnd + 22;
+  const earningsRows = anyLines && earnings.length
+    ? earnings
+    : [
+        { label: "Basic salary", amount: money(record.basic_salary), source: null, basis: null },
+        { label: "Allowances (total)", amount: money(record.allowances), source: null, basis: null },
+      ];
+  const deductionRows = anyLines && deductions.length
+    ? deductions
+    : [{ label: "Deductions (total)", amount: money(record.deductions), source: null, basis: null }];
+
+  /*
+   * Itemised payslips always stack full width: at half-page width (~243px) a
+   * label, its amount and its source line cannot sit together without crowding.
+   * Only legacy two-row records (no lines) stay side by side, and only while
+   * they are short.
+   */
+  const stack = anyLines || Math.max(earningsRows.length, deductionRows.length) > 3;
+
+  if (stack) {
+    const earningsEnd = drawPanel(doc, {
+      x: PAGE_MARGIN, y, width: contentW, title: "Earnings",
+      rows: earningsRows,
+      totalLabel: "Total earnings", totalAmount: money(totalEarnings),
+    });
+    const deductionTop = earningsEnd + 14;
+    drawPanel(doc, {
+      x: PAGE_MARGIN, y: deductionTop, width: contentW, title: "Deductions",
+      rows: deductionRows,
+      totalLabel: "Total deductions", totalAmount: money(record.deductions),
+    });
+    y = deductionTop + panelHeight(deductionRows) + 22;
+  } else {
+    const earningsEnd = drawPanel(doc, {
+      x: PAGE_MARGIN, y, width: panelW, title: "Earnings",
+      rows: earningsRows,
+      totalLabel: "Total earnings", totalAmount: money(totalEarnings),
+    });
+    drawPanel(doc, {
+      x: PAGE_MARGIN + panelW + gap, y, width: panelW, title: "Deductions",
+      rows: deductionRows,
+      totalLabel: "Total deductions", totalAmount: money(record.deductions),
+    });
+    y = earningsEnd + 22;
+  }
   drawNetSalary(doc, record.net_salary, y);
 
   const generatedDate = new Intl.DateTimeFormat("en-PK", {

@@ -31,8 +31,7 @@ describe("resendInvite — a fresh invite can always be resent", () => {
   it("allows resend for an unused invite even when status='active' (the reported bug)", async () => {
     pool.query
       .mockResolvedValueOnce([[USER]]) // user lookup
-      .mockResolvedValueOnce([[{ used: 0 }]]) // used-token count
-      .mockResolvedValueOnce([{}]) // UPDATE invite_tokens
+      .mockResolvedValueOnce([{}]) // delete old pending token
       .mockResolvedValueOnce([{ insertId: 7 }]); // INSERT invite_tokens
     const res = mockRes();
     await resendInvite({ params: { uuid: UUID }, admin: { full_name: "Admin" } }, res);
@@ -40,15 +39,15 @@ describe("resendInvite — a fresh invite can always be resent", () => {
     expect(res.json.mock.calls[0][0].message).toBe("Invite resent successfully");
   });
 
-  it("blocks when the invite was already accepted (used token)", async () => {
+  it("allows retry after an earlier resend left a used legacy token for an unverified user", async () => {
     pool.query
       .mockResolvedValueOnce([[USER]])
-      .mockResolvedValueOnce([[{ used: 1 }]]);
+      .mockResolvedValueOnce([{}])
+      .mockResolvedValueOnce([{ insertId: 8 }]);
     const res = mockRes();
-    await expect(
-      resendInvite({ params: { uuid: UUID }, admin: {} }, res)
-    ).rejects.toMatchObject({ message: "Invitation already accepted. Use forgot password instead." });
-    expect(sendInviteEmail).not.toHaveBeenCalled();
+    await resendInvite({ params: { uuid: UUID }, admin: {} }, res);
+    expect(sendInviteEmail).toHaveBeenCalledTimes(1);
+    expect(res.json.mock.calls[0][0].message).toBe("Invite resent successfully");
   });
 
   it("blocks when the account is verified", async () => {

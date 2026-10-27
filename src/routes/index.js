@@ -29,9 +29,14 @@ import orgRoutes from "./org.routes.js";
 import verifyRoutes from "./verify.routes.js";
 import documentsRoutes from "./documents.routes.js";
 import leavesRoutes from "./leaves.routes.js";
+import myLettersRoutes from "./myLetters.routes.js";
+import myAssetsRoutes from "./myAssets.routes.js";
+import myExpensesRoutes from "./myExpenses.routes.js";
+import myResignationRoutes from "./myResignation.routes.js";
 import attendanceRoutes from "./attendance.routes.js";
 import salarySelfRoutes from "./salary.routes.js";
 import supportRoutes from "./support.routes.js";
+import unifiedSupportRoutes from "./support.unified.routes.js";
 import adminSupport from "./admin/support.routes.js";
 import orgSubscriptionRoutes from "./orgSubscription.routes.js";
 import paymentWebhookRoutes from "./paymentWebhook.routes.js";
@@ -54,7 +59,7 @@ const router = Router();
 
 router.use("/", dashboardRoutes);
 
-// Public marketing data (no auth) â€” consumed by the marketing/landing site.
+// Public marketing data (no auth) Ã¢â‚¬— consumed by the marketing/landing site.
 router.use("/marketing", marketingRoutes);
 
 // Public QR verification (no auth)
@@ -67,6 +72,7 @@ router.use("/webhooks/payment-gateway", paymentWebhookRoutes);
 
 router.use("/org", orgRoutes);
 router.use("/org/support", supportRoutes);
+router.use("/support", unifiedSupportRoutes);
 router.use("/org/subscription", orgSubscriptionRoutes);
 
 // Unified login (determines admin vs user automatically)
@@ -85,6 +91,24 @@ router.use("/document-types", documentTypes);
 router.use("/payment", paymentRoutes);
 router.use("/notifications", notificationRoutes);
 router.use("/leaves", leavesRoutes);
+// Employee portal: my own issued HR letters (self-service, any employee).
+router.use("/my-letters", myLettersRoutes);
+// Mounted at /my/assets, NOT /my-assets. The frontend calls "/my/assets", which
+// resolves to /api/v1/my/assets, and these two disagreed - the API answered on
+// /api/v1/my-assets while the app requested /api/v1/my/assets, so the page 404'd
+// with "Route not found" even though both halves existed and every unit test
+// passed. Nothing checked the mount path against the client's request.
+router.use("/my/assets", myAssetsRoutes);
+// Mounted at /my/resignation, NOT /my-resignation. The frontend and the API have
+// to agree on this one string exactly: the /my/assets sibling above shipped with
+// the two halves disagreeing (router mounted at /my-assets, client asking for
+// /my/assets) and the page 404'd with every unit test passing, because no test
+// read the mount path against the client's request.
+router.use("/my/resignation", myResignationRoutes);
+// Mounted at /my/expenses, NOT /my-expenses, and for the same reason as the two
+// siblings above: the API mount path and the client request path have to be the
+// same string or the page 404s with every unit test still green.
+router.use("/my/expenses", myExpensesRoutes);
 router.use("/attendance", attendanceRoutes);
 router.use("/salary-records", salarySelfRoutes);
 
@@ -106,7 +130,7 @@ router.use("/admin/document-types", adminDocumentTypes);
 router.use("/admin/database", adminDatabaseBackup);
 
 // Org-internal modules (employees, leave, attendance, payroll/salary) are 100%
-// Org-Admin-scoped. The System Admin must have NO access â€” not even view-only.
+// Org-Admin-scoped. The System Admin must have NO access Ã¢â‚¬— not even view-only.
 // Explicit 403 (instead of 404) so it's clear the block is intentional. Org
 // admins reach these through /org/* with org-scoped JWTs.
 function forbidOrgScopedModule(req, res, next) {
@@ -122,6 +146,8 @@ function forbidOrgScopedModule(req, res, next) {
   "/admin/leaves",
   "/admin/attendance",
   "/admin/salary-records",
+  "/admin/hr-letters",
+  "/admin/letter-templates",
 ].forEach((p) => {
   router.use(p, forbidOrgScopedModule);
 });

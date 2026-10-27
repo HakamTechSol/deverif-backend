@@ -9,7 +9,8 @@ import { sendInviteEmail } from "../../utils/mailer.js";
 import { firstFrontendUrl } from "../../utils/frontendUrl.js";
 import { logAudit, getActorFromReq } from "../../utils/auditLog.js";
 import { getFreePlan } from "../../utils/subscriptionPlans.js";
-import { assertIdentityAvailable, rethrowIdentityDuplicate } from "../../utils/identityUniqueness.js";
+import { assertIdentityAvailable, rethrowIdentityDuplicate, assertEmailAvailable } from "../../utils/identityUniqueness.js";
+import { cnicError, normalizeCnic } from "../../utils/contactFormat.js";
 
 const USER_SELECT = `SELECT u.id, u.uuid, u.full_name, u.email, u.phone, u.cnic, u.status,
         u.org_role, u.profile_image,
@@ -70,6 +71,8 @@ export async function createUserWithOrganization(req, res) {
   if (!user?.full_name || !user?.email) {
     throw new ApiError(400, "user.full_name and user.email are required");
   }
+  if (cnicError(user.cnic)) throw new ApiError(400, "CNIC must be 13 digits, e.g. 42101-2345678-9");
+  user = { ...user, cnic: normalizeCnic(user.cnic) || null };
 
   const conn = await pool.getConnection();
   try {
@@ -125,6 +128,12 @@ export async function createUserWithOrganization(req, res) {
     // runs first so the admin is told whose phone or CNIC it already belongs to
     // instead of receiving a driver error naming an internal index.
     await assertIdentityAvailable({ phone: user.phone, cnic: user.cnic, executor: conn });
+
+    // One email, one identity — and that spans `employees` too, which the
+    // database cannot enforce (employees.email is not unique). Creating an
+    // account for an address that already has an employee record leaves one
+    // person as an unlinked employee plus an unrelated login.
+    await assertEmailAvailable({ email: user.email, executor: conn });
 
     const [userRes] = await conn.query(
       `INSERT INTO users
@@ -194,6 +203,10 @@ export async function updateUser(req, res) {
 
   const [userExists] = await pool.query("SELECT id, phone, cnic FROM users WHERE uuid=?", [uuid]);
   if (!userExists.length) throw new ApiError(404, "User not found");
+  const normalizedCnic = cnic === undefined ? undefined : normalizeCnic(cnic);
+  if (cnic !== undefined && cnicError(cnic)) {
+    throw new ApiError(400, "CNIC must be 13 digits, e.g. 42101-2345678-9");
+  }
 
   const updateFields = [];
   const updateValues = [];
@@ -201,7 +214,7 @@ export async function updateUser(req, res) {
   if (full_name !== undefined) { updateFields.push("full_name = ?"); updateValues.push(full_name); }
   if (email !== undefined) { updateFields.push("email = ?"); updateValues.push(email); }
   if (phone !== undefined) { updateFields.push("phone = ?"); updateValues.push(phone); }
-  if (cnic !== undefined) { updateFields.push("cnic = ?"); updateValues.push(cnic || null); }
+  if (cnic !== undefined) { updateFields.push("cnic = ?"); updateValues.push(normalizedCnic || null); }
   if (status !== undefined) { updateFields.push("status = ?"); updateValues.push(status === "inactive" ? "inactive" : "active"); }
   if (organization_uuid !== undefined) {
     updateFields.push("organization = ?");
@@ -217,10 +230,18 @@ export async function updateUser(req, res) {
   if (phone !== undefined || cnic !== undefined) {
     await assertIdentityAvailable({
       phone: phone !== undefined ? phone : userExists[0].phone,
-      cnic: cnic !== undefined ? cnic : userExists[0].cnic,
+      cnic: cnic !== undefined ? normalizedCnic : userExists[0].cnic,
       excludeUserId: userExists[0].id,
       executor: pool,
     });
+  }
+
+  // Same reasoning for email, against BOTH tables. `excludeUserUuid` keeps this
+  // account from reading as a duplicate of itself when its email is unchanged;
+  // the helper reuses that same uuid to skip the employee record this account
+  // is legitimately paired with. Without it, every profile save would 409.
+  if (email !== undefined) {
+    await assertEmailAvailable({ email, executor: pool, excludeUserUuid: uuid });
   }
 
   updateValues.push(uuid);
@@ -375,23 +396,18 @@ export async function resendInvite(req, res) {
 
   const user = userRows[0];
 
-  // Block only if the account was actually accepted (password already set).
-  // is_verified is flipped to 'yes' on set-password; for older rows we also
-  // treat a used invite token as acceptance, so a fresh-but-unused invite can
-  // always be resent even when the user row is status='active'.
+  // setPassword flips is_verified to 'yes' in the same transaction that consumes
+  // the invite token. A used token alone does not prove acceptance: older versions
+  // of this resend handler marked superseded links as used, so that check blocked
+  // every later resend even though the account was still unverified.
   if (user.is_verified === "yes") {
     throw new ApiError(400, "Invitation already accepted. Use forgot password instead.");
   }
-  const [[{ used }]] = await pool.query(
-    "SELECT COUNT(*) AS used FROM invite_tokens WHERE user_uuid=? AND used_at IS NOT NULL",
-    [user.uuid]
-  );
-  if (used > 0) {
-    throw new ApiError(400, "Invitation already accepted. Use forgot password instead.");
-  }
 
+  // Revoke old pending links without marking them as accepted/used. This keeps
+  // used_at reserved for an invite that was actually redeemed.
   await pool.query(
-    "UPDATE invite_tokens SET used_at=NOW() WHERE user_uuid=? AND used_at IS NULL",
+    "DELETE FROM invite_tokens WHERE user_uuid=? AND used_at IS NULL",
     [user.uuid]
   );
 

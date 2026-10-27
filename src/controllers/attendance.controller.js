@@ -480,30 +480,3 @@ export async function listOrgAttendance(req, res) {
   );
   return ok(res, paginatedResponse(rows, total, page, limit), "Attendance records");
 }
-
-export async function listAllAttendance(req, res) {
-  const { page, limit, offset } = parsePagination(req.query);
-  const f = buildRecordFilters(req.query);
-  const orgUuid = typeof req.query.organization_uuid === "string" && req.query.organization_uuid.trim()
-    ? req.query.organization_uuid.trim() : "";
-
-  const clauses = [...f.clauses];
-  const params = [...f.params];
-  if (orgUuid) {
-    assertUuid(orgUuid, "Organization UUID");
-    clauses.push("o.uuid = ?");
-    params.push(orgUuid);
-  }
-  const whereClause = clauses.length ? "WHERE " + clauses.join(" AND ") : "";
-  const whereJoin = whereClause ? " " + whereClause : "";
-
-  const [[{ total }]] = await pool.query(
-    `SELECT COUNT(*) AS total FROM attendance_records ar JOIN employees e ON e.uuid = ar.employee_uuid JOIN organizations o ON o.id = ar.organization_id ${whereJoin}`,
-    params
-  );
-  const [rows] = await pool.query(
-    `${RECORD_SELECT}${whereJoin} ORDER BY ar.date DESC, ar.check_in_at DESC LIMIT ? OFFSET ?`,
-    [...params, limit, offset]
-  );
-  return ok(res, paginatedResponse(rows, total, page, limit), "Attendance records");
-}

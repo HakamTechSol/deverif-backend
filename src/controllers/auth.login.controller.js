@@ -43,11 +43,19 @@ export async function login(req, res) {
 
   const user = userRows[0];
 
-  // NEW: Check if the linked employee record is inactive and the user is a platform user.
+  // Check if the linked employee record is inactive and the user is a platform user.
   // This blocks login immediately even if the users table status is still 'active'.
+  //
+  // Match on users.uuid, NOT users.id. employees.linked_user_uuid holds a UUID -
+  // employeeAccess.service.js writes `linked_user_uuid = user.uuid` when an
+  // employee is granted portal access. Comparing that column against the integer
+  // primary key silently matches nothing, so `employees` comes back empty and
+  // this guard never fires: a deactivated platform employee could still log in
+  // with their password. authUser.js and auth.otp.controller.js already pass a
+  // uuid here; this endpoint did not, and the two disagreed for the same reason.
   const [employees] = await pool.query(
     `SELECT is_platform_user, status FROM employees WHERE linked_user_uuid = ?`,
-    [user.id]
+    [user.uuid]
   );
   if (employees.length && employees[0].is_platform_user === 'yes' && employees[0].status === 'inactive') {
     throw new ApiError(403, "Your account has been deactivated. Contact your organization admin.");

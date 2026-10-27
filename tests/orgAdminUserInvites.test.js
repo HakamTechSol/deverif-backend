@@ -14,6 +14,7 @@ import { pool } from "../src/config/db.js";
 import {
   cancelAdminUserInvite,
   removeAdminUserPermanently,
+  revokeAdminUser,
 } from "../src/controllers/org/adminUsers.controller.js";
 
 const SCOPE_ORG = 20;
@@ -225,5 +226,45 @@ describe("org sub-admin invite lifecycle — permanently remove a pending invite
     expect(conn.commit).not.toHaveBeenCalled();
     // Released even on the failure path, or the pool leaks a connection.
     expect(conn.release).toHaveBeenCalled();
+  });
+});
+
+describe("org sub-admin revoke — deactivation only", () => {
+  it("rejects any action other than deactivate before touching the database", async () => {
+    const req = mockReq();
+    req.body = { action: "demote" };
+
+    await expect(revokeAdminUser(req, mockRes())).rejects.toMatchObject({
+      statusCode: 400,
+      message: "Only deactivation is supported",
+    });
+    expect(pool.query).not.toHaveBeenCalled();
+    expect(pool.getConnection).not.toHaveBeenCalled();
+  });
+
+  it("deactivates the sub-admin without creating an employee record", async () => {
+    pool.query
+      .mockResolvedValueOnce([[subAdminRow({ status: "active", is_verified: "yes" })]])
+      .mockResolvedValueOnce([{ affectedRows: 1 }])
+      .mockResolvedValueOnce([[subAdminRow({ status: "inactive", is_verified: "yes" })]]);
+
+    const req = mockReq();
+    req.body = { action: "deactivate" };
+    const res = mockRes();
+
+    await revokeAdminUser(req, res);
+
+    expect(res.status).toHaveBeenCalledWith(200);
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({ message: "Sub-admin deactivated" })
+    );
+    expect(pool.getConnection).not.toHaveBeenCalled();
+
+    const sql = pool.query.mock.calls.map(([statement]) => String(statement));
+    const updateIdx = sql.findIndex(
+      (statement) => statement.includes("UPDATE users SET status='inactive'") && statement.includes("uuid=?")
+    );
+    expect(updateIdx).toBeGreaterThanOrEqual(0);
+    expect(sql.some((statement) => statement.includes("INSERT INTO employees"))).toBe(false);
   });
 });

@@ -30,8 +30,11 @@ export default class ApiError extends Error {
   constructor(statusCode, message, options = {}) {
     super(message);
     this.statusCode = statusCode;
-    const { code, ...extra } = options || {};
+    const { code, publicMessage, ...extra } = options || {};
     if (code) this.code = code;
+    if (typeof publicMessage === "string" && publicMessage.trim()) {
+      this.publicMessage = publicMessage;
+    }
     if (extra && Object.keys(extra).length) this.extra = extra;
   }
 }
