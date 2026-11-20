@@ -10,18 +10,22 @@ import { parseModuleFlags, isModuleIncluded } from "../src/utils/moduleFlags.js"
 import { ALL_MODULE_KEYS } from "./helpers/moduleKeyFixtures.js";
 
 /**
- * The real shape of the seeded Free plan: Employee Management is the ONLY module
- * included. This is the data a brand-new organization lands on by default, and
- * it is the exact scenario that was reported as broken -- a Free org saw
- * Employee Management locked too.
+ * The real shape of the seeded Free plan: Employee Management and User
+ * Management are included. This is the data a brand-new organization lands on
+ * by default, and it is the exact scenario that was reported as broken -- a Free
+ * org saw Employee Management locked too, and later could not invite employees
+ * to the portal because User Management was off.
  *
- * Only `employee_management` is listed. Every other key is deliberately ABSENT
- * rather than explicitly `false`, because that is how the Free plan is really
- * seeded: `isModuleIncluded` reads an absent key as blocked either way, and a
- * test that wrote them out as `false` would no longer catch a regression that
- * changed the absent-vs-false distinction.
+ * Only those two keys are listed. Every other key is deliberately ABSENT rather
+ * than explicitly `false`, because that is how the Free plan is really seeded:
+ * `isModuleIncluded` reads an absent key as blocked either way, and a test that
+ * wrote them out as `false` would no longer catch a regression that changed the
+ * absent-vs-false distinction.
  */
-const FREE_PLAN_FLAGS = JSON.stringify({ employee_management: true });
+const FREE_PLAN_FLAGS = JSON.stringify({
+  employee_management: true,
+  user_management: true,
+});
 
 let orgRow;
 
@@ -98,11 +102,22 @@ describe("per-module gating on a Free plan matches the pricing card", () => {
     expect(next.mock.calls[0][0]).toBeUndefined();
   });
 
-  // Every module other than employee_management must be locked on the Free plan,
-  // including the thirteen added by the HR expansion. Driven off ALL_MODULE_KEYS
+  it("allows User Management so Free organizations can invite portal users", async () => {
+    const next = mockNext();
+    await requireModuleFeature("user_management")(req, {}, next);
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(next.mock.calls[0][0]).toBeUndefined();
+  });
+
+  // Every module other than the two Free includes must be locked, including the
+  // remaining modules added by the HR expansion. Driven off ALL_MODULE_KEYS
   // rather than a hand-written list so a new module cannot be added without this
   // assertion covering it.
-  it.each(ALL_MODULE_KEYS.filter((k) => k !== "employee_management"))(
+  it.each(
+    ALL_MODULE_KEYS.filter(
+      (k) => k !== "employee_management" && k !== "user_management",
+    ),
+  )(
     "returns a distinct UPGRADE_REQUIRED for %s instead of a generic 403",
     async (key) => {
       const next = mockNext();
@@ -241,9 +256,10 @@ describe("the pricing card and the enforcement read the same flags", () => {
   it("parseModuleFlags + isModuleIncluded agree with the seeded Free plan", () => {
     const flags = parseModuleFlags(FREE_PLAN_FLAGS);
     expect(flags).not.toBeNull();
-    // Exactly one module is on the Free plan.
+    // Exactly these modules are on the Free plan.
     expect(ALL_MODULE_KEYS.filter((k) => isModuleIncluded(flags, k))).toEqual([
       "employee_management",
+      "user_management",
     ]);
   });
 

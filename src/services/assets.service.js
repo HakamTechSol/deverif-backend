@@ -3,27 +3,19 @@ import ApiError from "../utils/ApiError.js";
 import { assertUuid } from "../utils/publicResponse.js";
 import { logAudit } from "../utils/auditLog.js";
 import { paginatedResponse } from "../utils/pagination.js";
-import { buildInsert, buildUpdateStrict, buildOrgScope, boolField } from "../utils/crudHelpers.js";
+import { buildInsert, buildUpdateStrict } from "../utils/crudHelpers.js";
 import * as attachments from "./attachments.service.js";
 
 /**
- * Asset management: categories, inventory, custody, maintenance.
+ * Asset management: inventory and custody.
  *
- * FILES ARE ATTACHMENTS, NOT COLUMNS. Purchase receipts and maintenance
- * invoices go through the polymorphic attachments table (entity_type 'asset' and
- * 'asset_maintenance') rather than a receipt_path column. That is the house design
- * — see 20261103_create_attachments.sql — and it is also the only version that
- * gets tenant isolation (attachments filters organization_id), path-traversal
- * defence (resolveAttachmentPath re-anchors against ATTACHMENTS_DIR), soft
- * delete and an audit entry per upload. A bare path column had none of those.
+ * FILES ARE ATTACHMENTS, NOT COLUMNS. Purchase receipts go through the
+ * polymorphic attachments table (entity_type 'asset') rather than a receipt_path
+ * column. This is also the only version that gets tenant isolation, path-traversal
+ * defence, soft delete and an audit entry per upload.
  *
- * THE ONE RULE THAT SHAPES THIS WHOLE MODULE. An asset's status is never set by a
- * client. It is DERIVED from whether the asset currently has an open assignment
- * or an open maintenance job:
- *
- *   open maintenance job            -> maintenance
- *   else open assignment            -> assigned
- *   else                            -> available   (or retired, if scrapped)
+ * Asset status is derived from its active custody assignment: assigned or
+ * available. Retired is a terminal state until reinstated.
  *
  * Every mutation below recomputes it from the rows rather than trusting a
  * supplied value. The alternative — a `status` column a form posts — is the
@@ -45,21 +37,17 @@ import * as attachments from "./attachments.service.js";
 /** Attachment entity types, namespaced to match the attachments table. */
 export const ATTACHMENT_ENTITY = {
   ASSET: "asset",
-  MAINTENANCE: "asset_maintenance",
 };
 
-/** Sub-categories, so receipts and invoices stay distinguishable on one entity. */
+/** Attachment category for a purchase receipt. */
 export const ATTACHMENT_CATEGORY = {
   RECEIPT: "purchase_receipt",
-  INVOICE: "maintenance_invoice",
 };
 
-export const ASSET_STATUSES = ["available", "assigned", "maintenance", "retired"];
-const RETURN_CONDITIONS = ["good", "damaged", "needs_maintenance"];
+export const ASSET_STATUSES = ["available", "assigned", "retired"];
+const RETURN_CONDITIONS = ["good", "damaged"];
 
-const CATEGORY_COLUMNS = ["name", "description", "default_lifespan_months", "is_active"];
 const ASSET_COLUMNS = [
-  "category_uuid",
   "asset_tag",
   "name",
   "model_details",
@@ -102,21 +90,6 @@ function audit(actorUuid, action, entityType, entityId, orgId, details = {}) {
   });
 }
 
-/** A category must exist AND belong to this org, or the asset has no valid class. */
-async function categoryInOrg(orgId, categoryUuid, conn = pool) {
-  if (!categoryUuid) throw new ApiError(400, "category_uuid is required");
-  assertUuid(categoryUuid, "Category UUID");
-  const [rows] = await conn.query(
-    "SELECT uuid, name, is_active FROM asset_categories WHERE uuid=? AND organization_id=?",
-    [categoryUuid, orgId],
-  );
-  if (!rows.length) throw new ApiError(404, "Asset category not found");
-  if (!rows[0].is_active) {
-    throw new ApiError(409, `"${rows[0].name}" is inactive. Reactivate it before adding assets to it.`);
-  }
-  return rows[0];
-}
-
 async function employeeInOrg(orgId, employeeUuid, conn = pool) {
   // Trim first. A dropdown that submits nothing sends undefined or ""; one that
   // submits an unfilled input can send "   ". Left untrimmed, whitespace falls
@@ -146,9 +119,8 @@ async function employeeInOrg(orgId, employeeUuid, conn = pool) {
 async function loadAsset(orgId, assetUuid, conn = pool, forUpdate = false) {
   assertUuid(assetUuid, "Asset UUID");
   const [rows] = await conn.query(
-    `SELECT a.*, c.name AS category_name
+    `SELECT a.*
        FROM assets a
-       JOIN asset_categories c ON c.uuid = a.category_uuid
       WHERE a.uuid=? AND a.organization_id=?${forUpdate ? " FOR UPDATE" : ""}`,
     [assetUuid, orgId],
   );
@@ -157,127 +129,10 @@ async function loadAsset(orgId, assetUuid, conn = pool, forUpdate = false) {
 }
 
 // ---------------------------------------------------------------------------
-// Categories
-// ---------------------------------------------------------------------------
-
-export async function listCategories({ orgId, includeInactive = false }) {
-  const [rows] = await pool.query(
-    `SELECT c.*,
-            (SELECT COUNT(*) FROM assets a WHERE a.category_uuid = c.uuid) AS asset_count
-       FROM asset_categories c
-      WHERE c.organization_id = ?${includeInactive ? "" : " AND c.is_active = 1"}
-      ORDER BY c.name`,
-    [orgId],
-  );
-  return rows;
-}
-
-export async function createCategory({ orgId, actorUuid, data }) {
-  const name = String(data.name ?? "").trim();
-  if (!name) throw new ApiError(400, "name is required");
-
-  const insert = composeInsert(
-    { organization_id: orgId, created_by_uuid: actorUuid ?? null },
-    {
-      name,
-      description: data.description ?? null,
-      default_lifespan_months: data.default_lifespan_months ?? null,
-      is_active: boolField(data.is_active, true) ? 1 : 0,
-    },
-    ["name", "description", "default_lifespan_months", "is_active"],
-  );
-
-  try {
-    const [res] = await pool.query(
-      `INSERT INTO asset_categories (${insert.columns.join(", ")}) VALUES (${insert.placeholders.join(", ")})`,
-      insert.params,
-    );
-    const [[row]] = await pool.query(
-      "SELECT * FROM asset_categories WHERE id=?",
-      [res.insertId],
-    );
-    audit(actorUuid, "asset_category.create", "asset_category", row.uuid, orgId, { name });
-    return row;
-  } catch (e) {
-    // The unique key is per-org, so this is a duplicate name within one
-    // organization and nothing else. Surface it as a conflict rather than a 500.
-    if (e.code === "ER_DUP_ENTRY") {
-      throw new ApiError(409, `A category named "${name}" already exists`);
-    }
-    throw e;
-  }
-}
-
-export async function updateCategory({ orgId, actorUuid, categoryUuid, data }) {
-  assertUuid(categoryUuid, "Category UUID");
-  const scope = buildOrgScope(orgId, { uuid: categoryUuid });
-  const update = buildUpdateStrict(
-    {
-      name: data.name === undefined ? undefined : String(data.name).trim(),
-      description: data.description,
-      default_lifespan_months: data.default_lifespan_months,
-      is_active: data.is_active === undefined ? undefined : boolField(data.is_active) ? 1 : 0,
-    },
-    ["name", "description", "default_lifespan_months", "is_active"],
-  );
-  if (!update.columns.length) throw new ApiError(400, "No fields to update");
-
-  try {
-    const [res] = await pool.query(
-      `UPDATE asset_categories ${update.clause} WHERE ${scope.clause}`,
-      [...update.params, ...scope.params],
-    );
-    if (!res.affectedRows) throw new ApiError(404, "Asset category not found");
-  } catch (e) {
-    if (e.code === "ER_DUP_ENTRY") {
-      throw new ApiError(409, "A category with that name already exists");
-    }
-    throw e;
-  }
-
-  const [[row]] = await pool.query(
-    "SELECT * FROM asset_categories WHERE uuid=? AND organization_id=?",
-    [categoryUuid, orgId],
-  );
-  audit(actorUuid, "asset_category.update", "asset_category", categoryUuid, orgId);
-  return row;
-}
-
-/**
- * Retire a category rather than deleting it.
- *
- * A hard DELETE would either fail on the FK (assets still reference it) or, with
- * ON DELETE CASCADE, silently destroy an inventory and its purchase history
- * because someone clicked the wrong button. Deactivating is reversible and keeps
- * every historical reference intact.
- */
-export async function deleteCategory({ orgId, actorUuid, categoryUuid }) {
-  assertUuid(categoryUuid, "Category UUID");
-  const [[asset]] = await pool.query(
-    "SELECT COUNT(*) AS n FROM assets WHERE category_uuid=? AND organization_id=?",
-    [categoryUuid, orgId],
-  );
-  if (asset.n > 0) {
-    throw new ApiError(
-      409,
-      `This category still holds ${asset.n} asset(s). Reassign them before removing it.`,
-    );
-  }
-
-  const scope = buildOrgScope(orgId, { uuid: categoryUuid });
-  const [res] = await pool.query(
-    `DELETE FROM asset_categories WHERE ${scope.clause}`,
-    scope.params,
-  );
-  if (!res.affectedRows) throw new ApiError(404, "Asset category not found");
-  audit(actorUuid, "asset_category.delete", "asset_category", categoryUuid, orgId);
-}
-
-// ---------------------------------------------------------------------------
 // Inventory
 // ---------------------------------------------------------------------------
 
-export async function listAssets({ orgId, page, limit, offset, search, status, categoryUuid }) {
+export async function listAssets({ orgId, page, limit, offset, search, status, employeeUuid, scopeFilter, creatorScopeFilter }) {
   const clauses = ["a.organization_id = ?"];
   const params = [orgId];
 
@@ -288,17 +143,23 @@ export async function listAssets({ orgId, page, limit, offset, search, status, c
     clauses.push("a.status = ?");
     params.push(status);
   }
-  if (categoryUuid) {
-    assertUuid(categoryUuid, "Category UUID");
-    clauses.push("a.category_uuid = ?");
-    params.push(categoryUuid);
-  }
   if (search) {
-    // Scoped to the org's own asset_tag so a serial belonging to another tenant
-    // can never be discovered by search.
     clauses.push("(a.asset_tag LIKE ? OR a.name LIKE ? OR a.model_details LIKE ? OR a.serial_number LIKE ?)");
     const like = `%${search}%`;
     params.push(like, like, like, like);
+  }
+  if (employeeUuid) {
+    assertUuid(employeeUuid, "Employee UUID");
+    clauses.push("EXISTS (SELECT 1 FROM asset_assignments af WHERE af.asset_uuid=a.uuid AND af.employee_uuid=? AND af.organization_id=a.organization_id AND af.returned_at IS NULL)");
+    params.push(employeeUuid);
+  }
+  if (scopeFilter || creatorScopeFilter) {
+    const visibleByAssignment = scopeFilter
+      ? `EXISTS (SELECT 1 FROM asset_assignments sf JOIN employees e ON e.uuid=sf.employee_uuid WHERE sf.asset_uuid=a.uuid AND sf.organization_id=a.organization_id AND sf.returned_at IS NULL AND ${scopeFilter.sql})`
+      : "0=1";
+    const visibleByCreator = creatorScopeFilter ? creatorScopeFilter.sql : "0=1";
+    clauses.push(`(${visibleByAssignment} OR ${visibleByCreator})`);
+    params.push(...(scopeFilter?.params ?? []), ...(creatorScopeFilter?.params ?? []));
   }
   const where = clauses.join(" AND ");
 
@@ -308,14 +169,11 @@ export async function listAssets({ orgId, page, limit, offset, search, status, c
   );
 
   const [rows] = await pool.query(
-    `SELECT a.*, c.name AS category_name,
+    `SELECT a.*,
             (SELECT e.full_name FROM asset_assignments g
                JOIN employees e ON e.uuid = g.employee_uuid
-              WHERE g.asset_uuid = a.uuid AND g.returned_at IS NULL LIMIT 1) AS holder_name,
-            (SELECT COUNT(*) FROM asset_maintenance m
-              WHERE m.asset_uuid = a.uuid AND m.status = 'open') AS open_jobs
+              WHERE g.asset_uuid = a.uuid AND g.returned_at IS NULL LIMIT 1) AS holder_name
        FROM assets a
-       JOIN asset_categories c ON c.uuid = a.category_uuid
       WHERE ${where}
       ORDER BY a.asset_tag
       LIMIT ? OFFSET ?`,
@@ -337,34 +195,6 @@ export async function getAsset({ orgId, assetUuid }) {
       ORDER BY g.assigned_at DESC`,
     [assetUuid],
   );
-  const [jobs] = await pool.query(
-    // completion_notes is selected because the column exists and the drawer shows
-    // it: how a job closed is the whole record of whether a repair happened, and
-    // a job that was CANCELLED rather than completed is indistinguishable from a
-    // completed one without it.
-    `SELECT uuid, title, description, status, vendor, cost, reported_at, completed_at,
-            completion_notes
-       FROM asset_maintenance
-      WHERE asset_uuid=?
-      ORDER BY reported_at DESC`,
-    [assetUuid],
-  );
-
-  // Attachments are resolved per job. Each lookup is isolated so one failing
-  // invoice query degrades to an empty list rather than a 500 that blanks the
-  // whole asset page, custody history included.
-  const jobsWithInvoices = await Promise.all(
-    jobs.map(async (job) => {
-      let invoices = [];
-      try {
-        invoices = await listInvoices({ orgId, jobUuid: job.uuid });
-      } catch {
-        invoices = [];
-      }
-      return { ...job, invoices };
-    }),
-  );
-
   let receipts = [];
   try {
     receipts = await listReceipts({ orgId, assetUuid });
@@ -376,7 +206,6 @@ export async function getAsset({ orgId, assetUuid }) {
     ...asset,
     holder: history.find((h) => !h.returned_at) ?? null,
     assignments: history,
-    maintenance: jobsWithInvoices,
     receipts,
   };
 }
@@ -387,9 +216,6 @@ async function nextAssetTag(conn, orgId) {
     "SELECT COUNT(*) AS n FROM assets WHERE organization_id = ?",
     [orgId],
   );
-  // COUNT is a floor, not a max: after deletions a new asset could collide with
-  // an existing tag, so the candidate is checked against the unique key below
-  // and stepped forward until it is free.
   for (let i = n + 1; i < n + 1000; i += 1) {
     const candidate = `AST-${String(i).padStart(4, "0")}`;
     const [[hit]] = await conn.query(
@@ -408,8 +234,6 @@ export async function createAsset({ orgId, actorUuid, data }) {
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
-    await categoryInOrg(orgId, data.category_uuid, conn);
-
     const tag = data.asset_tag ? String(data.asset_tag).trim() : await nextAssetTag(conn, orgId);
     if (!tag) throw new ApiError(400, "asset_tag cannot be empty");
 
@@ -422,7 +246,6 @@ export async function createAsset({ orgId, actorUuid, data }) {
         created_by_uuid: actorUuid ?? null,
       },
       {
-        category_uuid: data.category_uuid,
         asset_tag: tag,
         name,
         model_details: data.model_details ?? null,
@@ -466,17 +289,10 @@ export async function updateAsset({ orgId, actorUuid, assetUuid, data }) {
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
-    const asset = await loadAsset(orgId, assetUuid, conn, true);
-
-    // A category swap must be validated in the same transaction that writes it,
-    // otherwise a concurrent deactivation could leave the asset in a dead class.
-    if (data.category_uuid && data.category_uuid !== asset.category_uuid) {
-      await categoryInOrg(orgId, data.category_uuid, conn);
-    }
+    await loadAsset(orgId, assetUuid, conn, true);
 
     const update = buildUpdateStrict(
       {
-        category_uuid: data.category_uuid,
         asset_tag: data.asset_tag === undefined ? undefined : String(data.asset_tag).trim(),
         name: data.name === undefined ? undefined : String(data.name).trim(),
         model_details: data.model_details,
@@ -519,25 +335,15 @@ export async function updateAsset({ orgId, actorUuid, assetUuid, data }) {
 // ---------------------------------------------------------------------------
 
 /**
- * Recompute an asset's status from its open rows.
- *
- * Maintenance outranks assignment deliberately. An asset that is out for repair
- * AND somehow still recorded as held is a data-entry error, and showing it as
- * "assigned" would invite someone to go looking for it in an employee's hands
- * when it is on a bench. Retired is terminal and never overwritten here, because
- * a scrapped asset stays scrapped regardless of stray rows.
+ * Recompute an asset's status from its active assignment. Retired is terminal
+ * and never overwritten here, because a scrapped asset stays scrapped.
  */
 async function syncStatus(conn, orgId, assetUuid) {
-  const [[m]] = await conn.query(
-    "SELECT COUNT(*) AS n FROM asset_maintenance WHERE asset_uuid=? AND status='open'",
-    [assetUuid],
-  );
   const [[a]] = await conn.query(
     "SELECT COUNT(*) AS n FROM asset_assignments WHERE asset_uuid=? AND returned_at IS NULL",
     [assetUuid],
   );
-
-  const next = m.n > 0 ? "maintenance" : a.n > 0 ? "assigned" : "available";
+  const next = a.n > 0 ? "assigned" : "available";
   await conn.query("UPDATE assets SET status=? WHERE uuid=? AND organization_id=? AND status<>'retired'", [
     next,
     assetUuid,
@@ -558,9 +364,6 @@ export async function assignAsset({ orgId, actorUuid, assetUuid, employeeUuid })
 
     if (asset.status === "retired") {
       throw new ApiError(409, "A retired asset cannot be assigned");
-    }
-    if (asset.status === "maintenance") {
-      throw new ApiError(409, "Complete or cancel the open maintenance job before assigning this asset");
     }
     if (asset.status === "assigned") {
       throw new ApiError(409, "This asset is already assigned. Return it first.");
@@ -613,14 +416,7 @@ export async function assignAsset({ orgId, actorUuid, assetUuid, employeeUuid })
   }
 }
 
-/**
- * Take an asset back.
- *
- * `return_condition` is not cosmetic. "needs_maintenance" opens a maintenance
- * job in the same transaction, because an asset coming back broken and then
- * sitting in "available" until somebody notices is exactly how broken equipment
- * gets handed to the next person.
- */
+/** Take an asset back and record its condition in the custody history. */
 export async function returnAsset({ orgId, actorUuid, assetUuid, condition = "good", notes }) {
   if (!RETURN_CONDITIONS.includes(condition)) {
     throw new ApiError(400, `condition must be one of: ${RETURN_CONDITIONS.join(", ")}`);
@@ -645,160 +441,11 @@ export async function returnAsset({ orgId, actorUuid, assetUuid, condition = "go
       throw new ApiError(409, "This asset is not currently assigned");
     }
 
-    let openedJob = null;
-    if (condition === "needs_maintenance" || condition === "damaged") {
-      const [job] = await conn.query(
-        `INSERT INTO asset_maintenance (organization_id, asset_uuid, title, description, reported_by_uuid)
-         VALUES (?, ?, ?, ?, ?)`,
-        [
-          orgId,
-          assetUuid,
-          condition === "damaged" ? "Reported damaged on return" : "Flagged on return",
-          notes ?? null,
-          actorUuid ?? null,
-        ],
-      );
-      const [[jobRow]] = await conn.query("SELECT uuid FROM asset_maintenance WHERE id=?", [job.insertId]);
-      openedJob = jobRow.uuid;
-    }
-
     const status = await syncStatus(conn, orgId, assetUuid);
     await conn.commit();
 
-    audit(actorUuid, "asset.return", "asset", assetUuid, orgId, { condition, notes: notes ?? null, opened_job: openedJob });
-    return { status, opened_maintenance_uuid: openedJob };
-  } catch (e) {
-    await conn.rollback();
-    throw e;
-  } finally {
-    conn.release();
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Maintenance
-// ---------------------------------------------------------------------------
-
-export async function listMaintenance({ orgId, assetUuid, status }) {
-  const clauses = ["m.organization_id = ?"];
-  const params = [orgId];
-  if (assetUuid) {
-    assertUuid(assetUuid, "Asset UUID");
-    clauses.push("m.asset_uuid = ?");
-    params.push(assetUuid);
-  }
-  if (status) {
-    clauses.push("m.status = ?");
-    params.push(status);
-  }
-  const [rows] = await pool.query(
-    `SELECT m.*, a.asset_tag, a.name AS asset_name
-       FROM asset_maintenance m
-       JOIN assets a ON a.uuid = m.asset_uuid
-      WHERE ${clauses.join(" AND ")}
-      ORDER BY m.reported_at DESC`,
-    params,
-  );
-  return rows;
-}
-
-export async function reportMaintenance({ orgId, actorUuid, assetUuid, data }) {
-  const title = String(data.title ?? "").trim();
-  if (!title) throw new ApiError(400, "title is required");
-
-  const conn = await pool.getConnection();
-  try {
-    await conn.beginTransaction();
-    const asset = await loadAsset(orgId, assetUuid, conn, true);
-    if (asset.status === "retired") {
-      throw new ApiError(409, "A retired asset cannot be sent for maintenance");
-    }
-
-    let jobUuid;
-    try {
-      const [res] = await conn.query(
-        `INSERT INTO asset_maintenance
-(organization_id, asset_uuid, title, description, vendor, cost,
-             reported_by_uuid)
-          VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [
-          orgId,
-          assetUuid,
-          title,
-          data.description ?? null,
-          data.vendor ?? null,
-          data.cost ?? null,
-          actorUuid ?? null,
-        ],
-      );
-      const [[row]] = await conn.query("SELECT uuid FROM asset_maintenance WHERE id=?", [res.insertId]);
-      jobUuid = row.uuid;
-    } catch (e) {
-      if (e.code === "ER_DUP_ENTRY") {
-        throw new ApiError(409, "This asset already has an open maintenance job");
-      }
-      throw e;
-    }
-
-    const status = await syncStatus(conn, orgId, assetUuid);
-    await conn.commit();
-
-    audit(actorUuid, "asset.maintenance.report", "asset", assetUuid, orgId, {
-      maintenance_uuid: jobUuid,
-      vendor: data.vendor ?? null,
-      cost: data.cost ?? null,
-    });
-    return { maintenance_uuid: jobUuid, status };
-  } catch (e) {
-    await conn.rollback();
-    throw e;
-  } finally {
-    conn.release();
-  }
-}
-
-/**
- * Close a maintenance job.
- *
- * `restoreToAvailable` is explicit rather than inferred. Completing a repair
- * while the asset is still recorded as held by an employee is a real situation
- * (borrowed company laptop sent for servicing), and guessing there would either
- * silently strip a live assignment or strand the asset in "assigned" with
- * nothing to fix. The caller states which situation they mean.
- */
-export async function completeMaintenance({ orgId, actorUuid, jobUuid, data = {} }) {
-  assertUuid(jobUuid, "Maintenance UUID");
-  const finalStatus = data.status === "cancelled" ? "cancelled" : "completed";
-
-  const conn = await pool.getConnection();
-  try {
-    await conn.beginTransaction();
-    const [[job]] = await conn.query(
-      "SELECT * FROM asset_maintenance WHERE uuid=? AND organization_id=? FOR UPDATE",
-      [jobUuid, orgId],
-    );
-    if (!job) throw new ApiError(404, "Maintenance job not found");
-    if (job.status !== "open") {
-      throw new ApiError(409, `This job is already ${job.status}`);
-    }
-
-    await conn.query(
-      `UPDATE asset_maintenance
-          SET status=?, completed_at=NOW(), completed_by_uuid=?, completion_notes=?
-        WHERE uuid=?`,
-      [finalStatus, actorUuid ?? null, data.notes ?? null, jobUuid],
-    );
-
-    // Recompute from the rows rather than forcing "available": if the asset is
-    // still legitimately held by someone, that is where it belongs.
-    const status = await syncStatus(conn, orgId, job.asset_uuid);
-    await conn.commit();
-
-    audit(actorUuid, "asset.maintenance.complete", "asset", job.asset_uuid, orgId, {
-      maintenance_uuid: jobUuid,
-      status: finalStatus,
-    });
-    return { maintenance_uuid: jobUuid, status };
+    audit(actorUuid, "asset.return", "asset", assetUuid, orgId, { condition, notes: notes ?? null });
+    return { status };
   } catch (e) {
     await conn.rollback();
     throw e;
@@ -833,7 +480,7 @@ async function employeeForUser(orgId, userUuid) {
  * do I have" wants what is in their hands, and showing a returned laptop as still
  * theirs invites a support ticket about a device they do not have.
  *
- * Only non-sensitive columns are returned: tag, category, model, serial and the
+ * Only non-sensitive columns are returned: tag, model, serial and the
  * assignment date. Deliberately NOT purchase_cost or vendor — an employee has no
  * business seeing what the company paid, and including it would make this
  * endpoint a way to read procurement figures.
@@ -847,16 +494,10 @@ export async function listMyAssets({ orgId, userUuid }) {
 
   const [rows] = await pool.query(
     `SELECT a.uuid, a.asset_tag, a.name, a.model_details, a.serial_number,
-            a.warranty_expires_at, c.name AS category_name,
-            g.assigned_at, g.uuid AS assignment_uuid
+            a.warranty_expires_at, g.assigned_at, g.uuid AS assignment_uuid
        FROM asset_assignments g
        JOIN assets a ON a.uuid = g.asset_uuid
-       JOIN asset_categories c ON c.uuid = a.category_uuid
       WHERE g.employee_uuid=? AND g.organization_id=? AND g.returned_at IS NULL
-        -- Defence in depth. An asset on a repair bench is not "currently
-        -- assigned to" anybody in any sense an employee should act on, and the
-        -- syncStatus invariant should already prevent it. Belt and braces,
-        -- because exposing a broken laptop as usable is worse than hiding it.
         AND a.status = 'assigned'
       ORDER BY g.assigned_at DESC`,
     [employee.uuid, orgId],
@@ -867,7 +508,6 @@ export async function listMyAssets({ orgId, userUuid }) {
     assignment_uuid: r.assignment_uuid,
     asset_tag: r.asset_tag,
     name: r.name,
-    category_name: r.category_name,
     model_details: r.model_details,
     serial_number: r.serial_number,
     warranty_expires_at: r.warranty_expires_at,
@@ -876,7 +516,7 @@ export async function listMyAssets({ orgId, userUuid }) {
 }
 
 // ---------------------------------------------------------------------------
-// Attachments: purchase receipts and maintenance invoices
+// Attachments: purchase receipts
 // ---------------------------------------------------------------------------
 
 /**
@@ -906,43 +546,11 @@ export async function attachReceipt({ orgId, actorUuid, assetUuid, files, catego
   return rows;
 }
 
-/** Attach a repair invoice to a maintenance job, same ownership check first. */
-export async function attachInvoice({ orgId, actorUuid, jobUuid, files, description }) {
-  assertUuid(jobUuid, "Maintenance UUID");
-  const [[job]] = await pool.query(
-    "SELECT uuid FROM asset_maintenance WHERE uuid=? AND organization_id=?",
-    [jobUuid, orgId],
-  );
-  if (!job) throw new ApiError(404, "Maintenance job not found");
-
-  const rows = await attachments.createAttachments({
-    orgId,
-    entityType: ATTACHMENT_ENTITY.MAINTENANCE,
-    entityUuid: jobUuid,
-    uploadedByUuid: actorUuid ?? null,
-    category: ATTACHMENT_CATEGORY.INVOICE,
-    description: description ?? null,
-    files,
-  });
-  audit(actorUuid, "asset.maintenance.attachment.add", "asset_maintenance", jobUuid, orgId, {
-    count: rows.length,
-  });
-  return rows;
-}
-
 export function listReceipts({ orgId, assetUuid }) {
   return attachments.listAttachments({
     orgId,
     entityType: ATTACHMENT_ENTITY.ASSET,
     entityUuid: assetUuid,
-  });
-}
-
-export function listInvoices({ orgId, jobUuid }) {
-  return attachments.listAttachments({
-    orgId,
-    entityType: ATTACHMENT_ENTITY.MAINTENANCE,
-    entityUuid: jobUuid,
   });
 }
 
@@ -962,19 +570,10 @@ export async function removeAssetAttachment({ orgId, actorUuid, attachmentUuid }
     [attachmentUuid, orgId],
   );
   if (!rows.length) throw new ApiError(404, "Attachment not found");
-  if (![ATTACHMENT_ENTITY.ASSET, ATTACHMENT_ENTITY.MAINTENANCE].includes(rows[0].entity_type)) {
+  if (rows[0].entity_type !== ATTACHMENT_ENTITY.ASSET) {
     throw new ApiError(400, "That file does not belong to an asset");
   }
-  // Confirms the owning entity is visible in this org.
-  if (rows[0].entity_type === ATTACHMENT_ENTITY.ASSET) {
-    await loadAsset(orgId, rows[0].entity_uuid);
-  } else {
-    const [[job]] = await pool.query(
-      "SELECT uuid FROM asset_maintenance WHERE uuid=? AND organization_id=?",
-      [rows[0].entity_uuid, orgId],
-    );
-    if (!job) throw new ApiError(404, "Attachment not found");
-  }
+  await loadAsset(orgId, rows[0].entity_uuid);
   return attachments.removeAttachment({ orgId, attachmentUuid, actorUuid });
 }
 
@@ -988,15 +587,9 @@ export function resolveAssetAttachment({ orgId, attachmentUuid }) {
 // ---------------------------------------------------------------------------
 
 /**
- * Scrapping an asset.
- *
- * Terminal by design: a scrapped asset cannot be assigned, returned, or sent for
- * maintenance, because its purchase history has to stay readable for the years
- * an auditor asks for it. That is why this is `retired` and not a DELETE — the
- * row is the record.
- *
- * Refuses while the asset is held or in the shop, since scrapping something an
- * employee is using would make the custody history contradict the asset record.
+ * Scrapping an asset. Retired assets remain in the register for audit history.
+ * Refuses while the asset is assigned, since scrapping equipment an employee is
+ * using would make the custody history contradict the asset record.
  */
 export async function retireAsset({ orgId, actorUuid, assetUuid, reason }) {
   assertUuid(assetUuid, "Asset UUID");
@@ -1008,9 +601,6 @@ export async function retireAsset({ orgId, actorUuid, assetUuid, reason }) {
     if (asset.status === "retired") throw new ApiError(409, "This asset is already retired");
     if (asset.status === "assigned") {
       throw new ApiError(409, "Return this asset before retiring it");
-    }
-    if (asset.status === "maintenance") {
-      throw new ApiError(409, "Close the open maintenance job before retiring this asset");
     }
 
     await conn.query(
@@ -1056,11 +646,16 @@ export async function reinstateAsset({ orgId, actorUuid, assetUuid }) {
 }
 
 /** Summary counts for the inventory dashboard tiles. */
-export async function assetSummary({ orgId }) {
+export async function assetSummary({ orgId, scopeFilter, creatorScopeFilter }) {
+  const visibleByAssignment = scopeFilter
+    ? `EXISTS (SELECT 1 FROM asset_assignments sf JOIN employees e ON e.uuid=sf.employee_uuid WHERE sf.asset_uuid=assets.uuid AND sf.organization_id=assets.organization_id AND sf.returned_at IS NULL AND ${scopeFilter.sql})`
+    : "0=1";
+  const visibleByCreator = creatorScopeFilter ? creatorScopeFilter.sql.replace(/\ba\./g, "assets.") : "0=1";
+  const scopeSql = scopeFilter || creatorScopeFilter ? ` AND (${visibleByAssignment} OR ${visibleByCreator})` : "";
   const [rows] = await pool.query(
     `SELECT status, COUNT(*) AS n, COALESCE(SUM(purchase_cost),0) AS value
-       FROM assets WHERE organization_id=? GROUP BY status`,
-    [orgId],
+       FROM assets WHERE organization_id=?${scopeSql} GROUP BY status`,
+    [orgId, ...(scopeFilter?.params ?? []), ...(creatorScopeFilter?.params ?? [])],
   );
   const byStatus = Object.fromEntries(ASSET_STATUSES.map((s) => [s, 0]));
   let totalValue = 0;
@@ -1068,9 +663,5 @@ export async function assetSummary({ orgId }) {
     byStatus[r.status] = r.n;
     if (r.status !== "retired") totalValue += Number(r.value);
   }
-  const [[{ n: maintenanceCost }]] = await pool.query(
-    "SELECT COALESCE(SUM(cost),0) AS n FROM asset_maintenance WHERE organization_id=? AND status='completed'",
-    [orgId],
-  );
-  return { by_status: byStatus, total_value: totalValue, maintenance_spend: Number(maintenanceCost) };
+  return { by_status: byStatus, total_value: totalValue };
 }

@@ -31,7 +31,6 @@ const row = (over = {}) => ({
   assignment_uuid: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
   asset_tag: "AST-0001",
   name: "ThinkPad T14",
-  category_name: "Laptops",
   model_details: "T14 Gen 3",
   serial_number: "PF3XK9",
   warranty_expires_at: "2027-01-31",
@@ -113,13 +112,7 @@ describe("my assets", () => {
     withEmployeeAndRows([row()]);
     const [first] = await assets.listMyAssets({ orgId: ORG, userUuid: USER });
 
-    for (const key of [
-      "asset_tag",
-      "category_name",
-      "model_details",
-      "serial_number",
-      "assigned_at",
-    ]) {
+    for (const key of ["asset_tag", "name", "model_details", "serial_number", "assigned_at"]) {
       expect(first).toHaveProperty(key);
     }
   });

@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { randomUUID } from "node:crypto";
 import dotenv from "dotenv";
 import mysql from "mysql2/promise";
 import {
-  createCategory,
   createClaim,
   reviewClaim,
   markClaimPaid,
@@ -16,7 +16,7 @@ import {
 import { generatePayroll } from "../src/controllers/salary.controller.js";
 import { pool } from "../src/config/db.js";
 import { purgeTestOrgs } from "./helpers/dbCleanup.js";
-import { seedPayrollBaseline } from "./helpers/payrollPolicy.js";
+import { seedPayrollBaseline } from "./helpers/payrollSettings.js";
 
 /**
  * THE INVARIANT THIS FILE EXISTS TO PROVE.
@@ -39,10 +39,10 @@ import { seedPayrollBaseline } from "./helpers/payrollPolicy.js";
  *     toISOString() shifts the calendar day backwards. isoDate() is used throughout
  *     precisely so that cannot happen; a mock has no timezone to catch it in.
  *
- * EVERY TEST GETS ITS OWN EMPLOYEE AND ITS OWN CATEGORY. Claims are counted and
- * totalled per employee and per period, so a shared fixture would make each test see
- * the previous one's money and the file would become order-dependent - a payroll
- * regression would present as "the claim total is wrong" with no obvious cause.
+ * EVERY TEST GETS ITS OWN EMPLOYEE. Claims are counted and totalled per employee and
+ * per period, so a shared fixture would make each test see the previous one's money
+ * and the file would become order-dependent - a payroll regression would present as
+ * "the claim total is wrong" with no obvious cause.
  *
  * THE 20261114 REGRESSION, EXPLICITLY.
  *
@@ -91,9 +91,6 @@ let orgId;
 let otherOrgId;
 /** A REAL user row: salary_records.created_by is an FK to users(id). */
 let payrollUserId;
-let taxi;
-let meals;
-let unlimited;
 let n = 0;
 
 beforeAll(async () => {
@@ -127,15 +124,6 @@ beforeAll(async () => {
     `Expense Other Tenant ${Date.now()}`,
   ]);
   otherOrgId = other.insertId;
-
-  const mk = async (name, opts) =>
-    createCategory({ orgId, name, conn: db, ...opts });
-
-  // requires_receipt: the receipt gate, and the reason attachments exist here.
-  taxi = await mk("Taxi", { maxLimitPerClaim: 5000, requiresReceipt: true });
-  meals = await mk("Meals", { requiresReceipt: false });
-  // No limit at all, to keep limit-enforcement tests off the critical path.
-  unlimited = await mk("General", { requiresReceipt: false });
 });
 
 afterAll(async () => {
@@ -163,7 +151,7 @@ afterAll(async () => {
       await db.query("DELETE FROM employees WHERE organization_id=?", [id]);
     }
     // Both probe orgs are deleted: left behind they appear in an org-admin's
-    // organization picker and their categories look like real company policy.
+    // organization picker and their claims look like real company data.
   
   } finally {
     await purgeTestOrgs(db, [orgId, otherOrgId]);
@@ -196,7 +184,7 @@ const file = (amount, over = {}) =>
   createClaim({
     orgId,
     employeeUuid: over.employeeUuid,
-    categoryUuid: over.categoryUuid ?? unlimited.uuid,
+    expenseName: over.expenseName ?? "Probe expense",
     amount,
     expenseDate: over.expenseDate ?? IN_PERIOD,
     description: "probe claim",
@@ -204,13 +192,20 @@ const file = (amount, over = {}) =>
     conn: db,
   });
 
-/** file + approve, attaching a receipt first only when the category requires one. */
-async function approvedClaim({ employeeUuid, categoryUuid = unlimited.uuid, amount = 1000, expenseDate = IN_PERIOD, paymentMode = "payroll" }) {
-  const claim = await file(amount, { employeeUuid, categoryUuid, expenseDate, paymentMode });
-  // Derived from the category rather than passed in as a flag, so a test cannot
-  // forget it and then fail for the wrong reason.
-  if (categoryUuid === taxi.uuid) await attachReceipt(claim.uuid);
+/** file + approve. Receipts are optional, so none is attached. */
+async function approvedClaim({ employeeUuid, expenseName = "Probe expense", amount = 1000, expenseDate = IN_PERIOD, paymentMode = "payroll" }) {
+  const claim = await file(amount, { employeeUuid, expenseName, expenseDate, paymentMode });
   return reviewClaim({ orgId, claimUuid: claim.uuid, decision: "approved", conn: db });
+}
+
+async function newSalaryRecord(employeeUuid, uuid = randomUUID()) {
+  await db.query(
+    `INSERT INTO salary_records
+       (uuid, employee_uuid, organization_id, month, year, created_by)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+    [uuid, employeeUuid, orgId, MONTH, YEAR, payrollUserId],
+  );
+  return uuid;
 }
 
 describe.runIf(HAS_DB)("an expense claim is reimbursed exactly once", () => {
@@ -268,13 +263,14 @@ describe.runIf(HAS_DB)("an expense claim is reimbursed exactly once", () => {
   it("a payroll run settles the claims, and a SECOND run settles nothing", async () => {
     const employee = await newEmployee(orgId, "PayrollOnce");
     const claim = await approvedClaim({ employeeUuid: employee, amount: 800 });
+    const salaryRecordUuid = await newSalaryRecord(employee);
 
     const firstRun = await getApprovedClaimsForPeriod({
       orgId, employeeUuid: employee, month: MONTH, year: YEAR, conn: db,
     });
     expect(firstRun).toHaveLength(1);
     await markClaimsPaidByPayroll({
-      conn: db, orgId, salaryRecordUuid: "salary-record-1", claims: firstRun,
+      conn: db, orgId, salaryRecordUuid, claims: firstRun,
     });
 
     const secondRun = await getApprovedClaimsForPeriod({
@@ -291,7 +287,7 @@ describe.runIf(HAS_DB)("an expense claim is reimbursed exactly once", () => {
     );
     expect(rows[0].status).toBe("paid");
     // Traceable to the payslip that carried it - the evidence an audit reads.
-    expect(rows[0].paid_via_salary_record_uuid).toBe("salary-record-1");
+    expect(rows[0].paid_via_salary_record_uuid).toBe(salaryRecordUuid);
     expect(rows[0].paid_at).toBeTruthy();
   });
 
@@ -302,10 +298,13 @@ describe.runIf(HAS_DB)("an expense claim is reimbursed exactly once", () => {
       orgId, employeeUuid: employee, month: MONTH, year: YEAR, conn: db,
     });
 
-    await markClaimsPaidByPayroll({ conn: db, orgId, salaryRecordUuid: "run-a", claims });
+    const firstRecord = await newSalaryRecord(employee);
+    await markClaimsPaidByPayroll({ conn: db, orgId, salaryRecordUuid: firstRecord, claims });
     // A caller holding a stale claim list (two payroll runs racing, or a retry that
     // reused an old payload) must not be able to settle it again.
-    await markClaimsPaidByPayroll({ conn: db, orgId, salaryRecordUuid: "run-b", claims });
+    await expect(
+      markClaimsPaidByPayroll({ conn: db, orgId, salaryRecordUuid: randomUUID(), claims }),
+    ).rejects.toMatchObject({ statusCode: 409 });
 
     const [rows] = await db.query(
       "SELECT status, paid_via_salary_record_uuid FROM expense_claims WHERE uuid=?",
@@ -313,7 +312,7 @@ describe.runIf(HAS_DB)("an expense claim is reimbursed exactly once", () => {
     );
     // The second run matched zero rows: run-b does not overwrite run-a.
     expect(rows[0].status).toBe("paid");
-    expect(rows[0].paid_via_salary_record_uuid).toBe("run-a");
+    expect(rows[0].paid_via_salary_record_uuid).toBe(firstRecord);
   });
 
   it("a paid claim can never be settled again, by hand or in bulk", async () => {
@@ -335,33 +334,23 @@ describe.runIf(HAS_DB)("an expense claim is reimbursed exactly once", () => {
   // -------------------------------------------------------------------------
   // Review rules.
   // -------------------------------------------------------------------------
-  it("a category that requires a receipt cannot be approved without one", async () => {
-    const employee = await newEmployee(orgId, "NoReceipt");
-    const claim = await file(900, { employeeUuid: employee, categoryUuid: taxi.uuid });
+  it("a claim can be approved with NO receipt, and still reports zero receipts", async () => {
+    // Receipts are optional now. Demanding one everywhere would make the module
+    // unusable for small daily spend and people would stop filing claims.
+    const employee = await newEmployee(orgId, "NoReceiptNeeded");
+    const claim = await file(120, { employeeUuid: employee, expenseName: "Bus fare" });
+    const approved = await reviewClaim({ orgId, claimUuid: claim.uuid, decision: "approved", conn: db });
+    expect(approved.status).toBe("approved");
+    expect(approved.receipt_count).toBe(0);
+  });
 
-    await expect(
-      reviewClaim({ orgId, claimUuid: claim.uuid, decision: "approved", conn: db }),
-    ).rejects.toThrow(/require a receipt/i);
-
-    // Still pending afterwards - a refused approval must not half-apply.
-    const [rows] = await db.query("SELECT status FROM expense_claims WHERE uuid=?", [claim.uuid]);
-    expect(rows[0].status).toBe("pending");
-
+  it("a receipt is still accepted when the employee attaches one", async () => {
+    const employee = await newEmployee(orgId, "WithReceipt");
+    const claim = await file(900, { employeeUuid: employee, expenseName: "Taxi" });
     await attachReceipt(claim.uuid);
     const approved = await reviewClaim({ orgId, claimUuid: claim.uuid, decision: "approved", conn: db });
     expect(approved.status).toBe("approved");
-    expect(approved.receipt_satisfied).toBe(true);
-  });
-
-  it("a receipt requirement is NOT applied to a category that does not ask for one", async () => {
-    // The other direction: if receipts were demanded everywhere, the module would be
-    // unusable for small daily spend and people would stop filing claims at all.
-    const employee = await newEmployee(orgId, "NoReceiptNeeded");
-    const claim = await file(120, { employeeUuid: employee, categoryUuid: meals.uuid });
-    const approved = await reviewClaim({ orgId, claimUuid: claim.uuid, decision: "approved", conn: db });
-    expect(approved.status).toBe("approved");
-    expect(approved.receipt_satisfied).toBe(true);
-    expect(approved.receipt_count).toBe(0);
+    expect(approved.receipt_count).toBe(1);
   });
 
   it("a claim cannot be decided twice", async () => {
@@ -463,27 +452,6 @@ describe.runIf(HAS_DB)("an expense claim is reimbursed exactly once", () => {
   // -------------------------------------------------------------------------
   // Submission rules.
   // -------------------------------------------------------------------------
-  it("a claim over the category limit is refused at submission AND at review", async () => {
-    const employee = await newEmployee(orgId, "OverLimit");
-    // taxi is capped at 5000.
-    await expect(file(6000, { employeeUuid: employee, categoryUuid: taxi.uuid })).rejects.toThrow(
-      /exceeds the Taxi limit/i,
-    );
-
-    // And the limit can be TIGHTENED between submission and review, which is why it
-    // is re-checked on approval rather than trusted from submission time.
-    const claim = await file(4000, { employeeUuid: employee, categoryUuid: taxi.uuid });
-    await attachReceipt(claim.uuid);
-    await db.query("UPDATE expense_categories SET max_limit_per_claim=1000 WHERE uuid=?", [taxi.uuid]);
-    try {
-      await expect(
-        reviewClaim({ orgId, claimUuid: claim.uuid, decision: "approved", conn: db }),
-      ).rejects.toThrow(/exceeds the current Taxi limit/i);
-    } finally {
-      await db.query("UPDATE expense_categories SET max_limit_per_claim=5000 WHERE uuid=?", [taxi.uuid]);
-    }
-  });
-
   it("refuses a future expense and one beyond the backdate window", async () => {
     const employee = await newEmployee(orgId, "BadDates");
     await expect(file(100, { employeeUuid: employee, expenseDate: "2099-01-01" })).rejects.toThrow(
@@ -525,18 +493,6 @@ describe.runIf(HAS_DB)("an expense claim is reimbursed exactly once", () => {
     // And it is still untouched in its own org.
     const [rows] = await db.query("SELECT status FROM expense_claims WHERE uuid=?", [mine.uuid]);
     expect(rows[0].status).toBe("approved");
-  });
-
-  it("a claim cannot be filed against a category belonging to another organization", async () => {
-    const theirCategory = await createCategory({
-      orgId: otherOrgId,
-      name: "Their Travel",
-      conn: db,
-    });
-    const employee = await newEmployee(orgId, "WrongCategory");
-    await expect(
-      file(100, { employeeUuid: employee, categoryUuid: theirCategory.uuid }),
-    ).rejects.toThrow(/not found/i);
   });
 
   it("an employee from another organization cannot have a claim filed for them", async () => {
@@ -594,13 +550,13 @@ describe.runIf(HAS_DB)("an expense claim is reimbursed exactly once", () => {
     expect(expenseReimbursementLine(null)).toBeNull();
   });
 
-  it("a single claim is labelled by its category rather than as a count of one", async () => {
+  it("a single claim is labelled by its expense name rather than as a count of one", async () => {
     const employee = await newEmployee(orgId, "SingleLabel");
-    await approvedClaim({ employeeUuid: employee, amount: 100, categoryUuid: meals.uuid });
+    await approvedClaim({ employeeUuid: employee, amount: 100, expenseName: "Client lunch" });
     const claims = await getApprovedClaimsForPeriod({
       orgId, employeeUuid: employee, month: MONTH, year: YEAR, conn: db,
     });
-    expect(expenseReimbursementLine(claims).label).toMatch(/Meals/);
+    expect(expenseReimbursementLine(claims).label).toMatch(/Client lunch/);
   });
 });
 
@@ -653,7 +609,7 @@ async function newPaidEmployee(name) {
 describe.runIf(HAS_DB)("payroll carries approved claims onto the payslip and consumes them", () => {
   it("an approved claim becomes an auto_expense EARNING line and is marked paid by the run", async () => {
     const employee = await newPaidEmployee("PayslipEarning");
-    const claim = await approvedClaim({ employeeUuid: employee, amount: 1250, categoryUuid: meals.uuid });
+    const claim = await approvedClaim({ employeeUuid: employee, amount: 1250, expenseName: "Client lunch" });
 
     const res = fakeRes();
     await generatePayroll(
@@ -722,7 +678,7 @@ describe.runIf(HAS_DB)("payroll carries approved claims onto the payslip and con
     expect(Number(unpaid[0].n)).toBe(0);
   });
 
-  it("a REGENERATED period does not pay the claim a second time", async () => {
+  it("a period with a paid claim cannot be regenerated or lose its payment history", async () => {
     const employee = await newPaidEmployee("Regenerated");
     const claim = await approvedClaim({ employeeUuid: employee, amount: 900 });
 
@@ -736,23 +692,20 @@ describe.runIf(HAS_DB)("payroll carries approved claims onto the payslip and con
     // Regenerate rewrites the period from scratch, which is the scenario most likely
     // to double-pay: it deletes and recreates every line, so a naive implementation
     // would re-read the claims. They are 'paid' now, so there is nothing to re-read.
-    const second = fakeRes();
-    await generatePayroll(
+    await expect(generatePayroll(
       {
         scopeOrgId: orgId,
         body: { month: MONTH, year: YEAR, employee_uuids: [employee], regenerate: true },
         user: { id: payrollUserId },
       },
-      second,
-    );
-    expect(second.sent.body.data.expense_claims_paid).toBe(0);
+      fakeRes(),
+    )).rejects.toMatchObject({ statusCode: 409 });
 
     const [lines] = await db.query(
       "SELECT amount FROM salary_record_lines WHERE employee_uuid=? AND source='auto_expense'",
       [employee],
     );
-    // The payslip keeps the reimbursement, because the money really was paid once -
-    // but only the ONE run's worth exists.
+    // The original payslip and paid-claim link stay untouched.
     expect(lines).toHaveLength(1);
     expect(Number(lines[0].amount)).toBe(900);
 
@@ -785,13 +738,14 @@ describe.runIf(HAS_DB)("payroll carries approved claims onto the payslip and con
      * suite, and a test that damages unrelated tests is worse than no test. A
      * rollback needs no broken schema to be meaningful.
      */
+    const salaryRecordUuid = await newSalaryRecord(employee);
     const conn = await pool.getConnection();
     try {
       await conn.beginTransaction();
       await markClaimsPaidByPayroll({
         conn,
         orgId,
-        salaryRecordUuid: "record-that-will-not-exist",
+        salaryRecordUuid,
         claims: [{ uuid: claim.uuid, amount: 700 }],
       });
 
@@ -886,5 +840,30 @@ describe.runIf(HAS_DB)("payroll carries approved claims onto the payslip and con
     expect(res.sent.body.data.expense_claims_paid).toBe(0);
     const [rows] = await db.query("SELECT status FROM expense_claims WHERE employee_uuid=?", [employee]);
     expect(rows[0].status).toBe("approved");
+  });
+
+  it("approval after the expense-period payroll is generated carries into the next period", async () => {
+    const employee = await newEmployee(orgId, "LateApproval");
+    await newSalaryRecord(employee);
+    const claim = await approvedClaim({ employeeUuid: employee, amount: 550 });
+
+    expect(Number(claim.reimbursement_year)).toBe(YEAR);
+    expect(Number(claim.reimbursement_month)).toBe(MONTH + 1);
+    const originalPeriod = await getApprovedClaimsForPeriod({
+      orgId,
+      employeeUuid: employee,
+      month: MONTH,
+      year: YEAR,
+      conn: db,
+    });
+    const nextPeriod = await getApprovedClaimsForPeriod({
+      orgId,
+      employeeUuid: employee,
+      month: MONTH + 1,
+      year: YEAR,
+      conn: db,
+    });
+    expect(originalPeriod).toHaveLength(0);
+    expect(nextPeriod.map((entry) => entry.uuid)).toContain(claim.uuid);
   });
 });

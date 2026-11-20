@@ -40,9 +40,10 @@ const ATTACH = "66666666-6666-4666-8666-666666666666";
 const assetRow = (over = {}) => ({
   uuid: ASSET,
   organization_id: ORG,
-  category_uuid: "22222222-2222-4222-8222-222222222222",
   asset_tag: "AST-0001",
   name: "ThinkPad",
+  model_details: null,
+  serial_number: null,
   status: "available",
   ...over,
 });
@@ -118,36 +119,6 @@ describe("asset receipts", () => {
   });
 });
 
-describe("maintenance invoices", () => {
-  it("records invoices against the maintenance entity", async () => {
-    const create = vi.spyOn(attachmentsService, "createAttachments").mockResolvedValue([{ uuid: ATTACH }]);
-    pool.query = vi.fn(async (sql) => {
-      if (String(sql).includes("FROM asset_maintenance WHERE uuid")) return [[{ uuid: JOB }], []];
-      return [[], []];
-    });
-
-    await assets.attachInvoice({ orgId: ORG, actorUuid: ADMIN, jobUuid: JOB, files: [file("invoice.pdf")] });
-
-    expect(create).toHaveBeenCalledWith(
-      expect.objectContaining({
-        entityType: "asset_maintenance",
-        entityUuid: JOB,
-        category: "maintenance_invoice",
-      }),
-    );
-  });
-
-  it("refuses an invoice against another organization's job", async () => {
-    const create = vi.spyOn(attachmentsService, "createAttachments");
-    pool.query = vi.fn(async () => [[], []]);
-
-    await expect(
-      assets.attachInvoice({ orgId: OTHER_ORG, actorUuid: ADMIN, jobUuid: JOB, files: [file()] }),
-    ).rejects.toMatchObject({ statusCode: 404 });
-    expect(create).not.toHaveBeenCalled();
-  });
-});
-
 describe("attachment deletion", () => {
   it("will not delete a file that is not an asset attachment", async () => {
     // entity_type is free-form, so an attachment belonging to, say, an expense
@@ -206,27 +177,25 @@ describe("attachment deletion", () => {
 });
 
 describe("asset detail", () => {
-  it("includes receipts and per-job invoices", async () => {
+  it("includes purchase receipts", async () => {
     vi.spyOn(attachmentsService, "listAttachments").mockImplementation(async ({ entityType, entityUuid }) => {
       if (entityType === "asset") return [{ uuid: ATTACH, file_name: "receipt.pdf" }];
-      return entityUuid === JOB ? [{ uuid: ATTACH, file_name: "invoice.pdf" }] : [];
+      return [];
     });
 
     pool.query = vi.fn(async (sql) => {
       const s = String(sql);
       if (s.includes("FROM assets a")) return [[assetRow()], []];
       if (s.includes("FROM asset_assignments g")) return [[], []];
-      if (s.includes("FROM asset_maintenance")) return [[{ uuid: JOB, status: "open" }], []];
       return [[], []];
     });
 
     const asset = await assets.getAsset({ orgId: ORG, assetUuid: ASSET });
     expect(asset.receipts).toHaveLength(1);
-    expect(asset.maintenance[0].invoices).toHaveLength(1);
   });
 
   it("still returns custody history when an attachment lookup fails", async () => {
-    // A 500 here would blank the whole asset page over a missing invoice.
+    // A 500 here would blank the whole asset page over a missing receipt.
     vi.spyOn(attachmentsService, "listAttachments").mockRejectedValue(new Error("attachments down"));
 
     pool.query = vi.fn(async (sql) => {
@@ -235,7 +204,6 @@ describe("asset detail", () => {
       if (s.includes("FROM asset_assignments g")) {
         return [[{ uuid: "g1", employee_uuid: EMPLOYEE_UUID, employee_name: "Kinza", returned_at: null }], []];
       }
-      if (s.includes("FROM asset_maintenance")) return [[], []];
       return [[], []];
     });
 

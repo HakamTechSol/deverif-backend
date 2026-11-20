@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import dotenv from "dotenv";
 import mysql from "mysql2/promise";
 import { purgeTestOrgs } from "./helpers/dbCleanup.js";
-import { seedPayrollBaseline, seedPayrollPolicy } from "./helpers/payrollPolicy.js";
+import { seedPayrollBaseline, seedPayrollSettings } from "./helpers/payrollSettings.js";
 
 import {
   createSalaryComponent,
@@ -16,7 +16,8 @@ import {
   updateEmployeeSalaryComponent,
 } from "../src/controllers/org/employeeSalaryComponents.controller.js";
 import { setLeaveAllocation } from "../src/controllers/org/leaveAllocation.controller.js";
-import { createLeave, decideLeave } from "../src/controllers/leave.controller.js";
+import { createLeave, decideLeave, cancelLeave, listOrgLeaves, myLeaveCalendar } from "../src/controllers/leave.controller.js";
+import { getEmployeeLeaveHistory } from "../src/controllers/org/leaveAllocation.controller.js";
 import {
   addAllowedIp,
   checkIn,
@@ -258,7 +259,7 @@ async function insertUser({ org, name, email, role }) {
  * A fresh employee with its own linked platform user and salary history.
  * `allocations` is [{ typeId, days }].
  */
-async function newEmployee({ name = "Probe", org = orgId, basic = BASIC, platform = true, allocations = [] } = {}) {
+async function newEmployee({ name = "Probe", org = orgId, basic = BASIC, platform = true, allocations = [], joiningDate = "2024-01-01" } = {}) {
   n += 1;
   const email = `payroll-${runTag}-${n}@example.com`;
   let user = null;
@@ -270,8 +271,8 @@ async function newEmployee({ name = "Probe", org = orgId, basic = BASIC, platfor
   const [emp] = await db.query(
     `INSERT INTO employees
        (uuid, full_name, email, organization_id, status, is_platform_user, linked_user_uuid, joining_date)
-     VALUES (UUID(), ?, ?, ?, 'current_employee', ?, ?, '2024-01-01')`,
-    [`${name} ${n}`, email, org, user ? "yes" : "no", user?.uuid ?? null],
+     VALUES (UUID(), ?, ?, ?, 'current_employee', ?, ?, ?)`,
+    [`${name} ${n}`, email, org, user ? "yes" : "no", user?.uuid ?? null, joiningDate],
   );
   const [rows] = await db.query("SELECT uuid FROM employees WHERE id=?", [emp.insertId]);
   const uuid = rows[0].uuid;
@@ -305,9 +306,9 @@ async function attendAll(uuid, skip = []) {
     if (skipped.has(date)) continue;
     await db.query(
       `INSERT INTO attendance_records
-         (uuid, employee_uuid, organization_id, date, check_in_at, status, is_manual, created_at)
-       VALUES (UUID(), ?, ?, ?, ?, 'checked_in', 'no', NOW())`,
-      [uuid, orgId, date, `${date} 08:55:00`],
+         (uuid, employee_uuid, organization_id, date, check_in_at, check_out_at, status, is_manual, created_at)
+       VALUES (UUID(), ?, ?, ?, ?, ?, 'checked_in', 'no', NOW())`,
+      [uuid, orgId, date, `${date} 08:55:00`, `${date} 17:00:00`],
     );
   }
 }
@@ -315,9 +316,9 @@ async function attendAll(uuid, skip = []) {
 async function approveLeaveDirect(uuid, leaveTypeId, startDate, endDate) {
   await db.query(
     `INSERT INTO leave_requests
-       (uuid, employee_uuid, leave_type_id, start_date, end_date, status, approved_at)
-     VALUES (UUID(), ?, ?, ?, ?, 'approved', NOW())`,
-    [uuid, leaveTypeId, startDate, endDate],
+       (uuid, employee_uuid, leave_type_id, start_date, end_date, requested_treatment, approved_treatment, status, approved_at)
+     VALUES (UUID(), ?, ?, ?, ?, ?, ?, 'approved', NOW())`,
+    [uuid, leaveTypeId, startDate, endDate, "unpaid", "unpaid"],
   );
 }
 
@@ -554,6 +555,133 @@ describe.runIf(HAS_DB)("salary components reach the payslip", () => {
 // ---------------------------------------------------------------------------
 
 describe.runIf(HAS_DB)("leave requests reach the payslip", () => {
+  it("default unpaid leave keeps its configured payroll treatment", async () => {
+    const emp = await newEmployee({ name: "DefaultUnpaidLeave", allocations: [] });
+    const submitted = await call(createLeave, employeeReq(emp, {
+      body: {
+        default_unpaid: true,
+        start_date: "2026-10-12",
+        end_date: "2026-10-12",
+        reason: "No leave balance",
+      },
+    }));
+    expect(submitted.statusCode).toBe(201);
+    expect(submitted.body.data.leaveRequest.requested_treatment).toBe("unpaid");
+
+    const leaveUuid = submitted.body.data.leaveRequest.uuid;
+    const listed = await call(listOrgLeaves, adminReq());
+    expect(listed.body.data.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ uuid: leaveUuid, leave_type_name: "Unpaid Leave" }),
+    ]));
+
+    const decided = await call(decideLeave, adminReq({
+      params: { uuid: leaveUuid },
+      body: { status: "approved", approved_treatment: "unpaid" },
+    }));
+    expect(decided.statusCode).toBe(200);
+    expect(decided.body.data.leaveRequest.approved_treatment).toBe("unpaid");
+    const payroll = await preview(emp.uuid);
+    expect(payroll.attendance.paid_leave_days).toBe(0);
+    expect(payroll.attendance.unpaid_leave_days).toBe(1);
+    const [allocations] = await db.query(
+      "SELECT id FROM employee_leave_allocations WHERE employee_uuid=?",
+      [emp.uuid],
+    );
+    expect(allocations).toHaveLength(0);
+  });
+
+  it("leave requests use configured working days and reject non-working endpoints and overlaps", async () => {
+    const emp = await newEmployee({
+      name: "WorkingDaysAndOverlap",
+      allocations: [{ typeId: unpaidTypeId, days: 10 }],
+    });
+    const calendar = await call(myLeaveCalendar, employeeReq(emp, {
+      query: { month: "10", year: "2026", from: "2026-10-09", to: "2026-10-12" },
+    }));
+    expect(calendar.body.data.working_dates).toContain("2026-10-12");
+    expect(calendar.body.data.working_dates).not.toContain("2026-10-11");
+    expect(calendar.body.data.range_working_days).toBe(2);
+
+    await expect(
+      call(createLeave, employeeReq(emp, {
+        body: {
+          leave_type_id: unpaidTypeId,
+          start_date: "2026-10-11",
+          end_date: "2026-10-12",
+          reason: "Sunday start",
+        },
+      })),
+    ).rejects.toMatchObject({ statusCode: 400 });
+
+    const first = await call(createLeave, employeeReq(emp, {
+      body: {
+        leave_type_id: unpaidTypeId,
+        start_date: "2026-10-09",
+        end_date: "2026-10-12",
+        reason: "Friday to Monday",
+      },
+    }));
+    expect(first.body.data.leaveRequest.status).toBe("pending");
+    await expect(
+      call(createLeave, employeeReq(emp, {
+        body: {
+          leave_type_id: unpaidTypeId,
+          start_date: "2026-10-12",
+          end_date: "2026-10-13",
+          reason: "Overlapping Monday",
+        },
+      })),
+    ).rejects.toMatchObject({ statusCode: 409 });
+
+    await call(decideLeave, adminReq({
+      params: { uuid: first.body.data.leaveRequest.uuid },
+      body: { status: "approved" },
+    }));
+    const [allocation] = await db.query(
+      "SELECT used_days, remaining_days FROM employee_leave_allocations WHERE employee_uuid=? AND leave_type_id=? AND year=?",
+      [emp.uuid, unpaidTypeId, YEAR],
+    );
+    expect(allocation[0].used_days).toBe(2);
+    expect(allocation[0].remaining_days).toBe(8);
+  });
+
+  it("admin can see past leave requests and employee history shows their date range and balance", async () => {
+    const emp = await newEmployee({
+      name: "LeaveHistory",
+      allocations: [{ typeId: unpaidTypeId, days: 10 }],
+    });
+    const submitted = await call(createLeave, employeeReq(emp, {
+      body: {
+        leave_type_id: unpaidTypeId,
+        start_date: "2026-10-12",
+        end_date: "2026-10-13",
+        reason: "Personal",
+      },
+    }));
+    const leaveUuid = submitted.body.data.leaveRequest.uuid;
+
+    const listed = await call(listOrgLeaves, adminReq());
+    expect(listed.body.data.items.some((leave) => leave.uuid === leaveUuid)).toBe(true);
+
+    await call(decideLeave, adminReq({
+      params: { uuid: leaveUuid },
+      body: { status: "approved" },
+    }));
+    const history = await call(getEmployeeLeaveHistory, adminReq({ params: { uuid: emp.uuid } }));
+    expect(history.body.data.leave_history).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        uuid: leaveUuid,
+        start_date: "2026-10-12",
+        end_date: "2026-10-13",
+        days: 2,
+        status: "approved",
+      }),
+    ]));
+    expect(history.body.data.balances).toEqual(expect.arrayContaining([
+      expect.objectContaining({ leave_type_name: "Unpaid Leave", used_days: 2, remaining_days: 8 }),
+    ]));
+  });
+
   it("an approved UNPAID leave request moves from absence to one unpaid-leave deduction", async () => {
     const emp = await newEmployee({
       name: "UnpaidLeaveFlow",
@@ -571,6 +699,7 @@ describe.runIf(HAS_DB)("leave requests reach the payslip", () => {
     const submitted = await call(createLeave, employeeReq(emp, {
       body: {
         leave_type_id: unpaidTypeId,
+        requested_treatment: "paid",
         start_date: "2026-10-06",
         end_date: "2026-10-07",
         reason: "Family emergency",
@@ -578,6 +707,7 @@ describe.runIf(HAS_DB)("leave requests reach the payslip", () => {
     }));
     expect(submitted.statusCode).toBe(201);
     expect(submitted.body.data.leaveRequest.status).toBe("pending");
+    expect(submitted.body.data.leaveRequest.requested_treatment).toBe("unpaid");
     const leaveUuid = submitted.body.data.leaveRequest.uuid;
 
     // PENDING leave changes nothing: payroll only counts an approved request.
@@ -647,6 +777,171 @@ describe.runIf(HAS_DB)("leave requests reach the payslip", () => {
     const after = await preview(emp.uuid);
     expect(after.lines.some((l) => l.source === "auto_unpaid_leave")).toBe(false);
     expect(Number(after.deductions)).toBe(0);
+  });
+
+  it("serializes concurrent approvals and makes cancellation and balance adjustments ledger-backed", async () => {
+    const emp = await newEmployee({
+      name: "LedgerFlow",
+      allocations: [{ typeId: unpaidTypeId, days: 2 }],
+    });
+    const submitted = await call(createLeave, employeeReq(emp, {
+      body: {
+        leave_type_id: unpaidTypeId,
+        start_date: "2026-10-12",
+        end_date: "2026-10-12",
+        reason: "Ledger flow",
+      },
+    }));
+    const uuid = submitted.body.data.leaveRequest.uuid;
+    let [allocation] = await db.query(
+      "SELECT used_days, remaining_days FROM employee_leave_allocations WHERE employee_uuid=? AND leave_type_id=? AND year=?",
+      [emp.uuid, unpaidTypeId, YEAR],
+    );
+    expect(Number(allocation[0].used_days)).toBe(0);
+    expect(Number(allocation[0].remaining_days)).toBe(2);
+
+    const decisions = await Promise.allSettled([
+      call(decideLeave, adminReq({ params: { uuid }, body: { status: "approved" } })),
+      call(decideLeave, adminReq({ params: { uuid }, body: { status: "approved" } })),
+    ]);
+    expect(decisions.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(decisions.filter((result) => result.status === "rejected")).toHaveLength(1);
+    let [ledger] = await db.query(
+      `SELECT transaction_type, credited_days, debited_days, previous_balance, updated_balance
+       FROM leave_balance_ledger WHERE related_leave_request_uuid=?`,
+      [uuid],
+    );
+    expect(ledger).toHaveLength(1);
+    expect(ledger[0].transaction_type).toBe("leave_approved");
+    expect(Number(ledger[0].previous_balance)).toBe(2);
+    expect(Number(ledger[0].updated_balance)).toBe(1);
+
+    await call(cancelLeave, employeeReq(emp, { params: { uuid } }));
+    await expect(
+      call(cancelLeave, employeeReq(emp, { params: { uuid } })),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    [allocation] = await db.query(
+      "SELECT used_days, remaining_days FROM employee_leave_allocations WHERE employee_uuid=? AND leave_type_id=? AND year=?",
+      [emp.uuid, unpaidTypeId, YEAR],
+    );
+    expect(Number(allocation[0].used_days)).toBe(0);
+    expect(Number(allocation[0].remaining_days)).toBe(2);
+    [ledger] = await db.query(
+      `SELECT transaction_type, credited_days, debited_days, previous_balance, updated_balance
+       FROM leave_balance_ledger WHERE related_leave_request_uuid=? ORDER BY id`,
+      [uuid],
+    );
+    expect(ledger.map((entry) => entry.transaction_type)).toEqual(["leave_approved", "leave_cancelled"]);
+    expect(Number(ledger[1].credited_days)).toBe(1);
+
+    await call(setLeaveAllocation, adminReq({
+      body: { employee_uuid: emp.uuid, leave_type_id: unpaidTypeId, year: YEAR, allocated_days: 3 },
+    }));
+    const [adjustment] = await db.query(
+      `SELECT transaction_type, credited_days, previous_balance, updated_balance
+       FROM leave_balance_ledger
+       WHERE employee_uuid=? AND transaction_type='admin_adjustment'`,
+      [emp.uuid],
+    );
+    expect(adjustment).toHaveLength(1);
+    expect(Number(adjustment[0].credited_days)).toBe(1);
+    expect(Number(adjustment[0].updated_balance)).toBe(3);
+  });
+
+  it("deducts an approved half-day at 0.5 and rejects a conflicting duplicate request", async () => {
+    const emp = await newEmployee({
+      name: "HalfDayLeave",
+      allocations: [{ typeId: paidTypeId, days: 1 }],
+    });
+    const submitted = await call(createLeave, employeeReq(emp, {
+      body: {
+        leave_type_id: paidTypeId,
+        start_date: "2026-10-12",
+        end_date: "2026-10-12",
+        day_portion: "half",
+        reason: "Half-day appointment",
+      },
+    }));
+    const uuid = submitted.body.data.leaveRequest.uuid;
+    await expect(call(createLeave, employeeReq(emp, {
+      body: {
+        leave_type_id: paidTypeId,
+        start_date: "2026-10-12",
+        end_date: "2026-10-12",
+        day_portion: "half",
+        reason: "Conflicting half-day",
+      },
+    }))).rejects.toMatchObject({ statusCode: 409 });
+
+    await call(decideLeave, adminReq({ params: { uuid }, body: { status: "approved" } }));
+    const [allocation] = await db.query(
+      "SELECT used_days, remaining_days FROM employee_leave_allocations WHERE employee_uuid=? AND leave_type_id=? AND year=?",
+      [emp.uuid, paidTypeId, YEAR],
+    );
+    expect(Number(allocation[0].used_days)).toBe(0.5);
+    expect(Number(allocation[0].remaining_days)).toBe(0.5);
+    const payroll = await preview(emp.uuid);
+    expect(payroll.attendance.paid_leave_days).toBe(0.5);
+    expect(payroll.attendance.absent_days).toBe(WORKING_DAYS - 0.5);
+    expect(payroll.lines.some((line) => line.source === "auto_unpaid_leave")).toBe(false);
+  });
+
+  it("reports attendance recorded on an approved leave date and applies attendance only once", async () => {
+    const emp = await newEmployee({
+      name: "LeaveAttendanceConflict",
+      allocations: [{ typeId: paidTypeId, days: 1 }],
+    });
+    await attendAll(emp.uuid);
+    const submitted = await call(createLeave, employeeReq(emp, {
+      body: {
+        leave_type_id: paidTypeId,
+        start_date: "2026-10-12",
+        end_date: "2026-10-12",
+        reason: "Approved leave with attendance",
+      },
+    }));
+    await call(decideLeave, adminReq({
+      params: { uuid: submitted.body.data.leaveRequest.uuid },
+      body: { status: "approved" },
+    }));
+    const payroll = await preview(emp.uuid);
+    expect(payroll.attendance.paid_leave_days).toBe(0);
+    expect(payroll.attendance.absent_days).toBe(0);
+    expect(payroll.attendance.leave_attendance_conflicts).toEqual(expect.arrayContaining([
+      expect.objectContaining({ date: "2026-10-12", resolution: "attendance_takes_precedence" }),
+    ]));
+  });
+
+  it("rejects pre-joining and invalid-range leave and blocks an employee from approving", async () => {
+    const emp = await newEmployee({
+      name: "JoiningDateLeave",
+      allocations: [{ typeId: unpaidTypeId, days: 5 }],
+      joiningDate: "2026-10-09",
+    });
+    await expect(call(createLeave, employeeReq(emp, {
+      body: {
+        leave_type_id: unpaidTypeId,
+        start_date: "2026-10-13",
+        end_date: "2026-10-12",
+        reason: "Invalid range",
+      },
+    }))).rejects.toMatchObject({ statusCode: 400 });
+
+    const [request] = await db.query(
+      `INSERT INTO leave_requests
+         (uuid, employee_uuid, leave_type_id, start_date, end_date, status)
+       VALUES (UUID(), ?, ?, '2026-10-08', '2026-10-08', 'pending')`,
+      [emp.uuid, unpaidTypeId],
+    );
+    const [createdRequest] = await db.query("SELECT uuid FROM leave_requests WHERE id=?", [request.insertId]);
+    await expect(call(decideLeave, adminReq({
+      params: { uuid: createdRequest[0].uuid },
+      body: { status: "approved" },
+    }))).rejects.toMatchObject({ statusCode: 409 });
+    await expect(call(decideLeave, employeeReq(emp, {
+      params: { uuid: createdRequest[0].uuid },
+      body: { status: "approved" },
+    }))).rejects.toMatchObject({ statusCode: 403 });
   });
 
   it("approving beyond the remaining balance is refused atomically", async () => {
@@ -724,7 +1019,6 @@ describe.runIf(HAS_DB)("leave requests reach the payslip", () => {
       name: "PaidLeaveFlow",
       allocations: [{ typeId: paidTypeId, days: 10 }],
     });
-
     const before = await preview(emp.uuid);
     expect(before.attendance.absent_days).toBe(WORKING_DAYS);
 
@@ -737,6 +1031,11 @@ describe.runIf(HAS_DB)("leave requests reach the payslip", () => {
       },
     }));
     const leaveUuid = submitted.body.data.leaveRequest.uuid;
+    const [request] = await db.query(
+      "SELECT requested_treatment FROM leave_requests WHERE uuid=?",
+      [leaveUuid],
+    );
+    expect(request[0].requested_treatment).toBe("paid");
     await call(decideLeave, adminReq({
       params: { uuid: leaveUuid },
       body: { status: "approved" },
@@ -747,6 +1046,48 @@ describe.runIf(HAS_DB)("leave requests reach the payslip", () => {
     expect(after.attendance.absent_days).toBe(WORKING_DAYS - 1);
     expect(after.lines.some((l) => l.source === "auto_unpaid_leave")).toBe(false);
     expect(Number(after.deductions)).toBe(money(PER_DAY * (WORKING_DAYS - 1)));
+  });
+
+  it("admin can select unpaid treatment when approving a paid leave type", async () => {
+    const emp = await newEmployee({
+      name: "AdminChangesPaidToUnpaid",
+      allocations: [{ typeId: paidTypeId, days: 10 }],
+    });
+    const submitted = await call(createLeave, employeeReq(emp, {
+      body: {
+        leave_type_id: paidTypeId,
+        start_date: "2026-10-12",
+        end_date: "2026-10-12",
+        reason: "Admin treatment override",
+      },
+    }));
+    const leaveUuid = submitted.body.data.leaveRequest.uuid;
+    const decided = await call(decideLeave, adminReq({
+      params: { uuid: leaveUuid },
+      body: { status: "approved", approved_treatment: "unpaid" },
+    }));
+    expect(decided.body.data.leaveRequest.requested_treatment).toBe("paid");
+    expect(decided.body.data.leaveRequest.approved_treatment).toBe("unpaid");
+
+    const [allocation] = await db.query(
+      "SELECT used_days, remaining_days FROM employee_leave_allocations WHERE employee_uuid=? AND leave_type_id=? AND year=?",
+      [emp.uuid, paidTypeId, YEAR],
+    );
+    expect(Number(allocation[0].used_days)).toBe(0);
+    expect(Number(allocation[0].remaining_days)).toBe(10);
+
+    const payroll = await preview(emp.uuid);
+    expect(payroll.attendance.unpaid_leave_days).toBe(1);
+    expect(payroll.attendance.paid_leave_days).toBe(0);
+    expect(payroll.lines.some((line) => line.source === "auto_unpaid_leave")).toBe(true);
+
+    await call(cancelLeave, employeeReq(emp, { params: { uuid: leaveUuid } }));
+    const [afterCancellation] = await db.query(
+      "SELECT used_days, remaining_days FROM employee_leave_allocations WHERE employee_uuid=? AND leave_type_id=? AND year=?",
+      [emp.uuid, paidTypeId, YEAR],
+    );
+    expect(Number(afterCancellation[0].used_days)).toBe(0);
+    expect(Number(afterCancellation[0].remaining_days)).toBe(10);
   });
 
   it("allocations can be changed per employee without losing used days", async () => {
@@ -803,6 +1144,7 @@ describe.runIf(HAS_DB)("attendance records reach the payslip", () => {
           employee_uuid: emp.uuid,
           date,
           check_in_time: time,
+          check_out_time: "17:00",
           reason: "Biometric device offline",
         },
       }));
@@ -822,17 +1164,12 @@ describe.runIf(HAS_DB)("attendance records reach the payslip", () => {
     expect(four.attendance.late_count).toBe(3);
     expect(four.attendance.absent_days).toBe(WORKING_DAYS - 4);
 
-    const lateLine = lineOf(four, "auto_late");
-    expect(lateLine).toBeTruthy();
-    expect(Number(lateLine.amount)).toBe(money(PER_DAY * 0.5));
-    expect(Number(lateLine.basis_value)).toBe(3);
+    expect(lineOf(four, "auto_late")).toBeFalsy();
     expect(Number(lineOf(four, "auto_absenteeism").amount)).toBe(
       money(PER_DAY * (WORKING_DAYS - 4)),
     );
-    // 3 late arrivals x the configured threshold of 3 = one half-day penalty.
-    expect(Number(four.deductions)).toBe(
-      money(PER_DAY * (WORKING_DAYS - 4) + PER_DAY * 0.5),
-    );
+    // Late arrivals are reported, but the removed payroll-policy penalty is not applied.
+    expect(Number(four.deductions)).toBe(money(PER_DAY * (WORKING_DAYS - 4)));
   });
 
   it("attendance on a weekend is recorded but is not a working day", async () => {
@@ -933,6 +1270,10 @@ describe.runIf(HAS_DB)("approved overtime reaches the payslip", () => {
   it("pays only APPROVED hours, clamped to the request, and never the rejected ones", async () => {
     const emp = await newEmployee({ name: "OvertimeFlow" });
     await attendAll(emp.uuid);
+    await db.query(
+      "UPDATE attendance_records SET check_out_at='2026-10-20 19:00:00' WHERE employee_uuid=? AND date='2026-10-20'",
+      [emp.uuid],
+    );
 
     const created = await call(createOvertimeRequest, adminReq({
       body: {
@@ -980,14 +1321,11 @@ describe.runIf(HAS_DB)("approved overtime reaches the payslip", () => {
     }));
 
     const p = await preview(emp.uuid);
-    expect(p.attendance.approved_overtime_hours).toBe(8);
-    const line = lineOf(p, "auto_overtime");
-    expect(line).toBeTruthy();
-    expect(line.type).toBe("earning");
-    expect(Number(line.basis_value)).toBe(8);
-    expect(Number(line.amount)).toBe(money(HOURLY * 1.5 * 8));
-    expect(Number(p.allowances)).toBe(money(HOURLY * 1.5 * 8));
-    expect(Number(p.net_salary)).toBe(money(BASIC + HOURLY * 1.5 * 8));
+    expect(p.attendance.approved_overtime_hours).toBe(2);
+    expect(lineOf(p, "auto_overtime")).toBeUndefined();
+    expect(lineOf(p, "manual_overtime")).toBeUndefined();
+    expect(Number(p.allowances)).toBe(0);
+    expect(Number(p.net_salary)).toBe(BASIC);
   });
 });
 
@@ -1002,6 +1340,10 @@ describe.runIf(HAS_DB)("payroll preview and generation agree end to end", () => 
       allocations: [{ typeId: unpaidTypeId, days: 10 }],
     });
     await attendAll(emp.uuid, ["2026-10-06", "2026-10-07"]);
+    await db.query(
+      "UPDATE attendance_records SET check_out_at='2026-10-20 19:00:00' WHERE employee_uuid=? AND date='2026-10-20'",
+      [emp.uuid],
+    );
     await approveLeaveDirect(emp.uuid, unpaidTypeId, "2026-10-06", "2026-10-07");
 
     const transport = await createComponent({
@@ -1037,13 +1379,12 @@ describe.runIf(HAS_DB)("payroll preview and generation agree end to end", () => 
     expect(p.attendance.attended_days).toBe(20);
     expect(p.attendance.absent_days).toBe(0);
     expect(p.attendance.unpaid_leave_days).toBe(2);
-    expect(p.attendance.approved_overtime_hours).toBe(6);
+    expect(p.attendance.approved_overtime_hours).toBe(2);
 
-    const expectedOvertime = money(HOURLY * 1.5 * 6);
-    expect(Number(p.allowances)).toBe(money(8000 + expectedOvertime));
+    expect(Number(p.allowances)).toBe(8000);
     expect(Number(p.deductions)).toBe(money(1000 + PER_DAY * 2));
     expect(Number(p.net_salary)).toBe(
-      money(BASIC + 8000 + expectedOvertime - 1000 - PER_DAY * 2),
+      money(BASIC + 8000 - 1000 - PER_DAY * 2),
     );
 
     const generated = await generate([emp.uuid]);
@@ -1067,10 +1408,10 @@ describe.runIf(HAS_DB)("payroll preview and generation agree end to end", () => 
     expect(sources).toContain("basic");
     expect(sources).toContain("component");
     expect(sources).toContain("auto_unpaid_leave");
-    expect(sources).toContain("auto_overtime");
+    expect(sources).not.toContain("auto_overtime");
     expect(sources).not.toContain("auto_absenteeism");
 
-    expect(lines).toHaveLength(6); // basic + 3 components + unpaid leave + overtime
+    expect(lines).toHaveLength(5); // basic + 3 components + unpaid leave
     const earnings = lines.filter((l) => l.type === "earning").reduce((s, l) => s + Number(l.amount), 0);
     const deductions = lines.filter((l) => l.type === "deduction").reduce((s, l) => s + Number(l.amount), 0);
     expect(money(earnings - deductions)).toBe(Number(record.net_salary));
@@ -1078,10 +1419,6 @@ describe.runIf(HAS_DB)("payroll preview and generation agree end to end", () => 
     const leaveLine = lines.find((l) => l.source === "auto_unpaid_leave");
     expect(Number(leaveLine.basis_value)).toBe(2);
     expect(leaveLine.basis_unit).toBe("days");
-    const overtimeLine = lines.find((l) => l.source === "auto_overtime");
-    expect(Number(overtimeLine.basis_value)).toBe(6);
-    expect(overtimeLine.basis_unit).toBe("hours");
-
     // A second generate for the same employee/period is refused, not duplicated.
     await expect(generate([emp.uuid])).rejects.toMatchObject({ statusCode: 409 });
 
@@ -1103,11 +1440,9 @@ describe.runIf(HAS_DB)("payroll preview and generation agree end to end", () => 
     const regenerated = await generate([emp.uuid], { regenerate: true });
     expect(regenerated.statusCode).toBe(200);
     const [afterRegenerate] = await salaryRecordOf(emp.uuid);
-    expect(Number(afterRegenerate.allowances)).toBe(
-      money(7000 + 3000 + expectedOvertime),
-    );
+    expect(Number(afterRegenerate.allowances)).toBe(money(7000 + 3000));
     expect(Number(afterRegenerate.net_salary)).toBe(
-      money(BASIC + 7000 + 3000 + expectedOvertime - 1000 - PER_DAY * 2),
+      money(BASIC + 7000 + 3000 - 1000 - PER_DAY * 2),
     );
   });
 
@@ -1130,25 +1465,25 @@ describe.runIf(HAS_DB)("payroll preview and generation agree end to end", () => 
     expect(await salaryRecordOf(emp.uuid)).toHaveLength(0);
   });
 
-  it("preview refuses an org with no confirmed payroll policy", async () => {
+  it("preview refuses an org without payroll settings", async () => {
     const res = await call(previewPayroll, adminReq({
       scopeOrgId: otherOrgId,
       body: { month: MONTH, year: YEAR },
     })).catch((error) => ({ error }));
-    // The other tenant has an employee but no policy: preview must stop, not
-    // invent a deduction formula.
+    // The other tenant has an employee but no payroll settings: preview must stop,
+    // rather than invent a salary calculation method or shift timing.
     expect(res.error?.statusCode).toBe(409);
-    expect(res.error?.message).toMatch(/Payroll policy is not configured/i);
+    expect(res.error?.message).toMatch(/Payroll settings are not configured/i);
   });
 
-  it("preview refuses an org whose working week is not configured", async () => {
+  it("preview refuses an org whose monthly schedule is not configured", async () => {
     const [third] = await db.query("INSERT INTO organizations (uuid, name) VALUES (UUID(), ?)", [
       `Payroll No Week ${runTag}`,
     ]);
     const thirdOrgId = third.insertId;
     orgsToPurge.push(thirdOrgId);
-    // Policy without a work week: exactly one of the two configured inputs.
-    await seedPayrollPolicy(db, thirdOrgId);
+    // Settings exist, but no monthly date schedule has been saved.
+    await seedPayrollSettings(db, thirdOrgId);
     const emp = await newEmployee({
       name: "NoWorkWeek",
       org: thirdOrgId,
@@ -1160,7 +1495,7 @@ describe.runIf(HAS_DB)("payroll preview and generation agree end to end", () => 
       body: { month: MONTH, year: YEAR, employee_uuids: [emp.uuid] },
     })).catch((error) => ({ error }));
     expect(res.error?.statusCode).toBe(409);
-    expect(res.error?.message).toMatch(/work week is not configured/i);
+    expect(res.error?.message).toMatch(/monthly working schedule is incomplete/i);
   });
 
   it("another tenant's employee cannot be previewed or generated", async () => {

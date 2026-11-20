@@ -26,26 +26,6 @@ import { isoDate as normaliseIsoDate } from "../utils/dateRange.js";
  * below rather than left to the UI.
  */
 
-/**
- * The baseline every exit starts from.
- *
- * Seeded on request creation rather than left to whoever opens the dialog, so two
- * departures never produce two different checklists. Four departments because
- * four teams each hold something: IT revokes access, Finance confirms no dues,
- * Assets recovers hardware, HR closes the record.
- */
-export const CHECKLIST_TEMPLATE = [
-  { department: "IT", task_name: "Revoke system access, email and portal accounts" },
-  { department: "IT", task_name: "Collect company laptop, badge and other devices" },
-  { department: "Finance", task_name: "Confirm no outstanding advances or loans" },
-  { department: "Finance", task_name: "Confirm final payroll has been processed" },
-  { department: "Assets", task_name: "Recover all company assets in the employee's custody" },
-  { department: "Assets", task_name: "Verify returned assets against custody history" },
-  { department: "HR", task_name: "Confirm exit interview completed" },
-  { department: "HR", task_name: "Issue experience letter and final salary certificate" },
-  { department: "HR", task_name: "Remove employee from roster and settle accounts" },
-];
-
 /** Statuses that count as "still in flight" - the generated guard mirrors this. */
 export const OPEN_EXIT_STATUSES = ["pending", "approved"];
 
@@ -80,6 +60,71 @@ export function daysUntilLastWorkingDay(fromIso, toIso) {
   const to = new Date(`${toIso}T00:00:00Z`).getTime();
   if (Number.isNaN(from) || Number.isNaN(to)) return 0;
   return Math.max(0, Math.round((to - from) / 86400000));
+}
+
+// ---------------------------------------------------------------------------
+// Organization clearance template management
+// ---------------------------------------------------------------------------
+
+const CLEARANCE_DEPARTMENTS = new Set(["IT", "Finance", "Assets", "HR"]);
+
+export async function listClearanceTemplates({ orgId, conn = pool }) {
+  const [rows] = await conn.query(
+    "SELECT uuid, department, task_name, is_active, sort_order, created_at, updated_at FROM offboarding_clearance_templates WHERE organization_id=? ORDER BY sort_order ASC, id ASC",
+    [orgId],
+  );
+  return rows;
+}
+
+export async function createClearanceTemplate({ orgId, department, taskName, conn = pool }) {
+  const name = typeof taskName === "string" ? taskName.trim() : "";
+  if (!CLEARANCE_DEPARTMENTS.has(department)) throw new ApiError(400, "department must be IT, Finance, Assets or HR");
+  if (!name || name.length > 200) throw new ApiError(400, "task_name is required and must be at most 200 characters");
+  const uuid = randomUUID();
+  const [[{ nextOrder }]] = await conn.query(
+    "SELECT COALESCE(MAX(sort_order), 0) + 1 AS nextOrder FROM offboarding_clearance_templates WHERE organization_id=?",
+    [orgId],
+  );
+  await conn.query(
+    "INSERT INTO offboarding_clearance_templates (uuid, organization_id, department, task_name, is_active, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, NOW(), NOW())",
+    [uuid, orgId, department, name, nextOrder],
+  );
+  const [rows] = await conn.query(
+    "SELECT uuid, department, task_name, is_active, sort_order, created_at, updated_at FROM offboarding_clearance_templates WHERE uuid=? AND organization_id=?",
+    [uuid, orgId],
+  );
+  return rows[0];
+}
+
+export async function updateClearanceTemplate({ orgId, uuid, department, taskName, isActive, conn = pool }) {
+  assertUuid(uuid, "Clearance template UUID");
+  const [existing] = await conn.query(
+    "SELECT uuid FROM offboarding_clearance_templates WHERE uuid=? AND organization_id=?",
+    [uuid, orgId],
+  );
+  if (!existing.length) throw new ApiError(404, "Clearance template task not found");
+  const name = typeof taskName === "string" ? taskName.trim() : "";
+  if (!CLEARANCE_DEPARTMENTS.has(department)) throw new ApiError(400, "department must be IT, Finance, Assets or HR");
+  if (!name || name.length > 200) throw new ApiError(400, "task_name is required and must be at most 200 characters");
+  await conn.query(
+    "UPDATE offboarding_clearance_templates SET department=?, task_name=?, is_active=?, updated_at=NOW() WHERE uuid=? AND organization_id=?",
+    [department, name, isActive === false ? 0 : 1, uuid, orgId],
+  );
+  const [rows] = await conn.query(
+    "SELECT uuid, department, task_name, is_active, sort_order, created_at, updated_at FROM offboarding_clearance_templates WHERE uuid=? AND organization_id=?",
+    [uuid, orgId],
+  );
+  return rows[0];
+}
+
+export async function deleteClearanceTemplate({ orgId, uuid, conn = pool }) {
+  assertUuid(uuid, "Clearance template UUID");
+  const [result] = await conn.query(
+    "DELETE FROM offboarding_clearance_templates WHERE uuid=? AND organization_id=?",
+    [uuid, orgId],
+  );
+  if (!result.affectedRows) throw new ApiError(404, "Clearance template task not found");
+  return { uuid };
 }
 
 // ---------------------------------------------------------------------------
@@ -212,7 +257,11 @@ export async function createExitRequest({
       ],
     );
 
-    for (const item of CHECKLIST_TEMPLATE) {
+    const [template] = await db.query(
+      "SELECT department, task_name FROM offboarding_clearance_templates WHERE organization_id=? AND is_active=1 ORDER BY sort_order ASC, id ASC",
+      [orgId],
+    );
+    for (const item of template) {
       await db.query(
         `INSERT INTO offboarding_checklists
            (uuid, organization_id, exit_request_uuid, department, task_name, status, created_at, updated_at)
@@ -227,7 +276,7 @@ export async function createExitRequest({
       employeeUuid: employee.uuid,
       employeeName: employee.full_name,
       employeeEmail: employee.email ?? null,
-      checklistTasks: CHECKLIST_TEMPLATE.length,
+      checklistTasks: template.length,
     };
   } catch (e) {
     if (own) await db.rollback();
@@ -305,7 +354,7 @@ export function summariseChecklist(checklist) {
     cleared,
     pending: total - cleared,
     // A number rather than a fraction: "7 of 9" is answerable, "0.78" is not.
-    complete: total > 0 && cleared === total,
+    complete: cleared === total,
     byDepartment,
   };
 }
@@ -404,12 +453,11 @@ export async function clearChecklistItem({ orgId, actorUuid, exitUuid, checklist
 export async function getOutstandingAssets({ orgId, employeeUuid, conn = pool }) {
   assertUuid(employeeUuid, "Employee UUID");
   const [rows] = await conn.query(
-    `SELECT a.uuid AS asset_uuid, a.asset_tag, a.name, a.category_uuid, c.name AS category_name,
-            a.status AS asset_status, a.purchase_cost, a.serial_number,
+    `SELECT a.uuid AS asset_uuid, a.asset_tag, a.name, a.serial_number,
+            a.status AS asset_status, a.purchase_cost,
             g.uuid AS assignment_uuid, g.assigned_at
        FROM asset_assignments g
        JOIN assets a ON a.uuid = g.asset_uuid
-       LEFT JOIN asset_categories c ON c.uuid = a.category_uuid
       WHERE g.organization_id = ?
         AND g.employee_uuid = ?
         AND g.returned_at IS NULL
@@ -421,7 +469,6 @@ export async function getOutstandingAssets({ orgId, employeeUuid, conn = pool })
     asset_uuid: r.asset_uuid,
     asset_tag: r.asset_tag,
     name: r.name,
-    category_name: r.category_name ?? null,
     serial_number: r.serial_number ?? null,
     asset_status: r.asset_status,
     purchase_cost: r.purchase_cost === null ? null : Number(r.purchase_cost),
@@ -706,7 +753,7 @@ export async function processSettlement({ orgId, actorUuid, exitUuid, target = "
   const assets = await getOutstandingAssets({ orgId, employeeUuid: settlement.employee_uuid, conn });
   if (assets.count > 0) {
     // Named explicitly. "There is an issue with the checklist" sends someone
-    // hunting; the asset tag sends them to the car park.
+    // hunting; the asset tag identifies the exact device.
     throw new ApiError(
       409,
       `Cannot ${target} the settlement: ${assets.count} company asset(s) are still in the employee's custody (${assets.items
@@ -782,17 +829,6 @@ export async function completeExit({ orgId, actorUuid, exitUuid, hrNotes, conn =
       409,
       `Cannot complete the exit: ${summary.pending} of ${summary.total} clearance task(s) are still outstanding.`,
     );
-  }
-
-  const [settlements] = await conn.query(
-    "SELECT uuid, status, net_fnf_amount FROM final_settlements WHERE exit_request_uuid=?",
-    [exitUuid],
-  );
-  if (!settlements.length) {
-    throw new ApiError(409, "Cannot complete the exit: no Full & Final settlement has been calculated");
-  }
-  if (settlements[0].status === "draft") {
-    throw new ApiError(409, "Cannot complete the exit: the Full & Final settlement is still a draft");
   }
 
   await conn.query(

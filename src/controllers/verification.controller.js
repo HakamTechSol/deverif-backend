@@ -1,5 +1,6 @@
 import ApiError from "../utils/ApiError.js";
 import { pool } from "../config/db.js";
+import { getDataScope } from "../utils/dataScopes.js";
 import { encryptCnic, decryptCnic, hashCnic } from "../utils/personCrypto.js";
 import { cnicError, normalizeCnic } from "../utils/contactFormat.js";
 import { recordPersonDocument } from "../utils/personDocuments.js";
@@ -167,7 +168,7 @@ async function resolveOrganizationUuid(uuid, required = false) {
 }
 
 export async function createRequest(req, res) {
-  requirePermission(req.user, "generate_request");
+  requirePermission(req.user, "document_verification.generate_request");
   const { document_type, issuing_organization_uuid,
           other_organization_name, submission_remarks,
           other_organization_email, other_organization_phone, other_organization_website,
@@ -586,28 +587,19 @@ export async function createRequest(req, res) {
 }
 
 export async function mySentRequests(req, res) {
+  requirePermission(req.user, "document_verification.generate_request");
   const { page, limit, offset } = parsePagination(req.query);
   const search = typeof req.query.search === "string" ? req.query.search.trim() : "";
   const dateFrom = typeof req.query.dateFrom === "string" ? req.query.dateFrom.trim() : "";
   const dateTo = typeof req.query.dateTo === "string" ? req.query.dateTo.trim() : "";
 
-  // An org_admin is accountable for everything their organization submitted, not
-  // just their own uploads. Scoping to user_id made a sub-admin's submissions
-  // invisible to them with no way to discover they existed — the request would
-  // simply be missing from the org's own history.
-  //
-  // The requester is identified via the joined `users` row (requester.organization),
-  // NOT via the issuing organization: "who sent it" and "who it was sent to" are
-  // different questions, and only the former decides what the sender may see.
-  //
-  // Sub-admins keep seeing only their own submissions. That is the narrower,
-  // already-shipped behaviour, and widening it is a permission-model decision
-  // rather than a bug fix, so it is deliberately not changed here.
-  const seesWholeOrg = req.user.org_role === "org_admin" && Boolean(req.user.organization);
-
+  // Scope the sender's history by the separately saved document-verification
+  // data scope. The sender is resolved through users.uuid; issuing_organization_id
+  // answers who received the request and must not be used as the ownership axis.
+  const dataScope = getDataScope(req.user, "document_verification");
   let whereClause;
   let params;
-  if (seesWholeOrg) {
+  if (req.user.org_role === "org_admin" || (req.user.org_role === "sub_admin" && dataScope === "entire_organization")) {
     whereClause = "WHERE requester.organization = ?";
     params = [req.user.organization];
   } else {
@@ -665,6 +657,7 @@ export async function mySentRequests(req, res) {
 }
 
 export async function deleteMySentRequest(req, res) {
+  requirePermission(req.user, "document_verification.edit_draft");
   const { uuid } = req.params;
   assertUuid(uuid, "Request UUID");
 
@@ -708,6 +701,7 @@ export async function deleteMySentRequest(req, res) {
 }
 
 export async function updateMySentRequest(req, res) {
+  requirePermission(req.user, "document_verification.edit_draft");
   const { uuid } = req.params;
   assertUuid(uuid, "Request UUID");
 
@@ -885,7 +879,7 @@ export async function updateMySentRequest(req, res) {
 }
 
 export async function myInboxRequests(req, res) {
-  requirePermission(req.user, "approve_request");
+  requirePermission(req.user, "document_verification.view_requests");
   if (!req.user.organization) throw new ApiError(400, "User has no organization");
 
   // Lazy SLA check on read (reminder + flag overdue requests)
@@ -994,7 +988,7 @@ export async function myInboxRequests(req, res) {
 }
 
 export async function getMyInboxRequestDetail(req, res) {
-  requirePermission(req.user, "approve_request");
+  requirePermission(req.user, "document_verification.view_requests");
   assertUuid(req.params.uuid, "Request UUID");
   if (!req.user.organization) throw new ApiError(400, "User has no organization");
 
@@ -1094,7 +1088,7 @@ export async function getMyInboxRequestDetail(req, res) {
 }
 
 export async function myInboxCount(req, res) {
-  requirePermission(req.user, "approve_request");
+  requirePermission(req.user, "document_verification.view_requests");
   if (!req.user.organization) return ok(res, { count: 0 }, "Inbox count");
 
   // Lazy SLA check on read
@@ -1131,7 +1125,7 @@ export async function myInboxCount(req, res) {
  * times occupies a single row showing "10", rather than ten near-identical rows.
  */
 export async function myAutoVerifiedRequests(req, res) {
-  requirePermission(req.user, "approve_request");
+  requirePermission(req.user, "document_verification.view_requests");
   if (!req.user.organization) throw new ApiError(400, "User has no organization");
 
   const { page, limit, offset } = parsePagination(req.query);
@@ -1233,7 +1227,7 @@ export async function myAutoVerifiedRequests(req, res) {
  * auto-only ledger must not claim an outcome it cannot prove.
  */
 export async function getAutoVerifiedRequestHistory(req, res) {
-  requirePermission(req.user, "approve_request");
+  requirePermission(req.user, "document_verification.view_requests");
   const { uuid } = req.params;
   assertUuid(uuid, "Request UUID");
   if (!req.user.organization) throw new ApiError(400, "User has no organization");
@@ -1290,9 +1284,11 @@ export async function verifyRequest(req, res) {
   const { uuid } = req.params;
   const { status, verification_remarks } = req.body;
 
-  requirePermission(req.user, "approve_request");
   assertUuid(uuid, "Request UUID");
   if (!["verified", "unverified"].includes(status)) throw new ApiError(400, "status must be verified or unverified");
+  requirePermission(req.user, status === "verified"
+    ? "document_verification.approve"
+    : "document_verification.reject");
 
   // A rejection is a statement ABOUT someone's document, and the requester is
   // entitled to know what was wrong with it. Without a reason the row is

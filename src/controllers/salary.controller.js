@@ -1,17 +1,24 @@
 import ApiError from "../utils/ApiError.js";
 import { pool } from "../config/db.js";
+import { employeeScopeCondition, assertEmployeeInDataScope } from "../utils/dataScopes.js";
 import { ok } from "../utils/response.js";
 import { assertUuid } from "../utils/publicResponse.js";
 import { parsePagination, paginatedResponse } from "../utils/pagination.js";
 import { logAudit, getActorFromReq } from "../utils/auditLog.js";
 import { generatePayslipPdf } from "../utils/payslipPdf.js";
-import { CURRENCY } from "../utils/currency.js";
 import { randomUUID } from "node:crypto";
 import * as payrollService from "../services/payroll.service.js";
-const { computeAutomaticLines, getMonthlyAttendanceAndLeaveSummary, insertSalaryRecordLines } =
+const {
+  calculatePayrollAmounts,
+  computeAutomaticLines,
+  getMonthlyAttendanceAndLeaveSummary,
+  insertSalaryRecordLines,
+} =
   payrollService;
 import * as expenses from "../services/expenses.service.js";
 import { queueNotificationEmail, notificationActionUrl } from "../services/notificationEmail.service.js";
+import { isoDate } from "../utils/dateRange.js";
+import { CURRENCY } from "../utils/currency.js";
 
 const MONTHS = [
   "January", "February", "March", "April", "May", "June",
@@ -36,6 +43,186 @@ function monthYearFields(month, year) {
   const y = parseInt(year, 10);
   if (isNaN(y) || y < 2000 || y > 2100) throw new ApiError(400, "year is invalid");
   return { m, y };
+}
+
+function normalizePayrollOvertimeAmounts(input) {
+  if (input === undefined) return new Map();
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw new ApiError(400, "overtime_amounts must be an employee-to-amount object.");
+  }
+  const amounts = new Map();
+  for (const [employeeUuid, rawAmount] of Object.entries(input)) {
+    assertUuid(employeeUuid, "Overtime employee UUID");
+    if (rawAmount === undefined || rawAmount === null || rawAmount === "") {
+      throw new ApiError(400, "Each overtime amount is required.");
+    }
+    const amount = moneyField(rawAmount, "overtime_amount");
+    if (amount > 999999999999.99) {
+      throw new ApiError(400, "overtime_amount exceeds the maximum supported amount.");
+    }
+    amounts.set(employeeUuid, amount);
+  }
+  return amounts;
+}
+
+function assertPayrollOvertimeEmployees(amounts, employees) {
+  const employeeUuids = new Set(employees.map((employee) => employee.uuid));
+  for (const employeeUuid of amounts.keys()) {
+    if (!employeeUuids.has(employeeUuid)) {
+      throw new ApiError(400, "Overtime amounts may only be supplied for employees in this payroll run.");
+    }
+  }
+}
+
+function normalizePayrollComponentSelections(input) {
+  if (input === undefined) return undefined;
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw new ApiError(400, "component_selections must be an employee-to-components object.");
+  }
+  const selections = {};
+  for (const [employeeUuid, selection] of Object.entries(input)) {
+    assertUuid(employeeUuid, "Component-selection employee UUID");
+    if (!selection || typeof selection !== "object" || Array.isArray(selection)) {
+      throw new ApiError(400, "Each employee component selection must include allowance_uuids and deduction_uuids.");
+    }
+    const normalized = {};
+    for (const field of ["allowance_uuids", "deduction_uuids"]) {
+      const values = selection[field];
+      if (!Array.isArray(values)) {
+        throw new ApiError(400, `Each employee component selection must include an array of ${field}.`);
+      }
+      const unique = new Set();
+      for (const uuid of values) {
+        assertUuid(uuid, "Salary component assignment UUID");
+        if (unique.has(uuid)) throw new ApiError(400, "Salary component assignments may only be selected once.");
+        unique.add(uuid);
+      }
+      normalized[field] = [...unique];
+    }
+    selections[employeeUuid] = normalized;
+  }
+  return selections;
+}
+
+function assertPayrollComponentSelectionEmployees(selections, employees) {
+  if (!selections) return;
+  const employeeUuids = new Set(employees.map((employee) => employee.uuid));
+  for (const employeeUuid of Object.keys(selections)) {
+    if (!employeeUuids.has(employeeUuid)) {
+      throw new ApiError(400, "Component selections may only be supplied for employees in this payroll run.");
+    }
+  }
+}
+
+function normalizePayrollRunPolicy(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw new ApiError(400, "Payroll run settings are required.");
+  }
+  const salaryCalculationPolicy = payrollService.normalizePayrollPolicy(
+    input.salary_calculation_policy,
+    input.salary_calculation_method,
+  );
+  const salaryCalculationMethod = payrollService.payrollAttendanceBasis(salaryCalculationPolicy);
+  if (typeof input.calculate_overtime !== "boolean") {
+    throw new ApiError(400, "calculate_overtime must be true or false.");
+  }
+  const validTime = (value) => typeof value === "string" && /^([01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$/.test(value);
+  if (!validTime(input.shift_start_time) || !validTime(input.shift_end_time)) {
+    throw new ApiError(400, "Enter valid shift start and check-out times.");
+  }
+  const shiftStart = input.shift_start_time.slice(0, 5);
+  const shiftEnd = input.shift_end_time.slice(0, 5);
+  const startMinutes = Number(shiftStart.slice(0, 2)) * 60 + Number(shiftStart.slice(3, 5));
+  const endMinutes = Number(shiftEnd.slice(0, 2)) * 60 + Number(shiftEnd.slice(3, 5));
+  if (endMinutes <= startMinutes) {
+    throw new ApiError(400, "Check-out must be later than shift start time.");
+  }
+  const overtimeMultiplier = Number(input.overtime_multiplier);
+  if (!Number.isFinite(overtimeMultiplier) || overtimeMultiplier <= 0 || overtimeMultiplier > 5) {
+    throw new ApiError(400, "overtime_multiplier must be greater than 0 and at most 5.");
+  }
+  const deductSalaryForLateArrivals = input.deduct_salary_for_late_arrivals ?? false;
+  if (typeof deductSalaryForLateArrivals !== "boolean") {
+    throw new ApiError(400, "deduct_salary_for_late_arrivals must be true or false.");
+  }
+  const lateArrivalThreshold = Number(input.late_arrival_threshold ?? 1);
+  if (
+    deductSalaryForLateArrivals
+    && (!Number.isInteger(lateArrivalThreshold) || lateArrivalThreshold < 1)
+  ) {
+    throw new ApiError(400, "late_arrival_threshold must be a positive whole number.");
+  }
+  const lateGraceMinutes = Number(input.late_grace_minutes ?? 10);
+  if (!Number.isInteger(lateGraceMinutes) || lateGraceMinutes < 0 || lateGraceMinutes > 180) {
+    throw new ApiError(400, "late_grace_minutes must be a whole number between 0 and 180.");
+  }
+  return {
+    salary_calculation_method: salaryCalculationMethod,
+    salary_calculation_policy: salaryCalculationPolicy,
+    calculate_overtime: input.calculate_overtime,
+    shift_start_time: shiftStart,
+    shift_end_time: shiftEnd,
+    overtime_multiplier: overtimeMultiplier,
+    deduct_salary_for_late_arrivals: deductSalaryForLateArrivals,
+    late_arrival_threshold: Number.isInteger(lateArrivalThreshold) && lateArrivalThreshold > 0
+      ? lateArrivalThreshold
+      : 1,
+    late_grace_minutes: lateGraceMinutes,
+    hours_per_workday: (endMinutes - startMinutes) / 60,
+    currency: CURRENCY,
+  };
+}
+
+function payrollPolicySnapshot(policy) {
+  return {
+    salary_calculation_method: policy.salary_calculation_method,
+    salary_calculation_policy: payrollService.normalizePayrollPolicy(
+      policy.salary_calculation_policy,
+      policy.salary_calculation_method,
+    ),
+    calculate_overtime: Number(policy.calculate_overtime) === 1 || policy.calculate_overtime === true,
+    shift_start_time: String(policy.shift_start_time).slice(0, 5),
+    shift_end_time: String(policy.shift_end_time).slice(0, 5),
+    overtime_multiplier: Number(policy.overtime_multiplier),
+    deduct_salary_for_late_arrivals:
+      Number(policy.deduct_salary_for_late_arrivals) === 1 || policy.deduct_salary_for_late_arrivals === true,
+    late_arrival_threshold: Number(policy.late_arrival_threshold ?? 1),
+    late_grace_minutes: Number(policy.late_grace_minutes ?? 10),
+  };
+}
+
+async function resolvePayrollRunInputs({ orgId, m, y, body, conn }) {
+  const hasSettings = body?.settings !== undefined;
+  const hasDays = body?.days !== undefined;
+  if (hasSettings !== hasDays) {
+    throw new ApiError(400, "Payroll run settings and working days must be supplied together.");
+  }
+
+  let policy;
+  let schedule;
+  if (hasSettings) {
+    policy = normalizePayrollRunPolicy(body.settings);
+    schedule = payrollService.normalizePayrollRunSchedule(body.days, m, y);
+  } else {
+    policy = await payrollService.getPayrollSettings(orgId, conn, m, y);
+    const calendar = await payrollService.getWorkingDaysForMonth({ orgId, month: m, year: y, conn });
+    const workingDates = new Set(calendar.workingDates);
+    const offDates = calendar.nonWorkingDates;
+    const daysInMonth = new Date(Date.UTC(y, m, 0)).getUTCDate();
+    schedule = Array.from({ length: daysInMonth }, (_, index) => {
+      const date = `${y}-${String(m).padStart(2, "0")}-${String(index + 1).padStart(2, "0")}`;
+      return { date, day_type: workingDates.has(date) ? "working" : offDates.has(date) ? "off" : null };
+    });
+    if (schedule.some((day) => day.day_type === null)) {
+      throw new ApiError(409, "Monthly working schedule is incomplete. Configure every date as a working day or off day before payroll.");
+    }
+  }
+  return {
+    policy,
+    schedule,
+    policySnapshot: payrollPolicySnapshot(policy),
+    scheduleSnapshot: schedule.map(({ date, day_type }) => ({ date, day_type })),
+  };
 }
 
 /** Verify an employee exists and belongs to the given organization. */
@@ -69,8 +256,19 @@ async function findEmployee(employeeUuid, orgId) {
  * is "what actually happened", and an employee disputing a payslip needs to be
  * told which of the two they are looking at.
  */
-async function computeEmployeePayroll({ employeeUuid, orgId, m, y, conn }) {
-  const basic = await effectiveBasicForMonth(employeeUuid, m, y, conn);
+async function computeEmployeePayroll({
+  employeeUuid,
+  orgId,
+  m,
+  y,
+  joiningDate = null,
+  policy,
+  scheduleOverride,
+  overtimeAmount: overtimeAmountOverride,
+  componentSelections,
+  conn,
+}) {
+  const basic = await payrollService.proratedBasicForMonth({ employeeUuid, orgId, month: m, year: y, joiningDate, conn });
 
   // Pull ONLY this employee's individually-assigned, active salary components.
   // We use the per-employee amount (esc.amount), NOT the catalog's default_value,
@@ -84,30 +282,32 @@ async function computeEmployeePayroll({ employeeUuid, orgId, m, y, conn }) {
   // Without this predicate the assignment kept paying an "inactive" component
   // forever, while the screen showed it as switched off.
   const [empComponents] = await conn.query(
-    `SELECT sc.name, sc.type, sc.is_percentage, esc.amount
+    `SELECT esc.uuid AS assignment_uuid, sc.name, sc.type, sc.is_percentage, esc.amount
      FROM employee_salary_components esc
      JOIN salary_components sc ON sc.id = esc.salary_component_id
-     WHERE esc.employee_uuid=? AND esc.is_active=1 AND sc.is_active=1`,
-    [employeeUuid]
+     WHERE esc.employee_uuid=? AND sc.organization_id=? AND esc.is_active=1 AND sc.is_active=1`,
+    [employeeUuid, orgId]
   );
 
-  const componentLines = [];
-  let allowances = 0;
-  let deductions = 0;
-  for (const c of empComponents) {
-    let amt = Number(c.amount);
-    if (c.is_percentage) amt = Number(basic) * (amt / 100);
-    amt = moneyField(amt, c.name);
-    componentLines.push({
-      label: c.name,
-      type: c.type === "deduction" ? "deduction" : "earning",
-      source: "component",
-      amount: amt,
-      basis_value: null,
-      basis_unit: null,
-    });
-    if (c.type === "deduction") deductions += amt;
-    else allowances += amt;
+  // Month-specific variable items (bonuses and one-off deductions, etc.).
+  // These are separate from recurring employee assignments and are included only
+  // for the exact payroll period being previewed/generated.
+  const [monthlyVariables] = await conn.query(
+    `SELECT label, type, amount
+       FROM monthly_salary_variables
+      WHERE organization_id=? AND employee_uuid=? AND month=? AND year=?
+      ORDER BY id`,
+    [orgId, employeeUuid, m, y],
+  );
+  let overtimeAmount = overtimeAmountOverride;
+  if (overtimeAmount === undefined) {
+    const [[overtimeRow]] = await conn.query(
+      `SELECT overtime_amount
+         FROM payroll_employee_overtime
+        WHERE organization_id=? AND employee_uuid=? AND month=? AND year=?`,
+      [orgId, employeeUuid, m, y],
+    );
+    overtimeAmount = moneyField(overtimeRow?.overtime_amount ?? 0, "overtime");
   }
 
   const summary = await getMonthlyAttendanceAndLeaveSummary({
@@ -115,10 +315,20 @@ async function computeEmployeePayroll({ employeeUuid, orgId, m, y, conn }) {
     orgId,
     month: m,
     year: y,
+    joiningDate,
+    policy,
+    scheduleOverride,
     conn,
   });
 
-  const automatic = computeAutomaticLines({ summary, basicSalary: basic });
+  // Overtime pay is entered as a period-specific amount by payroll staff.
+  // Attendance may still report approved overtime hours, but they must not
+  // create a second, automatically calculated earning.
+  const automatic = computeAutomaticLines({
+    summary,
+    basicSalary: basic,
+    policy: { ...policy, calculate_overtime: false },
+  });
 
   /**
    * Expense reimbursements for the month, as one payslip line.
@@ -143,60 +353,52 @@ async function computeEmployeePayroll({ employeeUuid, orgId, m, y, conn }) {
   });
   const expenseLine = expenses.expenseReimbursementLine(approvedClaims);
 
-  const lines = [
-    { label: `Basic salary (${summary.policy.pay_frequency})`, type: "earning", source: "basic", amount: Number(basic), basis_value: null, basis_unit: null },
-    ...componentLines,
-    ...automatic.lines,
-    // Reimbursement is money COMING to the employee, so it is an earning alongside
-    // allowances rather than a negative anywhere. Folding it into the deduction
-    // side would hide it from a payslip that already nets off to zero.
-    ...(expenseLine ? [expenseLine] : []),
-  ];
-
-  const totalAllowances = moneyField(allowances + automatic.totalAddition, "allowances");
-  const totalDeductions = moneyField(deductions + automatic.totalDeduction, "deductions");
-
   const expenseReimbursement = expenseLine?.amount ?? 0;
-  // Reimbursements are payable earnings but remain separate from contractual
-  // allowances in the stored salary record.
-  const net = Math.max(
-    0,
-    computedNet(basic, totalAllowances + expenseReimbursement, totalDeductions),
-  );
+  const selection = componentSelections?.[employeeUuid];
+  if (selection) {
+    const activeAssignments = new Map(empComponents.map((component) => [
+      component.assignment_uuid,
+      component.type,
+    ]));
+    for (const [type, uuids] of [["allowance", selection.allowance_uuids], ["deduction", selection.deduction_uuids]]) {
+      for (const uuid of uuids) {
+        if (activeAssignments.get(uuid) !== type) {
+          throw new ApiError(400, "Selected salary components must be active assignments of the matching type for this employee.");
+        }
+      }
+    }
+  }
+  const selectedComponentUuids = selection
+    ? [...selection.allowance_uuids, ...selection.deduction_uuids]
+    : undefined;
+  const compensation = calculatePayrollAmounts({
+    basicSalary: basic,
+    components: empComponents,
+    selectedComponentUuids,
+    monthlyVariables,
+    automaticLines: automatic.lines,
+    overtimeAmount,
+    expenseReimbursement,
+  });
+  const lines = [
+    { label: "Basic monthly salary", type: "earning", source: "basic", amount: Number(basic), basis_value: null, basis_unit: null },
+    ...compensation.lines.filter((line) => line.source !== "auto_expense"),
+    ...(compensation.expenseReimbursement > 0 ? [expenseLine] : []),
+  ];
 
   return {
     basic,
-    allowances: totalAllowances,
-    deductions: totalDeductions,
-    expenseReimbursement,
-    net,
+    allowances: compensation.allowances,
+    deductions: compensation.deductions,
+    expenseReimbursement: compensation.expenseReimbursement,
+    net: compensation.net,
     lines,
     summary,
     automatic,
+    overtimeAmount,
     expenseLine,
     approvedClaims,
   };
-}
-
-/**
- * The employee's basic salary for the month, from the shared payroll service.
- *
- * Previously a local function. It now lives in payroll.service.js because the
- * Full & Final settlement needs the identical figure to price a day of unused
- * leave, and two copies of this rule is how FnF ends up quoting a daily rate
- * that disagrees with the payslip it accompanies.
- */
-async function effectiveBasicForMonth(employeeUuid, month, year, conn = pool) {
-  return payrollService.effectiveBasicForMonth({ employeeUuid, month, year, conn });
-}
-
-function computedNet(basicSalary, allowancesTotal, deductionsTotal) {
-  // mysql2 returns DECIMAL columns as strings by default. Convert before
-  // adding so JavaScript does not concatenate the basic and allowance values.
-  const basic = Number(basicSalary);
-  const allowances = Number(allowancesTotal);
-  const deductions = Number(deductionsTotal);
-  return Math.round((basic + allowances - deductions) * 100) / 100;
 }
 
 /**
@@ -210,47 +412,52 @@ export async function generatePayroll(req, res) {
   const orgId = req.scopeOrgId;
   const { month, year, employee_uuids, regenerate } = req.body || {};
   const { m, y } = monthYearFields(month, year);
+  const overtimeAmounts = normalizePayrollOvertimeAmounts(req.body?.overtime_amounts);
+  const componentSelections = normalizePayrollComponentSelections(req.body?.component_selections);
 
   const conn = await pool.getConnection();
   let skipped = 0;
   const generatedEmployeeUuids = [];
   // Declared outside the transaction block because it is reported after the commit.
   let claimsPaid = 0;
-  /**
-   * auto_expense lines lifted off the records Regenerate is about to delete, keyed
-   * by employee. Populated inside the transaction and read back in the per-employee
-   * loop; an empty map for an ordinary generate, because there is nothing to carry.
-   */
-  const carriedExpenses = new Map();
-  /** salary_record uuids about to be deleted, so their claims can be re-pointed. */
-  let carriedClaimPointers = [];
   try {
     await conn.beginTransaction();
+    const runInputs = await resolvePayrollRunInputs({
+      orgId,
+      m,
+      y,
+      body: req.body,
+      conn,
+    });
 
     // Normalize an optional employee selection. When `employee_uuids` is
     // provided (individual or check-box selection), only those employees are
     // generated for. Otherwise ALL employees of the org are processed.
     // Sub_admins and the org_admin are users without employee records and
     // therefore are not part of payroll.
-    const selected = Array.isArray(employee_uuids) ? employee_uuids.filter(Boolean) : [];
+    const selected = Array.isArray(employee_uuids) ? [...new Set(employee_uuids.filter(Boolean))] : [];
+    const scopeFilter = employeeScopeCondition(req, "payroll", "e");
+    const scopeSql = scopeFilter ? ` AND ${scopeFilter.sql}` : "";
     let employees = [];
 
     if (selected.length) {
       const placeholders = selected.map(() => "?").join(",");
       [employees] = await conn.query(
-        `SELECT uuid FROM employees WHERE organization_id=? AND uuid IN (${placeholders})`,
-        [orgId, ...selected]
+        `SELECT e.uuid, e.joining_date FROM employees e WHERE e.organization_id=? AND e.uuid IN (${placeholders})${scopeSql}`,
+        [orgId, ...selected, ...(scopeFilter?.params ?? [])]
       );
-      if (!employees.length) {
-        throw new ApiError(404, "None of the selected employees exist in this organization");
+      if (employees.length !== selected.length) {
+        throw new ApiError(404, "One or more selected employees are unavailable in your permitted data scope");
       }
     } else {
       [employees] = await conn.query(
-        "SELECT uuid FROM employees WHERE organization_id=?",
-        [orgId]
+        `SELECT e.uuid, e.joining_date FROM employees e WHERE e.organization_id=?${scopeSql}`,
+        [orgId, ...(scopeFilter?.params ?? [])]
       );
-      if (!employees.length) throw new ApiError(404, "No employees in this organization to process");
+      if (!employees.length) throw new ApiError(404, "No employees in your permitted data scope to process");
     }
+    assertPayrollOvertimeEmployees(overtimeAmounts, employees);
+    assertPayrollComponentSelectionEmployees(componentSelections, employees);
 
     // Regenerate mode: explicitly delete the existing records for exactly the
     // selected employees + period, then recreate them below. This is the
@@ -281,40 +488,20 @@ export async function generatePayroll(req, res) {
        * pay the same expense a second time in the second case. That is the one
        * failure this module must never have.
        *
-       * So the lines are carried forward instead. A reimbursement is a disbursement
-       * that already happened, not a value derived from attendance and salary
-       * components, which is exactly what Regenerate exists to recompute. The claim
-       * stays paid, and its paid_via pointer is re-pointed at the new record below
-       * so the audit trail does not dangle.
-       *
-       * Read BEFORE the delete, because the cascade destroys the rows being read.
+       * Paid claims have immutable payment-history rows with a restrictive foreign
+       * key to the salary record. Refuse regeneration rather than orphaning or
+       * silently rewriting a real disbursement.
        */
       const [doomedRecords] = await conn.query(
         `SELECT uuid, employee_uuid FROM salary_records
-          WHERE organization_id=? AND month=? AND year=? AND employee_uuid IN (${placeholders})`,
+          WHERE organization_id=? AND month=? AND year=? AND employee_uuid IN (${placeholders})
+          FOR UPDATE`,
         [orgId, m, y, ...employees.map((e) => e.uuid)]
       );
-
-      carriedExpenses.clear();
-      if (doomedRecords.length) {
-        const recordPlaceholders = doomedRecords.map(() => "?").join(",");
-        const [oldLines] = await conn.query(
-          `SELECT l.salary_record_uuid, r.employee_uuid, l.label, l.type, l.source,
-                  l.amount, l.basis_value, l.basis_unit
-             FROM salary_record_lines l
-             JOIN salary_records r ON r.uuid = l.salary_record_uuid
-            WHERE l.source='auto_expense' AND l.salary_record_uuid IN (${recordPlaceholders})`,
-          doomedRecords.map((r) => r.uuid)
-        );
-        for (const line of oldLines) {
-          if (!carriedExpenses.has(line.employee_uuid)) carriedExpenses.set(line.employee_uuid, []);
-          carriedExpenses.get(line.employee_uuid).push(line);
-        }
-
-        // The claims each carried line disbursed, so they can be re-pointed at the
-        // replacement record once it exists.
-        carriedClaimPointers = doomedRecords.map((r) => r.uuid);
-      }
+      await expenses.assertNoExpensePaymentsForSalaryRecords({
+        conn,
+        salaryRecordUuids: doomedRecords.map((r) => r.uuid),
+      });
 
       await conn.query(
         `DELETE FROM salary_records
@@ -360,9 +547,32 @@ export async function generatePayroll(req, res) {
     }
 
     const createdBy = req.user?.id ?? null;
+    const performedByUuid = req.user?.uuid ?? null;
 
     for (const emp of employees) {
-      const computed = await computeEmployeePayroll({ employeeUuid: emp.uuid, orgId, m, y, conn });
+      const overtimeAmount = overtimeAmounts.get(emp.uuid);
+      if (overtimeAmount !== undefined) {
+        await conn.query(
+          `INSERT INTO payroll_employee_overtime
+             (organization_id, employee_uuid, month, year, overtime_amount, updated_by_uuid)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON DUPLICATE KEY UPDATE overtime_amount=VALUES(overtime_amount),
+             updated_by_uuid=VALUES(updated_by_uuid)`,
+          [orgId, emp.uuid, m, y, overtimeAmount, req.user?.uuid ?? null],
+        );
+      }
+      const computed = await computeEmployeePayroll({
+        employeeUuid: emp.uuid,
+        orgId,
+        m,
+        y,
+        joiningDate: emp.joining_date,
+        policy: runInputs.policy,
+        scheduleOverride: runInputs.schedule,
+        overtimeAmount,
+        componentSelections,
+        conn,
+      });
       if (computed.automatic.skipReason === "no_basic_salary") {
         throw new ApiError(409, `Payroll setup is incomplete for employee ${emp.uuid}: no positive effective basic salary exists for ${MONTHS[m - 1]} ${y}. Add an effective salary record, then preview again.`);
       }
@@ -378,22 +588,15 @@ export async function generatePayroll(req, res) {
       // transaction. UUID() inside the INSERT would return the value to nobody.
       const recordUuid = randomUUID();
       generatedEmployeeUuids.push(emp.uuid);
-      const carried = carriedExpenses.get(emp.uuid) ?? [];
-      const carriedExpenseReimbursement = moneyField(
-        carried.reduce((sum, line) => sum + Number(line.amount || 0), 0),
-        "expense reimbursement",
-      );
-      const expenseReimbursement = moneyField(
-        computed.expenseReimbursement + carriedExpenseReimbursement,
-        "expense reimbursement",
-      );
-      const netSalary = moneyField(computed.net + carriedExpenseReimbursement, "net salary");
+      const expenseReimbursement = moneyField(computed.expenseReimbursement, "expense reimbursement");
+      const netSalary = moneyField(computed.net, "net salary");
 
       await conn.query(
         `INSERT INTO salary_records
            (uuid, employee_uuid, organization_id, month, year, basic_salary,
-            allowances, deductions, expense_reimbursement, net_salary, notes, created_by, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
+            allowances, deductions, expense_reimbursement, net_salary, payroll_policy_snapshot,
+            payroll_schedule_snapshot, notes, created_by, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
         [
           recordUuid,
           emp.uuid,
@@ -405,6 +608,11 @@ export async function generatePayroll(req, res) {
           computed.deductions,
           expenseReimbursement,
           netSalary,
+          JSON.stringify(runInputs.policySnapshot),
+          JSON.stringify({
+            days: runInputs.scheduleSnapshot,
+            leave_calculation: computed.summary.leaveCalculation,
+          }),
           null,
           createdBy,
         ]
@@ -421,29 +629,6 @@ export async function generatePayroll(req, res) {
       });
 
       /**
-       * Re-attach the reimbursements carried forward from the deleted record.
-       *
-       * Appended AFTER computed.lines so the carried disbursement is visible on the
-       * payslip alongside anything newly computed - a claim approved since the last
-       * run is picked up in the same regeneration, which is the whole point of
-       * recomputing a period.
-       *
-       * Only the LINE is carried. No claim is re-consumed, because these claims are
-       * already paid; re-consuming them would be a second disbursement.
-       */
-      if (carried.length) {
-        await insertSalaryRecordLines({
-          conn,
-          recordUuid,
-          orgId,
-          employeeUuid: emp.uuid,
-          month: m,
-          year: y,
-          lines: carried,
-        });
-      }
-
-      /**
        * Consume the claims, in the SAME transaction as the salary record.
        *
        * The ordering matters. If this ran first and the payroll then failed, the
@@ -457,22 +642,7 @@ export async function generatePayroll(req, res) {
           orgId,
           salaryRecordUuid: recordUuid,
           claims: computed.approvedClaims,
-        });
-      }
-
-      /**
-       * Re-point the carried claims at their replacement record.
-       *
-       * Left alone, paid_via_salary_record_uuid would name a row the regenerate just
-       * deleted, and the audit trail for a real disbursement would dead-end on a
-       * uuid that resolves to nothing.
-       */
-      if (carried.length && carriedClaimPointers.length) {
-        await expenses.repointClaimsPaidByPayroll({
-          conn,
-          orgId,
-          salaryRecordUuid: recordUuid,
-          previousRecordUuids: carriedClaimPointers,
+          performedByUuid,
         });
       }
     }
@@ -532,6 +702,7 @@ export async function generatePayroll(req, res) {
     console.error("Payroll email enqueue failed:", error?.message);
   }
 
+  const generatedEmployees = new Set(generatedEmployeeUuids);
   logAudit({
     ...getActorFromReq(req),
     action: "payroll.generate",
@@ -544,11 +715,14 @@ export async function generatePayroll(req, res) {
       // Named in the audit entry because money moving into a payroll is the thing
       // an auditor asks about later, and "the payroll ran" does not answer it.
       expense_claims_paid: claimsPaid,
+      manual_overtime_amounts_saved: [...overtimeAmounts]
+        .filter(([employeeUuid]) => generatedEmployees.has(employeeUuid))
+        .map(([employeeUuid, amount]) => ({ employee_uuid: employeeUuid, amount })),
     },
     req,
   });
 
-  return ok(res, { items: rows, month: m, year: y, count: rows.length, skipped, expense_claims_paid: claimsPaid }, "Payroll generated from salary history, components, leave, attendance and expense claims");
+  return ok(res, { items: rows, month: m, year: y, count: rows.length, skipped, expense_claims_paid: claimsPaid }, "Payroll generated from salary history, components, leave, attendance, manual overtime and expense claims");
 }
 
 // ---------------------------------------------------------------------------
@@ -570,29 +744,53 @@ export async function previewPayroll(req, res) {
   const orgId = req.scopeOrgId;
   const { month, year, employee_uuids } = req.body || {};
   const { m, y } = monthYearFields(month, year);
+  const overtimeAmounts = normalizePayrollOvertimeAmounts(req.body?.overtime_amounts);
+  const componentSelections = normalizePayrollComponentSelections(req.body?.component_selections);
+  const runInputs = await resolvePayrollRunInputs({
+    orgId,
+    m,
+    y,
+    body: req.body,
+    conn: pool,
+  });
 
-  const selected = Array.isArray(employee_uuids) ? employee_uuids.filter(Boolean) : [];
+  const selected = Array.isArray(employee_uuids) ? [...new Set(employee_uuids.filter(Boolean))] : [];
+  const scopeFilter = employeeScopeCondition(req, "payroll", "e");
+  const scopeSql = scopeFilter ? ` AND ${scopeFilter.sql}` : "";
   let employees;
   if (selected.length) {
     const placeholders = selected.map(() => "?").join(",");
     [employees] = await pool.query(
-      `SELECT uuid, full_name FROM employees WHERE organization_id=? AND uuid IN (${placeholders})
-        ORDER BY full_name`,
-      [orgId, ...selected]
+      `SELECT e.uuid, e.full_name, e.joining_date FROM employees e WHERE e.organization_id=? AND e.uuid IN (${placeholders})${scopeSql}
+        ORDER BY e.full_name`,
+      [orgId, ...selected, ...(scopeFilter?.params ?? [])]
     );
-    if (!employees.length) {
-      throw new ApiError(404, "None of the selected employees exist in this organization");
+    if (employees.length !== selected.length) {
+      throw new ApiError(404, "One or more selected employees are unavailable in your permitted data scope");
     }
   } else {
     [employees] = await pool.query(
-      `SELECT uuid, full_name FROM employees WHERE organization_id=? ORDER BY full_name`,
-      [orgId]
+      `SELECT e.uuid, e.full_name, e.joining_date FROM employees e WHERE e.organization_id=?${scopeSql} ORDER BY e.full_name`,
+      [orgId, ...(scopeFilter?.params ?? [])]
     );
   }
+  assertPayrollOvertimeEmployees(overtimeAmounts, employees);
+  assertPayrollComponentSelectionEmployees(componentSelections, employees);
 
   const items = [];
   for (const emp of employees) {
-    const computed = await computeEmployeePayroll({ employeeUuid: emp.uuid, orgId, m, y, conn: pool });
+    const computed = await computeEmployeePayroll({
+      employeeUuid: emp.uuid,
+      orgId,
+      m,
+      y,
+      joiningDate: emp.joining_date,
+      policy: runInputs.policy,
+      scheduleOverride: runInputs.schedule,
+      overtimeAmount: overtimeAmounts.get(emp.uuid),
+      componentSelections,
+      conn: pool,
+    });
     items.push({
       employee_uuid: emp.uuid,
       employee_name: emp.full_name,
@@ -603,12 +801,19 @@ export async function previewPayroll(req, res) {
       net_salary: computed.net,
       lines: computed.lines,
       attendance: {
-        working_days: computed.summary.workingDays,
+        working_days: computed.summary.monthWorkingDays ?? computed.summary.workingDays,
+        calendar_days: computed.summary.calendarDays,
+        elapsed_working_days: computed.summary.elapsedWorkingDays,
         attended_days: computed.summary.attendedDays,
+        worked_hours: computed.summary.workedHours,
+        expected_working_hours: computed.automatic.expectedHours,
+        actual_overtime_hours: computed.summary.actualOvertimeHours,
         absent_days: computed.summary.absentDays,
         late_count: computed.summary.lateCount,
         paid_leave_days: computed.summary.paidLeaveDays,
         unpaid_leave_days: computed.summary.unpaidLeaveDays,
+        leave_attendance_conflicts: computed.summary.leaveAttendanceConflicts,
+        leave_calculation: computed.summary.leaveCalculation,
         approved_overtime_hours: computed.summary.approvedOvertimeHours,
         holidays_in_month: computed.summary.holidayCount,
       },
@@ -617,9 +822,12 @@ export async function previewPayroll(req, res) {
         hourly: computed.automatic.hourlyRate,
         skip_reason: computed.automatic.skipReason,
         divisor: computed.automatic.divisor,
-        daily_rate_basis: computed.summary.policy.daily_rate_basis,
+        salary_calculation_method: computed.summary.policy.salary_calculation_method,
+        salary_calculation_policy: computed.automatic.payrollPolicy,
+        expected_hours: computed.automatic.expectedHours,
+        worked_hours: computed.automatic.workedHours,
+        payable_ratio: computed.automatic.payableRatio,
         currency: computed.summary.policy.currency,
-        pay_frequency: computed.summary.policy.pay_frequency,
       },
       /**
        * Expense reimbursement, broken out rather than folded into the allowances
@@ -661,85 +869,218 @@ export async function previewPayroll(req, res) {
   return ok(res, { month: m, year: y, items, totals, count: items.length }, "Payroll preview");
 }
 
-/** Read the explicitly configured organization payroll policy without exposing other tenants. */
-export async function getPayrollPolicy(req, res) {
+/** Current recurring compensation for the organization's employee roster. */
+export async function listPayrollEmployees(req, res) {
+  const { page, limit, offset } = parsePagination(req.query, { maxLimit: 1000 });
   const orgId = req.scopeOrgId;
-  const [policies] = await pool.query("SELECT * FROM organization_payroll_policies WHERE organization_id=?", [orgId]);
-  const [weeks] = policies.length ? await pool.query("SELECT mon,tue,wed,thu,fri,sat,sun FROM work_week_config WHERE organization_id=?", [orgId]) : [[]];
-  // Normalized on the way out for the same reason getConfiguredPayrollPolicy does
-  // it: a row written before the currency was fixed may still hold NULL or a
-  // stale code, and the client must never see one.
-  const policy = policies[0] ? { ...policies[0], currency: CURRENCY } : null;
-  return ok(res, {
-    configured: policies[0]?.is_configured === 1 || policies[0]?.is_configured === true,
-    policy,
-    work_week: weeks[0] ?? null,
-  }, "Payroll policy");
+  if ((req.query.month === undefined) !== (req.query.year === undefined)) {
+    throw new ApiError(400, "month and year must be supplied together");
+  }
+  const currentDate = new Date();
+  const { m, y } = req.query.month === undefined && req.query.year === undefined
+    ? { m: currentDate.getMonth() + 1, y: currentDate.getFullYear() }
+    : payrollService.assertMonthYear(req.query.month, req.query.year);
+  const employeeScope = employeeScopeCondition(req, "payroll", "e");
+  const employeeWhere = `WHERE e.organization_id=? AND e.status IN ('current_employee', 'active')${employeeScope ? ` AND ${employeeScope.sql}` : ""}`;
+  const employeeParams = [orgId, ...(employeeScope?.params ?? [])];
+
+  const [[{ total }]] = await pool.query(
+    `SELECT COUNT(*) AS total FROM employees e ${employeeWhere}`,
+    employeeParams,
+  );
+  const [employees] = await pool.query(
+    `SELECT e.uuid, e.full_name, e.email, dg.name AS designation, dp.name AS department,
+            (SELECT h.basic_salary FROM employee_salary_history h
+             WHERE h.employee_uuid=e.uuid AND h.effective_to IS NULL
+             ORDER BY h.effective_from DESC LIMIT 1) AS basic_salary,
+            COALESCE((SELECT po.overtime_amount FROM payroll_employee_overtime po
+              WHERE po.organization_id=e.organization_id AND po.employee_uuid=e.uuid
+                AND po.month=? AND po.year=? LIMIT 1), 0) AS overtime_amount
+       FROM employees e
+       LEFT JOIN designations dg ON dg.id=e.designation_id
+       LEFT JOIN departments dp ON dp.id=e.department_id
+      ${employeeWhere}
+      ORDER BY e.created_at DESC LIMIT ? OFFSET ?`,
+    [m, y, ...employeeParams, limit, offset],
+  );
+
+  const compensation = new Map(
+    employees.map((employee) => [
+      employee.uuid,
+      { allowances: [], deductions: [] },
+    ]),
+  );
+  const employeesByUuid = new Map(employees.map((employee) => [employee.uuid, employee]));
+  if (employees.length > 0) {
+    const placeholders = employees.map(() => "?").join(", ");
+    const [components] = await pool.query(
+      `SELECT esc.uuid AS assignment_uuid, esc.employee_uuid, esc.amount, sc.name, sc.type, sc.is_percentage
+         FROM employee_salary_components esc
+         JOIN salary_components sc
+           ON sc.id=esc.salary_component_id AND sc.organization_id=? AND sc.is_active=1
+        WHERE esc.employee_uuid IN (${placeholders}) AND esc.is_active=1`,
+      [orgId, ...employees.map((employee) => employee.uuid)],
+    );
+
+    for (const component of components) {
+      const employee = employeesByUuid.get(component.employee_uuid);
+      if (!employee) continue;
+      const details = compensation.get(component.employee_uuid);
+      const entries = component.type === "deduction" ? details.deductions : details.allowances;
+      entries.push(component);
+    }
+  }
+
+  const items = employees.map((employee) => {
+    const details = compensation.get(employee.uuid);
+    const amounts = calculatePayrollAmounts({
+      basicSalary: Number(employee.basic_salary ?? 0),
+      components: [...details.allowances, ...details.deductions],
+      overtimeAmount: moneyField(employee.overtime_amount, "overtime"),
+    });
+    return {
+      ...employee,
+      allowance_items: amounts.lines
+        .filter((line) => line.source === "component" && line.type === "earning")
+        .map((line) => ({ uuid: line.assignment_uuid, name: line.label, amount: line.amount })),
+      deduction_items: amounts.lines
+        .filter((line) => line.source === "component" && line.type === "deduction")
+        .map((line) => ({ uuid: line.assignment_uuid, name: line.label, amount: line.amount })),
+      allowances: amounts.allowances,
+      deductions: amounts.deductions,
+      overtime_amount: moneyField(employee.overtime_amount, "overtime"),
+      net_salary: amounts.net,
+    };
+  });
+  return ok(res, paginatedResponse(items, total, page, limit), "Payroll employees");
 }
 
-/** Save and explicitly confirm the org's payroll assumptions and work calendar. */
-export async function updatePayrollPolicy(req, res) {
-  const orgId = req.scopeOrgId;
-  const body = req.body ?? {};
-  const dayKeys = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
-  const week = body.work_week ?? {};
-  if (!dayKeys.every((day) => typeof week[day] === "boolean") || !dayKeys.some((day) => week[day])) {
-    throw new ApiError(400, "Choose at least one working day; each weekday must be explicitly set on or off.");
+/** Payroll settings and monthly working/off-day calendar. */
+export async function getPayrollSettings(req, res) {
+  const month = req.query.month === undefined ? null : Number(req.query.month);
+  const year = req.query.year === undefined ? null : Number(req.query.year);
+  if ((month === null) !== (year === null)) {
+    throw new ApiError(400, "month and year must be supplied together");
   }
-  // Currency is no longer an input. Anything a client sends in `currency` is
-  // ignored rather than rejected, so an older client (or a stale saved form)
-  // keeps working and cannot reintroduce a second currency; the value written
-  // below is always the single application currency.
-  const currency = CURRENCY;
-  const payFrequency = String(body.pay_frequency ?? "");
-  if (!["weekly", "biweekly", "semi_monthly", "monthly"].includes(payFrequency)) throw new ApiError(400, "Select a supported pay frequency.");
-  const basis = String(body.daily_rate_basis ?? "");
-  if (!["actual_working_days", "calendar_days", "fixed_30"].includes(basis)) throw new ApiError(400, "Select a daily-rate divisor policy.");
-  const shiftStartTime = String(body.shift_start_time ?? "");
-  if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(shiftStartTime)) throw new ApiError(400, "Enter the organization shift start time in HH:MM format.");
-  const numeric = (key, min, max, allowZero = true) => {
-    const n = Number(body[key]);
-    if (!Number.isFinite(n) || n < (allowZero ? min : Math.max(min, Number.EPSILON)) || n > max) throw new ApiError(400, `${key} must be between ${min} and ${max}.`);
-    return n;
-  };
-  const flag = (key) => {
-    if (typeof body[key] !== "boolean") throw new ApiError(400, `${key} must be explicitly enabled or disabled.`);
-    return body[key] ? 1 : 0;
-  };
-  const values = {
-    currency, pay_frequency: payFrequency, daily_rate_basis: basis, shift_start_time: shiftStartTime,
-    hours_per_workday: numeric("hours_per_workday", 1, 24, false),
-    late_grace_minutes: numeric("late_grace_minutes", 0, 720),
-    late_arrivals_per_penalty: numeric("late_arrivals_per_penalty", 1, 100, false),
-    late_penalty_days: numeric("late_penalty_days", 0, 1),
-    overtime_multiplier: numeric("overtime_multiplier", 0, 10),
-    deduct_unpaid_leave: flag("deduct_unpaid_leave"), deduct_absences: flag("deduct_absences"),
-    deduct_late_arrivals: flag("deduct_late_arrivals"), pay_approved_overtime: flag("pay_approved_overtime"),
-  };
+  const { m, y } = month === null ? { m: null, y: null } : payrollService.assertMonthYear(month, year);
+  let rows = [];
+  if (m !== null) {
+    [rows] = await pool.query(
+      "SELECT salary_calculation_method, salary_calculation_policy, calculate_overtime, shift_start_time, shift_end_time, overtime_multiplier, deduct_salary_for_late_arrivals, late_arrival_threshold, late_grace_minutes FROM organization_monthly_payroll_settings WHERE organization_id=? AND month=? AND year=?",
+      [req.scopeOrgId, m, y],
+    );
+  }
+  if (!rows.length) {
+    [rows] = await pool.query(
+      "SELECT salary_calculation_method, salary_calculation_policy, calculate_overtime, shift_start_time, shift_end_time, overtime_multiplier, deduct_salary_for_late_arrivals, late_arrival_threshold, late_grace_minutes FROM organization_payroll_settings WHERE organization_id=?",
+      [req.scopeOrgId],
+    );
+  }
+  const settings = rows[0] ? {
+    ...rows[0],
+    salary_calculation_policy: payrollService.normalizePayrollPolicy(
+      rows[0].salary_calculation_policy,
+      rows[0].salary_calculation_method,
+    ),
+    salary_calculation_method: payrollService.payrollAttendanceBasis(
+      payrollService.normalizePayrollPolicy(rows[0].salary_calculation_policy, rows[0].salary_calculation_method),
+    ),
+    calculate_overtime: Number(rows[0].calculate_overtime) === 1,
+    deduct_salary_for_late_arrivals: Number(rows[0].deduct_salary_for_late_arrivals) === 1,
+    late_arrival_threshold: Number(rows[0].late_arrival_threshold ?? 1),
+    late_grace_minutes: Number(rows[0].late_grace_minutes ?? 10),
+  } : null;
+  return ok(res, { settings, month: m, year: y }, "Payroll settings");
+}
+
+export async function updatePayrollSettings(req, res) {
+  const body = req.body ?? {};
+  const isOrganizationDefault = body.scope === "organization";
+  const { m, y } = isOrganizationDefault
+    ? { m: null, y: null }
+    : payrollService.assertMonthYear(body.month, body.year);
+  if (body.scope !== undefined && body.scope !== "organization" && body.scope !== "month") {
+    throw new ApiError(400, "scope must be 'organization' or 'month'.");
+  }
+  const settings = normalizePayrollRunPolicy(body);
+  const normalizedLateArrivalThreshold = settings.late_arrival_threshold;
+  const table = isOrganizationDefault ? "organization_payroll_settings" : "organization_monthly_payroll_settings";
+  const periodColumns = isOrganizationDefault ? "" : "month, year, ";
+  const periodValues = isOrganizationDefault ? "" : "?, ?, ";
+  const periodParams = isOrganizationDefault ? [] : [m, y];
+  await pool.query(
+    `INSERT INTO ${table}
+       (organization_id, ${periodColumns}salary_calculation_method, salary_calculation_policy, calculate_overtime, shift_start_time, shift_end_time, overtime_multiplier, deduct_salary_for_late_arrivals, late_arrival_threshold, late_grace_minutes, updated_by_uuid)
+     VALUES (?, ${periodValues}?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE salary_calculation_method=VALUES(salary_calculation_method),
+       salary_calculation_policy=VALUES(salary_calculation_policy),
+       calculate_overtime=VALUES(calculate_overtime), shift_start_time=VALUES(shift_start_time),
+       shift_end_time=VALUES(shift_end_time), overtime_multiplier=VALUES(overtime_multiplier),
+       deduct_salary_for_late_arrivals=VALUES(deduct_salary_for_late_arrivals),
+       late_arrival_threshold=VALUES(late_arrival_threshold),
+       late_grace_minutes=VALUES(late_grace_minutes),
+       updated_by_uuid=VALUES(updated_by_uuid)`,
+    [
+      req.scopeOrgId, ...periodParams, settings.salary_calculation_method, settings.salary_calculation_policy,
+      settings.calculate_overtime ? 1 : 0, settings.shift_start_time, settings.shift_end_time,
+      settings.overtime_multiplier, settings.deduct_salary_for_late_arrivals ? 1 : 0,
+      normalizedLateArrivalThreshold, settings.late_grace_minutes, req.user?.uuid ?? null,
+    ],
+  );
+  return getPayrollSettings({
+    ...req,
+    query: isOrganizationDefault ? {} : { month: m, year: y },
+  }, res);
+}
+
+export async function getMonthlyWorkSchedule(req, res) {
+  const month = Number(req.query.month);
+  const year = Number(req.query.year);
+  const { m, y } = payrollService.assertMonthYear(month, year);
+  const [rows] = await pool.query(
+    "SELECT schedule_date, day_type FROM organization_monthly_work_schedules WHERE organization_id=? AND MONTH(schedule_date)=? AND YEAR(schedule_date)=? ORDER BY schedule_date",
+    [req.scopeOrgId, m, y],
+  );
+  // DATE columns arrive as a JS Date at LOCAL midnight; serialising that to JSON
+  // converts it to UTC and, east of Greenwich, moves it to the previous day. The
+  // editor then shows (and re-saves) a schedule shifted by one day, so a Saturday
+  // marked working reappeared as an off Friday. Return the calendar date as text.
+  const days = rows.map((row) => ({ schedule_date: isoDate(row.schedule_date), day_type: row.day_type }));
+  return ok(res, { month: m, year: y, days }, "Monthly working schedule");
+}
+
+export async function saveMonthlyWorkSchedule(req, res) {
+  const month = Number(req.body?.month);
+  const year = Number(req.body?.year);
+  const { m, y } = payrollService.assertMonthYear(month, year);
+  const days = req.body?.days;
+  const total = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  if (!Array.isArray(days) || days.length !== total) throw new ApiError(400, "Select every date in the month as either a working day or an off day.");
+  const seen = new Set();
+  for (const item of days) {
+    if (!item || !/^\d{4}-\d{2}-\d{2}$/.test(String(item.date)) || !["working", "off"].includes(item.day_type)) throw new ApiError(400, "Each schedule day needs a valid date and working/off selection.");
+    const date = String(item.date);
+    if (date.slice(0, 7) !== `${y}-${String(m).padStart(2, "0")}` || seen.has(date)) throw new ApiError(400, "Schedule dates must be unique and belong to the selected month.");
+    seen.add(date);
+  }
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
-    await conn.query(
-      `INSERT INTO work_week_config (organization_id,mon,tue,wed,thu,fri,sat,sun)
-       VALUES (?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE mon=VALUES(mon),tue=VALUES(tue),wed=VALUES(wed),thu=VALUES(thu),fri=VALUES(fri),sat=VALUES(sat),sun=VALUES(sun),updated_at=NOW()`,
-      [orgId, ...dayKeys.map((day) => week[day] ? 1 : 0)],
-    );
-    await conn.query(
-      `INSERT INTO organization_payroll_policies
-       (organization_id,currency,pay_frequency,daily_rate_basis,shift_start_time,hours_per_workday,late_grace_minutes,late_arrivals_per_penalty,late_penalty_days,overtime_multiplier,deduct_unpaid_leave,deduct_absences,deduct_late_arrivals,pay_approved_overtime,is_configured,configured_by_uuid,configured_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,NOW())
-       ON DUPLICATE KEY UPDATE currency=VALUES(currency),pay_frequency=VALUES(pay_frequency),daily_rate_basis=VALUES(daily_rate_basis),shift_start_time=VALUES(shift_start_time),hours_per_workday=VALUES(hours_per_workday),late_grace_minutes=VALUES(late_grace_minutes),late_arrivals_per_penalty=VALUES(late_arrivals_per_penalty),late_penalty_days=VALUES(late_penalty_days),overtime_multiplier=VALUES(overtime_multiplier),deduct_unpaid_leave=VALUES(deduct_unpaid_leave),deduct_absences=VALUES(deduct_absences),deduct_late_arrivals=VALUES(deduct_late_arrivals),pay_approved_overtime=VALUES(pay_approved_overtime),is_configured=1,configured_by_uuid=VALUES(configured_by_uuid),configured_at=NOW()`,
-      [orgId, values.currency, values.pay_frequency, values.daily_rate_basis, values.shift_start_time, values.hours_per_workday, values.late_grace_minutes, values.late_arrivals_per_penalty, values.late_penalty_days, values.overtime_multiplier, values.deduct_unpaid_leave, values.deduct_absences, values.deduct_late_arrivals, values.pay_approved_overtime, req.user?.uuid ?? null],
-    );
+    await conn.query("DELETE FROM organization_monthly_work_schedules WHERE organization_id=? AND YEAR(schedule_date)=? AND MONTH(schedule_date)=?", [req.scopeOrgId, y, m]);
+    for (const item of days) {
+      await conn.query(
+        "INSERT INTO organization_monthly_work_schedules (organization_id, schedule_date, day_type, updated_by_uuid) VALUES (?, ?, ?, ?)",
+        [req.scopeOrgId, item.date, item.day_type, req.user?.uuid ?? null],
+      );
+    }
     await conn.commit();
   } catch (error) {
     await conn.rollback();
     throw error;
-  } finally { conn.release(); }
-  logAudit({ ...getActorFromReq(req), action: "payroll.policy.configure", entityType: "payroll_policy", entityId: String(orgId), details: values, req });
-  const [policy] = await pool.query("SELECT * FROM organization_payroll_policies WHERE organization_id=?", [orgId]);
-  const [workWeek] = await pool.query("SELECT mon,tue,wed,thu,fri,sat,sun FROM work_week_config WHERE organization_id=?", [orgId]);
-  return ok(res, { configured: true, policy: policy[0], work_week: workWeek[0] }, "Payroll policy saved");
+  } finally {
+    conn.release();
+  }
+  return getMonthlyWorkSchedule({ ...req, query: { month: m, year: y } }, res);
 }
 
 // ---------------------------------------------------------------------------
@@ -750,10 +1091,33 @@ export async function deleteSalaryPeriod(req, res) {
   const orgId = req.scopeOrgId;
   const { m, y } = monthYearFields(req.params.month, req.params.year);
 
-  const [result] = await pool.query(
-    "DELETE FROM salary_records WHERE organization_id=? AND month=? AND year=?",
-    [orgId, m, y]
-  );
+  const conn = await pool.getConnection();
+  let result;
+  try {
+    await conn.beginTransaction();
+    const [records] = await conn.query(
+      "SELECT uuid FROM salary_records WHERE organization_id=? AND month=? AND year=? FOR UPDATE",
+      [orgId, m, y],
+    );
+    await expenses.assertNoExpensePaymentsForSalaryRecords({
+      conn,
+      salaryRecordUuids: records.map((record) => record.uuid),
+    });
+    [result] = await conn.query(
+      "DELETE FROM salary_records WHERE organization_id=? AND month=? AND year=?",
+      [orgId, m, y],
+    );
+    await conn.commit();
+  } catch (error) {
+    try {
+      await conn.rollback();
+    } catch {
+      // Preserve the payroll deletion error.
+    }
+    throw error;
+  } finally {
+    conn.release();
+  }
 
   logAudit({
     ...getActorFromReq(req),
@@ -773,11 +1137,35 @@ export async function deleteSalaryRecord(req, res) {
   const orgId = req.scopeOrgId;
   assertUuid(req.params.uuid, "Salary record UUID");
 
-  const [result] = await pool.query(
-    "DELETE FROM salary_records WHERE uuid=? AND organization_id=?",
-    [req.params.uuid, orgId]
-  );
-  if (!result.affectedRows) throw new ApiError(404, "Salary record not found");
+  const conn = await pool.getConnection();
+  let result;
+  try {
+    await conn.beginTransaction();
+    const [records] = await conn.query(
+      "SELECT uuid FROM salary_records WHERE uuid=? AND organization_id=? FOR UPDATE",
+      [req.params.uuid, orgId],
+    );
+    if (!records.length) throw new ApiError(404, "Salary record not found");
+    await expenses.assertNoExpensePaymentsForSalaryRecords({
+      conn,
+      salaryRecordUuids: [records[0].uuid],
+    });
+    [result] = await conn.query(
+      "DELETE FROM salary_records WHERE uuid=? AND organization_id=?",
+      [req.params.uuid, orgId],
+    );
+    if (!result.affectedRows) throw new ApiError(404, "Salary record not found");
+    await conn.commit();
+  } catch (error) {
+    try {
+      await conn.rollback();
+    } catch {
+      // Preserve the payroll deletion error.
+    }
+    throw error;
+  } finally {
+    conn.release();
+  }
 
   logAudit({
     ...getActorFromReq(req),
@@ -801,9 +1189,15 @@ export async function listOrgSalaryRecords(req, res) {
     ? req.query.employee_uuid.trim() : "";
   const month = typeof req.query.month === "string" && req.query.month.trim() ? req.query.month.trim() : "";
   const year = typeof req.query.year === "string" && req.query.year.trim() ? req.query.year.trim() : "";
+  const department = typeof req.query.department === "string" ? req.query.department.trim() : "";
 
   let whereClause = "WHERE sr.organization_id = ?";
   const params = [orgId];
+  const employeeScope = employeeScopeCondition(req, "payroll", "e");
+  if (employeeScope) {
+    whereClause += ` AND ${employeeScope.sql}`;
+    params.push(...employeeScope.params);
+  }
 
   if (employeeUuid) {
     assertUuid(employeeUuid, "Employee UUID");
@@ -819,6 +1213,10 @@ export async function listOrgSalaryRecords(req, res) {
   if (year && !isNaN(y)) {
     whereClause += " AND sr.year = ?";
     params.push(y);
+  }
+  if (department) {
+    whereClause += " AND EXISTS (SELECT 1 FROM departments dp WHERE dp.id=e.department_id AND dp.organization_id=e.organization_id AND dp.name=?)";
+    params.push(department);
   }
   if (search) {
     whereClause += " AND (e.full_name LIKE ? OR e.email LIKE ?)";
@@ -836,6 +1234,7 @@ export async function listOrgSalaryRecords(req, res) {
   const [rows] = await pool.query(
     `SELECT sr.uuid, sr.employee_uuid, sr.month, sr.year, sr.basic_salary,
             sr.allowances, sr.deductions, sr.expense_reimbursement, sr.net_salary, sr.notes, sr.created_at,
+            sr.payroll_policy_snapshot, sr.payroll_schedule_snapshot,
             e.full_name AS employee_name, e.email AS employee_email, dg.name AS designation,
             o.name AS organization_name
      FROM salary_records sr
@@ -847,6 +1246,26 @@ export async function listOrgSalaryRecords(req, res) {
      LIMIT ? OFFSET ?`,
     [...params, limit, offset]
   );
+  const recordUuids = rows.map((row) => row.uuid);
+  if (recordUuids.length) {
+    const [lineRows] = await pool.query(
+      `SELECT salary_record_uuid, label, type, source, amount, basis_value, basis_unit
+         FROM salary_record_lines
+        WHERE salary_record_uuid IN (?)
+        ORDER BY salary_record_uuid, FIELD(type, 'earning', 'deduction'), id`,
+      [recordUuids],
+    );
+    const linesByRecord = new Map();
+    for (const line of lineRows) {
+      if (!linesByRecord.has(line.salary_record_uuid)) {
+        linesByRecord.set(line.salary_record_uuid, []);
+      }
+      linesByRecord.get(line.salary_record_uuid).push(line);
+    }
+    for (const row of rows) {
+      row.lines = linesByRecord.get(row.uuid) ?? [];
+    }
+  }
   return ok(res, paginatedResponse(rows, total, page, limit), "Salary records");
 }
 
@@ -992,6 +1411,7 @@ export async function downloadPayslip(req, res) {
   const isAdmin = Boolean(req.admin);
   const orgId = isAdmin ? null : req.scopeOrgId;
   const record = await getSalaryRecordForPayslip(req.params.uuid, orgId, isAdmin);
+  if (!isAdmin) await assertEmployeeInDataScope(req, "payroll", record.employee_uuid);
 
   const pdf = await generatePayslipPdf({
     record,
@@ -1028,6 +1448,11 @@ export async function exportOrgSalaryRecords(req, res) {
 
   let whereClause = "WHERE sr.organization_id = ?";
   const params = [orgId];
+  const employeeScope = employeeScopeCondition(req, "payroll", "e");
+  if (employeeScope) {
+    whereClause += ` AND ${employeeScope.sql}`;
+    params.push(...employeeScope.params);
+  }
 
   if (employeeUuid) {
     assertUuid(employeeUuid, "Employee UUID");

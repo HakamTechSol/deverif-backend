@@ -56,7 +56,9 @@ function installRouter() {
   const route = (sql) => {
     const s = String(sql);
     if (s.includes("SELECT id FROM organizations")) return [[{ id: 1 }]];
-    if (s.includes("SELECT uuid FROM users WHERE email")) return [[]];
+    if (s.includes("FROM users WHERE email")) return [[]];
+    if (s.includes("FROM users WHERE") && s.includes("REPLACE(REPLACE(cnic")) return [[]];
+    if (s.includes("FROM users WHERE") && s.includes("phone_normalized")) return [[]];
     if (s.includes("SELECT id, uuid, email") && s.includes("FROM users")) return [[]];
     if (s.includes("SELECT uuid FROM users WHERE `phone_normalized`")) return [[]];
     if (s.includes("SELECT uuid FROM users WHERE `cnic`")) return [[]];
@@ -86,6 +88,24 @@ function connSql() {
 }
 
 describe("createEmployee — automatic platform-user invite", () => {
+  it("rejects a starting salary when the sub-admin lacks payroll management permission", async () => {
+    const req = makeReq({ ...OWNER, current_salary: 85000 });
+    req.user = {
+      ...req.user,
+      org_role: "sub_admin",
+      feature_access: {
+        granular_permissions: {
+          "employees.create": true,
+          "payroll.view": true,
+          "payroll.manage_settings": false,
+        },
+      },
+    };
+
+    await expect(createEmployee(req, mockRes())).rejects.toMatchObject({ statusCode: 403 });
+    expect(pool.getConnection).not.toHaveBeenCalled();
+  });
+
   it("creates a platform user, an invite token and links the employee when an email is given", async () => {
     const res = mockRes();
     await createEmployee(makeReq({ document_type: undefined, ...OWNER, email: EMAIL, send_invite: true }), res);

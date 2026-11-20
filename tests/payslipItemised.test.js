@@ -67,7 +67,7 @@ const LINES = [
   { label: "Basic salary", type: "earning", source: "basic", amount: "50000.00", basis_value: null, basis_unit: null },
   { label: "Transport allowance", type: "earning", source: "component", amount: "15000.00", basis_value: null, basis_unit: null },
   { label: "House rent", type: "earning", source: "component", amount: "8500.00", basis_value: null, basis_unit: null },
-  { label: "Expense claims", type: "earning", source: "auto_expense", amount: "2000.00", basis_value: 2, basis_unit: "claims" },
+  { label: "Expense reimbursement (2 claims)", type: "earning", source: "auto_expense", amount: "2000.00", basis_value: 2, basis_unit: "claims" },
   { label: "Unpaid leave", type: "deduction", source: "auto_unpaid_leave", amount: "9090.91", basis_value: 2, basis_unit: "days" },
   { label: "Late arrivals", type: "deduction", source: "auto_late", amount: "3409.09", basis_value: 3, basis_unit: "late_arrivals" },
 ];
@@ -183,7 +183,7 @@ describe("payslip PDF Ã¢â‚¬â€ itemised lines", () => {
     for (const label of [
       "Transport allowance",
       "House rent",
-      "Expense claims",
+      "Expense reimbursement (2 claims)",
       "Unpaid leave",
       "Late arrivals",
     ]) {
@@ -204,13 +204,54 @@ describe("payslip PDF Ã¢â‚¬â€ itemised lines", () => {
     expect(raw).not.toContain("auto_expense");
     expect(raw).not.toContain("auto_unpaid_leave");
     expect(raw).toContain("Salary component");
-    expect(raw).toContain("Expense claims");
+    expect(raw).toContain("Expense reimbursement");
+    expect(raw.match(/Expense reimbursement/g)).toHaveLength(2);
 
     // The unit behind the derived amounts Ã¢â‚¬â€ 2 claims, 2 days, 3 late arrivals.
     // Without it a count reads as money, which is the ambiguity the basis exists
     // to remove.
     expect(raw).toContain("claims");
     expect(raw).toContain("late arrivals");
+  });
+
+  it("keeps a normal itemized payslip with the larger employer logo on one page", async () => {
+    const pdf = await generatePayslipPdf({
+      record: { ...withLines(LINES), organization_logo: "public/logo-full.png" },
+      employeeName: "Ayesha Siddiqui",
+      organizationName: "Dverif Labs",
+    });
+
+    expect(pdfText(pdf)).toContain("Page 1 of 1");
+  });
+
+  it("shows a readable source for monthly payroll items", async () => {
+    const pdf = await generatePayslipPdf({
+      record: withLines([
+        { label: "Attendance Bonus", type: "earning", source: "monthly_variable", amount: "1000.00", basis_value: null, basis_unit: null },
+      ]),
+      employeeName: "Ayesha Siddiqui",
+      organizationName: "Dverif Labs",
+    });
+    const raw = pdfText(pdf);
+
+    expect(raw).toContain("Attendance Bonus");
+    expect(raw).toContain("Monthly payroll item");
+    expect(raw).not.toContain("monthly_variable");
+  });
+
+  it("shows manual overtime as its own earning with a readable source", async () => {
+    const pdf = await generatePayslipPdf({
+      record: withLines([
+        { label: "Overtime", type: "earning", source: "manual_overtime", amount: "1500.00", basis_value: null, basis_unit: null },
+      ]),
+      employeeName: "Ayesha Siddiqui",
+      organizationName: "Dverif Labs",
+    });
+    const raw = pdfText(pdf);
+
+    expect(raw).toContain("Overtime");
+    expect(raw).toContain("Manual overtime");
+    expect(raw).not.toContain("manual_overtime");
   });
 
   it("still renders a record made before line items existed", async () => {
@@ -226,6 +267,18 @@ describe("payslip PDF Ã¢â‚¬â€ itemised lines", () => {
     const raw = pdfText(pdf);
     expect(raw).toContain("Basic salary");
     expect(raw).toContain("Allowances (total)");
+  });
+
+  it("shows expense reimbursement on legacy records even when itemised lines are absent", async () => {
+    const pdf = await generatePayslipPdf({
+      record: { ...RECORD, expense_reimbursement: "2000.00" },
+      employeeName: "Ayesha Siddiqui",
+      organizationName: "Dverif Labs",
+    });
+    const raw = pdfText(pdf);
+    expect(raw).toContain("Expense reimbursement");
+    expect(raw).toContain("Rs. 2,000.00");
+    expect(raw).toContain("Total earnings");
   });
 
   it("keeps the stored total as the total, rather than re-deriving it from the lines", async () => {
@@ -267,6 +320,7 @@ describe("payslip PDF Ã¢â‚¬â€ itemised lines", () => {
     const raw = pdfText(pdf);
     expect(raw).toContain("NET SALARY PAYABLE");
     expect(raw).toContain("Allowance 11");
+    expect(raw).toContain("Page 2 of 2");
   });
 });
 

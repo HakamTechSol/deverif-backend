@@ -1,6 +1,7 @@
 import ApiError from "../../utils/ApiError.js";
 import fs from "node:fs/promises";
 import { ok, created } from "../../utils/response.js";
+import { creatorScopeCondition, assertCreatedRecordInDataScope, employeeScopeCondition } from "../../utils/dataScopes.js";
 import { cnicError, isValidPhone, normalizeCnic } from "../../utils/contactFormat.js";
 import { parsePagination, paginatedResponse } from "../../utils/pagination.js";
 import { logAudit, getActorFromReq } from "../../utils/auditLog.js";
@@ -38,6 +39,7 @@ export async function listJobOpenings(req, res) {
     page,
     limit,
     offset,
+    scopeFilter: creatorScopeCondition(req, "recruitment", "o"),
   });
   // Identical envelope to candidates and offers. The per-row vacancy counts this used
   // to be unpaged for travel with each opening anyway, so nothing is lost.
@@ -45,6 +47,7 @@ export async function listJobOpenings(req, res) {
 }
 
 export async function getJobOpening(req, res) {
+  await assertCreatedRecordInDataScope(req, "recruitment", "job_openings", req.params.uuid);
   const opening = await recruitment.getOpening({
     orgId: req.scopeOrgId,
     openingUuid: req.params.uuid,
@@ -81,6 +84,7 @@ export async function createJobOpening(req, res) {
 }
 
 export async function updateJobOpening(req, res) {
+  await assertCreatedRecordInDataScope(req, "recruitment", "job_openings", req.params.uuid);
   const opening = await recruitment.updateOpening({
     orgId: req.scopeOrgId,
     openingUuid: req.params.uuid,
@@ -116,14 +120,18 @@ export async function listCandidates(req, res) {
     openingUuid: str(req.query.opening_uuid),
     stage: str(req.query.stage),
     search: str(req.query.search),
+    fromDate: str(req.query.from_date),
+    toDate: str(req.query.to_date),
     page,
     limit,
     offset,
+    scopeFilter: creatorScopeCondition(req, "recruitment", "c"),
   });
   return ok(res, paginatedResponse(result.items, result.total, result.page, result.limit), "Candidates");
 }
 
 export async function getCandidate(req, res) {
+  await assertCreatedRecordInDataScope(req, "recruitment", "candidates", req.params.uuid);
   const candidate = await recruitment.getCandidate({
     orgId: req.scopeOrgId,
     candidateUuid: req.params.uuid,
@@ -164,10 +172,12 @@ export async function createApplication(req, res) {
     throw new ApiError(400, "phone must be 7-15 digits and may contain spaces and + ( ) -");
   }
 
+  const openingUuid = str(req.body?.opening_uuid) ?? str(req.body?.job_opening_uuid);
+  if (openingUuid) await assertCreatedRecordInDataScope(req, "recruitment", "job_openings", openingUuid);
   const candidate = await recruitment.createCandidate({
     orgId: req.scopeOrgId,
     actorUuid: req.user?.uuid ?? null,
-    openingUuid: str(req.body?.opening_uuid) ?? str(req.body?.job_opening_uuid),
+    openingUuid,
     fullName: str(req.body?.full_name),
     email: str(req.body?.email),
     phone: str(req.body?.phone),
@@ -191,6 +201,7 @@ export async function createApplication(req, res) {
 }
 
 export async function updateCandidate(req, res) {
+  await assertCreatedRecordInDataScope(req, "recruitment", "candidates", req.params.uuid);
   const cnicGiven = String(req.body?.cnic ?? "").trim();
   const cnicDigits = normalizeCnic(cnicGiven);
   if (cnicError(cnicGiven)) {
@@ -230,6 +241,7 @@ export async function updateCandidate(req, res) {
  * the two agree rather than one silently accepting what the other rejects.
  */
 export async function moveApplicationStage(req, res) {
+  await assertCreatedRecordInDataScope(req, "recruitment", "candidates", req.params.uuid);
   const candidate = await recruitment.updateCandidateStage({
     orgId: req.scopeOrgId,
     actorUuid: req.user?.uuid ?? null,
@@ -254,13 +266,11 @@ export async function moveApplicationStage(req, res) {
 
 /** Prepare an offer for direct dispatch to the candidate. */
 export async function startOfferApplication(req, res) {
-  const override = req.route?.path?.endsWith("/override") === true;
+  await assertCreatedRecordInDataScope(req, "recruitment", "candidates", req.params.uuid);
   const result = await recruitment.startCandidateOffer({
     orgId: req.scopeOrgId,
     actorUuid: req.user?.uuid ?? null,
     candidateUuid: req.params.uuid,
-    overrideFailedInterviewReason: str(req.body?.override_failed_interview_reason),
-    overrideFailedInterviewAuthorized: override,
     offerTemplateUuid: str(req.body?.offer_template_uuid),
     offerValues: req.body?.offer_values ?? {},
   });
@@ -268,6 +278,9 @@ export async function startOfferApplication(req, res) {
 }
 
 export async function respondToOffer(req, res) {
+  if (req.user?.org_role) {
+    await assertCreatedRecordInDataScope(req, "recruitment", "candidates", req.params.uuid);
+  }
   /*
    * `portal_access` is read from the body and deliberately not forwarded.
    *
@@ -284,6 +297,7 @@ export async function respondToOffer(req, res) {
     candidateUuid: req.params.uuid,
     joiningDate: str(req.body?.joining_date),
     cnic: str(req.body?.cnic),
+    email: str(req.body?.email),
     designationId: req.body?.designation_id,
     departmentId: req.body?.department_id,
     emergencyContact: str(req.body?.emergency_contact),
@@ -310,9 +324,11 @@ export async function getPipeline(req, res) {
   if (!openingUuid) {
     throw new ApiError(400, "opening_uuid is required");
   }
+  await assertCreatedRecordInDataScope(req, "recruitment", "job_openings", openingUuid);
   const board = await recruitment.getPipelineBoard({
     orgId: req.scopeOrgId,
     openingUuid,
+    scopeFilter: creatorScopeCondition(req, "recruitment", "c"),
   });
   return ok(res, board, "Pipeline");
 }
@@ -320,6 +336,31 @@ export async function getPipeline(req, res) {
 // ---------------------------------------------------------------------------
 // Interviews
 // ---------------------------------------------------------------------------
+
+export async function listInterviewers(req, res) {
+  const items = await recruitment.listInterviewers({
+    orgId: req.scopeOrgId,
+    scopeFilter: employeeScopeCondition(req, "recruitment", "e"),
+  });
+  // The interviewer directory changes as org users are added/deactivated. A 304
+  // response has no JSON body, which leaves Axios/React Query with no option data.
+  // Always return the current directory instead of allowing conditional caching.
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+  return ok(res, { items }, "Interviewers");
+}
+
+export async function listMyInterviews(req, res) {
+  const { page, limit, offset } = parsePagination(req.query);
+  const result = await recruitment.listMyInterviews({
+    orgId: req.scopeOrgId, userUuid: req.user.uuid,
+    search: str(req.query.search), status: str(req.query.status),
+    fromDate: str(req.query.from_date), toDate: str(req.query.to_date),
+    page, limit, offset,
+  });
+  return ok(res, paginatedResponse(result.items, result.total, result.page, result.limit), "My assigned interviews");
+}
 
 export async function listInterviews(req, res) {
   const { page, limit, offset } = parsePagination(req.query);
@@ -330,6 +371,7 @@ export async function listInterviews(req, res) {
     page,
     limit,
     offset,
+    scopeFilter: creatorScopeCondition(req, "recruitment", "c"),
   });
   // Identical envelope to candidates and offers. The agenda page asks for a limit
   // large enough to cover a working week; without one this silently defaulted to 20
@@ -338,6 +380,7 @@ export async function listInterviews(req, res) {
 }
 
 export async function scheduleInterview(req, res) {
+  await assertCreatedRecordInDataScope(req, "recruitment", "candidates", str(req.body?.candidate_uuid));
   const interview = await recruitment.scheduleInterview({
     orgId: req.scopeOrgId,
     actorUuid: req.user?.uuid ?? null,
@@ -361,6 +404,8 @@ export async function scheduleInterview(req, res) {
 }
 
 export async function recordInterviewFeedback(req, res) {
+  const existingInterview = await recruitment.getInterview({ orgId: req.scopeOrgId, interviewUuid: req.params.uuid });
+  await assertCreatedRecordInDataScope(req, "recruitment", "candidates", existingInterview.candidate_uuid);
   const interview = await recruitment.recordInterviewFeedback({
     orgId: req.scopeOrgId,
     actorUuid: req.user?.uuid ?? null,
@@ -395,16 +440,19 @@ export async function listOffers(req, res) {
     page,
     limit,
     offset,
+    scopeFilter: creatorScopeCondition(req, "recruitment", "c"),
   });
   return ok(res, paginatedResponse(result.items, result.total, result.page, result.limit), "Offers");
 }
 
 export async function getOfferPreparation(req, res) {
+  await assertCreatedRecordInDataScope(req, "recruitment", "candidates", req.params.uuid);
   const data = await recruitment.getOfferPreparation({ orgId: req.scopeOrgId, candidateUuid: req.params.uuid });
   return ok(res, data, "Offer preparation");
 }
 
 export async function previewOffer(req, res) {
+  await assertCreatedRecordInDataScope(req, "recruitment", "candidates", req.params.uuid);
   const preview = await recruitment.previewOffer({
     orgId: req.scopeOrgId,
     candidateUuid: req.params.uuid,
@@ -415,6 +463,7 @@ export async function previewOffer(req, res) {
 }
 
 export async function sendOffer(req, res) {
+  await assertCreatedRecordInDataScope(req, "recruitment", "candidates", req.params.uuid);
   const letter = await recruitment.sendOffer({
     orgId: req.scopeOrgId,
     actorUuid: req.user?.uuid ?? null,
@@ -435,6 +484,7 @@ export async function sendOffer(req, res) {
 }
 
 export async function downloadOfferPdf(req, res) {
+  await assertCreatedRecordInDataScope(req, "recruitment", "candidates", req.params.uuid);
   const pdf = await recruitment.downloadOfferPdf({
     orgId: req.scopeOrgId,
     candidateUuid: req.params.uuid,
@@ -462,6 +512,8 @@ export async function uploadResume(req, res) {
 }
 
 export async function removeResume(req, res) {
+  const resolved = await recruitment.downloadResume({ orgId: req.scopeOrgId, attachmentUuid: req.params.attachmentUuid });
+  await assertCreatedRecordInDataScope(req, "recruitment", "candidates", resolved.entity_uuid);
   const result = await recruitment.removeResume({
     orgId: req.scopeOrgId,
     actorUuid: req.user?.uuid ?? null,
@@ -475,6 +527,7 @@ export async function downloadResume(req, res) {
     orgId: req.scopeOrgId,
     attachmentUuid: req.params.attachmentUuid,
   });
+  await assertCreatedRecordInDataScope(req, "recruitment", "candidates", resolved.entity_uuid);
   res.setHeader("Content-Type", resolved.mime_type || "application/octet-stream");
   // file_name is original-upload text and attacker-influenced, so anything that could
   // break out of the header is replaced before it goes in.

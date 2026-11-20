@@ -35,14 +35,20 @@ const ORG_ROUTES = readFileSync("src/routes/org.routes.js", "utf8");
 const REQUIRE_ROLE = readFileSync("src/middleware/requireRole.js", "utf8");
 const REQUIRE_PERMISSION_MW = readFileSync("src/middleware/requirePermission.js", "utf8");
 
-/** The four permissions this audit added. */
-const MODULE_PERMISSIONS = ["hr_letters", "manage_assets", "manage_separation", "approve_expenses"];
+/** The delegated module permissions, including independent expense capabilities. */
+const MODULE_PERMISSIONS = [
+  "hr_letters",
+  "manage_assets",
+  "manage_separation",
+  "approve_expenses",
+  "create_expenses",
+];
 
 /** The self-service keys that predate this work. */
 const SELF_SERVICE = ["attendance", "leave", "payroll"];
 
 describe("PERMISSION_KEYS lists every delegatable permission", () => {
-  it("includes all four HR-module permissions", () => {
+  it("includes the delegated module and expense permissions", () => {
     for (const key of MODULE_PERMISSIONS) {
       expect(PERMISSION_KEYS, `${key} missing`).toContain(key);
     }
@@ -101,6 +107,15 @@ describe("hasPermission honours an explicit grant over the default", () => {
     }
   });
 
+  it("keeps create and approve expense grants independent", () => {
+    const createOnly = { org_role: "sub_admin", feature_access: { create_expenses: true } };
+    const approveOnly = { org_role: "sub_admin", feature_access: { approve_expenses: true } };
+    expect(hasPermission(createOnly, "create_expenses")).toBe(true);
+    expect(hasPermission(createOnly, "approve_expenses")).toBe(false);
+    expect(hasPermission(approveOnly, "approve_expenses")).toBe(true);
+    expect(hasPermission(approveOnly, "create_expenses")).toBe(false);
+  });
+
   it("an org_admin passes on the role alone, with nothing granted", () => {
     const u = { org_role: "org_admin", feature_access: {} };
     for (const key of MODULE_PERMISSIONS) {
@@ -122,10 +137,10 @@ describe("hasPermission honours an explicit grant over the default", () => {
 
 describe("each module gate in org.routes.js requires its own permission", () => {
   const GATES = [
-    ["hrLettersMgmt", "hr_letters"],
-    ["assetMgmt", "manage_assets"],
-    ["separationMgmt", "manage_separation"],
-    ["expenseCategoryMgmt", "approve_expenses"],
+    ["hrLetterView", "hr_letters.view"],
+    ["assetView", "assets.view"],
+    ["offboardingView", "offboarding.view"],
+    ["expenseView", "expenses.view"],
   ];
 
   /** The single-line definition of a gate, so an assertion cannot match a comment. */
@@ -158,12 +173,8 @@ describe("each module gate in org.routes.js requires its own permission", () => 
   }
 
   it("orgAdminsOnly gates stay role-only and gain no permission", () => {
-    // hrLettersOwner and assetCategoryMgmt deliberately keep the stricter role gate:
-    // DELETING a template and redefining the classes of asset that exist are
-    // structural decisions, not delegated operations. Adding a permission to them
-    // would hand out the power to remove the definitions others depend on.
+    // Deleting a shared letter template remains org-admin-only.
     expect(gateLineOf("hrLettersOwner")).not.toContain("requirePermission(");
-    expect(gateLineOf("assetCategoryMgmt")).not.toContain("requirePermission(");
   });
 
   function gateLineOf(name) {

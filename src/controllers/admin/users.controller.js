@@ -404,13 +404,8 @@ export async function resendInvite(req, res) {
     throw new ApiError(400, "Invitation already accepted. Use forgot password instead.");
   }
 
-  // Revoke old pending links without marking them as accepted/used. This keeps
-  // used_at reserved for an invite that was actually redeemed.
-  await pool.query(
-    "DELETE FROM invite_tokens WHERE user_uuid=? AND used_at IS NULL",
-    [user.uuid]
-  );
-
+  // Keep existing pending links valid until the replacement email is confirmed
+  // sent. If SMTP fails, the user can still use the previous invitation link.
   const rawToken = crypto.randomBytes(32).toString("hex");
   const tokenHash = crypto.createHash("sha256").update(rawToken).digest("hex");
   const expiresInHours = parseInt(process.env.INVITE_EXPIRES_IN_HOURS || "72", 10);
@@ -426,8 +421,17 @@ export async function resendInvite(req, res) {
   try {
     await sendInviteEmail({ to: user.email, setLink, invitedByName: req.admin?.full_name || "Admin" });
   } catch (e) {
+    // Leave this token and earlier pending tokens intact: a connection reset can
+    // happen after the provider accepted the message, so deleting it could make
+    // an invitation that was actually delivered unusable.
     throw new ApiError(500, e.message || "Failed to send invite email");
   }
+
+  // Only retire older links after SMTP confirms the replacement was sent.
+  await pool.query(
+    "DELETE FROM invite_tokens WHERE user_uuid=? AND token_hash<>? AND used_at IS NULL",
+    [user.uuid, tokenHash]
+  );
 
   logAudit({
     ...getActorFromReq(req),

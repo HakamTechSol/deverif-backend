@@ -199,7 +199,7 @@ export async function removeAttachment({ orgId, attachmentUuid, actorUuid = null
  */
 export async function resolveForDownload({ orgId, attachmentUuid }) {
   const [rows] = await pool.query(
-    `SELECT uuid, file_name, file_path, mime_type, file_size
+    `SELECT uuid, entity_type, entity_uuid, file_name, file_path, mime_type, file_size
        FROM attachments
       WHERE uuid=? AND organization_id=? AND deleted_at IS NULL`,
     [attachmentUuid, orgId]

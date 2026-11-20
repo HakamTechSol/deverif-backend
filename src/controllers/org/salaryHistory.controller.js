@@ -29,7 +29,9 @@ function dateOnly(value) {
     throw new ApiError(400, "effective_from must be a valid date (YYYY-MM-DD)");
   }
   const d = new Date(`${value}T00:00:00Z`);
-  if (Number.isNaN(d.getTime())) throw new ApiError(400, "effective_from is not a valid date");
+  if (Number.isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== value) {
+    throw new ApiError(400, "effective_from is not a valid date");
+  }
   return value;
 }
 
@@ -100,6 +102,15 @@ export async function incrementEmployeeSalary(req, res) {
 
   const basic = moneyFrom(new_basic_salary, "new_basic_salary");
   const effectiveFrom = dateOnly(effective_from);
+  const today = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Karachi",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
+  if (effectiveFrom < today) {
+    throw new ApiError(400, "Salary increments cannot have a past effective date");
+  }
   const createdBy = req.user?.id ?? null;
 
   const conn = await pool.getConnection();
@@ -118,9 +129,7 @@ export async function incrementEmployeeSalary(req, res) {
 
     if (activeRows.length) {
       const active = activeRows[0];
-      const activeStart = active.effective_from instanceof Date
-        ? active.effective_from.toISOString().slice(0, 10)
-        : String(active.effective_from).slice(0, 10);
+      const activeStart = isoDate(active.effective_from);
 
       if (effectiveFrom <= activeStart) {
         throw new ApiError(
@@ -180,8 +189,7 @@ export async function incrementEmployeeSalary(req, res) {
 }
 
 function asDateStr(value) {
-  if (value instanceof Date) return value.toISOString().slice(0, 10);
-  return String(value).slice(0, 10);
+  return isoDate(value);
 }
 
 async function fetchEmployeeHistory(conn, employeeUuid) {
@@ -230,6 +238,17 @@ export async function updateEmployeeSalaryHistory(req, res) {
 
     if (newBasic === Number(target.basic_salary) && newEffFrom === asDateStr(target.effective_from)) {
       throw new ApiError(400, "No changes to save");
+    }
+    if (newEffFrom !== asDateStr(target.effective_from)) {
+      const today = new Intl.DateTimeFormat("en-CA", {
+        timeZone: "Asia/Karachi",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+      }).format(new Date());
+      if (newEffFrom < today) {
+        throw new ApiError(400, "Salary effective dates cannot be moved into the past");
+      }
     }
 
     const targetEff = asDateStr(target.effective_from);

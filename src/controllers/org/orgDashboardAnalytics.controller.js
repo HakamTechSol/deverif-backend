@@ -8,6 +8,11 @@ import { getOrgQuotaStatus } from "../../utils/requestQuota.js";
  */
 export async function orgDashboardAnalytics(req, res) {
   const orgId = req.scopeOrgId;
+  const validDate = (value) => /^\d{4}-\d{2}-\d{2}$/.test(String(value || ""));
+  const today = new Date().toISOString().slice(0, 10);
+  const fromDate = validDate(req.query.from) ? req.query.from : today.slice(0, 8) + "01";
+  const toDate = validDate(req.query.to) ? req.query.to : today;
+  if (fromDate > toDate || toDate > today) return res.status(400).json({ success: false, message: "Invalid dashboard date range" });
 
   // 1. Active employee count.
   // 'active' (deactivated) counts as staff: they are still on the roster and
@@ -25,8 +30,8 @@ export async function orgDashboardAnalytics(req, res) {
     `SELECT COUNT(*) AS total
      FROM leave_requests lr
      JOIN employees e ON e.uuid = lr.employee_uuid
-     WHERE e.organization_id=? AND lr.status='pending'`,
-    [orgId]
+     WHERE e.organization_id=? AND lr.status='pending' AND DATE(lr.created_at) BETWEEN ? AND ?`,
+    [orgId, fromDate, toDate]
   );
 
   // 3. Today's attendance (present vs total active employees)
@@ -34,8 +39,8 @@ export async function orgDashboardAnalytics(req, res) {
     `SELECT COUNT(DISTINCT ar.employee_uuid) AS present
      FROM attendance_records ar
      JOIN employees e ON e.uuid = ar.employee_uuid
-     WHERE e.organization_id=? AND ar.date = CURDATE()`,
-    [orgId]
+     WHERE e.organization_id=? AND ar.date BETWEEN ? AND ?`,
+    [orgId, fromDate, toDate]
   );
   const todayAttendance = {
     present: todayPresent.present,
@@ -46,8 +51,8 @@ export async function orgDashboardAnalytics(req, res) {
   const [[payrollTotal]] = await pool.query(
     `SELECT COALESCE(SUM(net_salary), 0) AS total
      FROM salary_records
-     WHERE organization_id=? AND month=MONTH(CURDATE()) AND year=YEAR(CURDATE())`,
-    [orgId]
+     WHERE organization_id=? AND STR_TO_DATE(CONCAT(year, '-', LPAD(month, 2, '0'), '-01'), '%Y-%m-%d') BETWEEN DATE_FORMAT(?, '%Y-%m-01') AND LAST_DAY(?)`,
+    [orgId, fromDate, toDate]
   );
 
   // 5. Quota status
@@ -84,9 +89,9 @@ export async function orgDashboardAnalytics(req, res) {
             ar.status
      FROM attendance_records ar
      JOIN employees e ON e.uuid = ar.employee_uuid
-     WHERE e.organization_id=? AND ar.date = CURDATE()
+     WHERE e.organization_id=? AND ar.date BETWEEN ? AND ?
        AND e.status IN ('active','current_employee')`,
-    [orgId]
+    [orgId, fromDate, toDate]
   );
 
   const presentUuids = new Set(todayRecords.map((r) => r.employee_uuid));
@@ -112,28 +117,29 @@ export async function orgDashboardAnalytics(req, res) {
             COALESCE(SUM(net_salary), 0) AS total
      FROM salary_records
      WHERE organization_id=?
-       AND STR_TO_DATE(CONCAT(year, '-', month, '-01'), '%Y-%m-%d') >= DATE_SUB(CURDATE(), INTERVAL 12 MONTH)
+       AND STR_TO_DATE(CONCAT(year, '-', LPAD(month, 2, '0'), '-01'), '%Y-%m-%d') BETWEEN DATE_FORMAT(?, '%Y-%m-01') AND LAST_DAY(?)
      GROUP BY month
      ORDER BY month ASC`,
-    [orgId]
+    [orgId, fromDate, toDate]
   );
 
-  // 9. Leave utilization by type (current year approved days)
+  // 9. Leave utilization by type (current year approved days for all configured leave types)
   const [leaveUtil] = await pool.query(
     `SELECT lt.name AS leave_type,
             COALESCE(SUM(
-              DATEDIFF(
-                LEAST(lr.end_date, LAST_DAY(CONCAT(YEAR(CURDATE()), '-', LPAD(MONTH(CURDATE()),2,'0'), '-01'))),
-                GREATEST(lr.start_date, CONCAT(YEAR(CURDATE()), '-01-01'))
-              ) + 1
+              CASE
+                WHEN lr.status = 'approved' AND lr.start_date <= ? AND lr.end_date >= ? THEN
+                  DATEDIFF(LEAST(lr.end_date, ?), GREATEST(lr.start_date, ?)) + 1
+                ELSE 0
+              END
             ), 0) AS days_used
-     FROM leave_requests lr
-     JOIN employees e ON e.uuid = lr.employee_uuid
-     JOIN leave_types lt ON lt.id = lr.leave_type_id
-     WHERE e.organization_id=? AND lr.status='approved' AND YEAR(lr.start_date)=YEAR(CURDATE())
+     FROM leave_types lt
+     LEFT JOIN leave_requests lr ON lt.id = lr.leave_type_id
+     LEFT JOIN employees e ON e.uuid = lr.employee_uuid AND e.organization_id = lt.organization_id
+     WHERE lt.organization_id = ?
      GROUP BY lt.id, lt.name
-     ORDER BY days_used DESC`,
-    [orgId]
+     ORDER BY days_used DESC, lt.name ASC`,
+    [toDate, fromDate, toDate, fromDate, orgId]
   );
 
   return ok(res, {
@@ -146,5 +152,6 @@ export async function orgDashboardAnalytics(req, res) {
     today_attendance_breakdown: attendanceBreakdown,
     monthly_payroll_trend: payrollTrend,
     leave_utilization: leaveUtil,
+    date_range: { from: fromDate, to: toDate },
   }, "Org dashboard analytics");
 }

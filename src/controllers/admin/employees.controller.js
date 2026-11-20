@@ -1,8 +1,9 @@
 import crypto from "crypto";
 import ApiError from "../../utils/ApiError.js";
-import { rethrowIdentityDuplicate } from "../../utils/identityUniqueness.js";
+import { assertEmploymentIdentityAvailable, rethrowIdentityDuplicate } from "../../utils/identityUniqueness.js";
 import { createEmployeePortalInvite, deliverEmployeePortalInvite } from "../../services/employeeAccess.service.js";
 import { pool } from "../../config/db.js";
+import { employeeScopeCondition, assertEmployeeInDataScope } from "../../utils/dataScopes.js";
 import { ok, created } from "../../utils/response.js";
 import { assertUuid } from "../../utils/publicResponse.js";
 import { parsePagination, paginatedResponse } from "../../utils/pagination.js";
@@ -10,7 +11,8 @@ import { sendInviteEmail } from "../../utils/mailer.js";
 import { firstFrontendUrl } from "../../utils/frontendUrl.js";
 import { logAudit, getActorFromReq } from "../../utils/auditLog.js";
 import { applyDesignationLeavePolicies } from "../../utils/designationLeavePolicy.js";
-import { STAFF_ROLES, assertRole, ROLE_ORG_ADMIN } from "../../utils/roles.js";
+import { STAFF_ROLES, assertRole } from "../../utils/roles.js";
+import { hasPermission } from "../../utils/permissions.js";
 import { cnicError, isValidPhone as isValidContactPhone, normalizeCnic } from "../../utils/contactFormat.js";
 
 const EMPLOYEE_SELECT = `SELECT e.id, e.uuid, e.employee_code, e.organization_id, e.full_name, e.email, e.phone,
@@ -195,8 +197,15 @@ function normalizeEmployeePayload(body) {
 
 export async function createEmployee(req, res) {
   assertRole(req.user, STAFF_ROLES);
-  const scope = await resolveScopeOrganization(req);
   const data = normalizeEmployeePayload(req.body);
+  if (
+    data.current_salary !== null &&
+    !req.admin &&
+    !hasPermission(req.user, "payroll.manage_settings")
+  ) {
+    throw new ApiError(403, "You do not have permission to set employee salary");
+  }
+  const scope = await resolveScopeOrganization(req);
 
   let orgId;
   if (scope.scoped) {
@@ -205,19 +214,20 @@ export async function createEmployee(req, res) {
     orgId = await resolveOrganizationId(req.body.organization_uuid);
   }
 
-  if (data.email) {
-    const [dupeEmp] = await pool.query(
-      "SELECT uuid FROM employees WHERE email=?",
-      [data.email]
-    );
-    if (dupeEmp.length) throw new ApiError(409, "An employee with this email already exists");
-  }
+  // Employment history is per organization. A person who already left another
+  // company must remain hireable here: only a CURRENT row (in this org or
+  // another) is a conflict. A same-org duplicate is still refused so the roster
+  // cannot contain the same person twice. See assertEmploymentIdentityAvailable.
+  await assertEmploymentIdentityAvailable({
+    executor: pool,
+    organizationId: orgId,
+    cnic: data.cnic,
+    email: data.email,
+  });
   if (data.reporting_manager_uuid) {
     const [manager] = await pool.query("SELECT uuid FROM employees WHERE uuid=? AND organization_id=? AND status IN ('active','current_employee')", [data.reporting_manager_uuid, orgId]);
     if (!manager.length) throw new ApiError(400, "Choose an active reporting manager from this organization");
   }
-  const [dupeCnic] = await pool.query("SELECT uuid FROM employees WHERE cnic=?", [data.cnic]);
-  if (dupeCnic.length) throw new ApiError(409, "An employee with this CNIC already exists");
 
   const addedByUuid = req.admin?.uuid || req.user?.uuid || null;
   // An employee that carries an email is created as a platform user straight
@@ -301,9 +311,11 @@ export async function createEmployee(req, res) {
   const [employeeRow] = await pool.query(`${EMPLOYEE_SELECT} WHERE e.uuid=?`, [createdEmployeeUuid]);
 
   // Sent after the transaction commits so a mail failure can never roll back a
-  // successfully created employee.
+  // successfully created employee. A returning employee already has a password
+  // (the account was linked, not created), so there is no set-password link to
+  // deliver in that case.
   let inviteWarning = null;
-  if (wantsPlatformUser && portalInvite) {
+  if (wantsPlatformUser && portalInvite?.rawToken) {
     const delivery = await deliverEmployeePortalInvite({
       ...portalInvite,
       to: data.email,
@@ -322,15 +334,23 @@ export async function createEmployee(req, res) {
       email: data.email,
       organization_id: orgId,
       created_platform_user: !!linkedUserUuid,
-      email_sent: wantsPlatformUser && !inviteWarning,
+      linked_existing_account: Boolean(portalInvite?.linkedExisting),
+      email_sent: Boolean(wantsPlatformUser && portalInvite?.rawToken && !inviteWarning),
     },
     req,
   });
 
-  const payload = { employee: employeeRow[0] };
+  const payload = {
+    employee: employeeRow[0],
+    linked_existing_account: Boolean(portalInvite?.linkedExisting),
+  };
   let message = "Employee created successfully";
   if (wantsPlatformUser) {
-    message = inviteWarning ? "Employee created but invite delivery failed." : "Employee created. Set-password invitation sent.";
+    if (portalInvite?.linkedExisting) {
+      message = "Employee created. Existing platform account linked.";
+    } else {
+      message = inviteWarning ? "Employee created but invite delivery failed." : "Employee created. Set-password invitation sent.";
+    }
     if (inviteWarning) payload._email_warning = inviteWarning;
   }
 
@@ -387,20 +407,29 @@ export async function resendEmployeeInvite(req, res) {
       conn.release();
     }
     const invitedByName = req.user?.full_name || "Org Admin";
-    await deliverEmployeePortalInvite({
-      tokenId: portalInvite.tokenId,
-      rawToken: portalInvite.rawToken,
-      to: eData.email,
-      invitedByName,
-    });
+    if (portalInvite.rawToken) {
+      await deliverEmployeePortalInvite({
+        tokenId: portalInvite.tokenId,
+        rawToken: portalInvite.rawToken,
+        to: eData.email,
+        invitedByName,
+      });
+    }
     logAudit({
       ...getActorFromReq(req),
-      action: "employee.invite_create",
+      action: portalInvite.linkedExisting ? "employee.account_link" : "employee.invite_create",
       entityType: "employee",
       entityId: uuid,
+      details: { linked_existing_account: Boolean(portalInvite.linkedExisting) },
       req,
     });
-    return ok(res, {}, "Invitation sent successfully");
+    return ok(
+      res,
+      { linked_existing_account: Boolean(portalInvite.linkedExisting) },
+      portalInvite.linkedExisting
+        ? "Existing platform account linked."
+        : "Invitation sent successfully"
+    );
   }
   if (emp.linked_user_status === "active") {
     throw new ApiError(400, "This user is already active. Use forgot password instead.");
@@ -476,40 +505,28 @@ export async function listEmployees(req, res) {
   if (scope.scoped) {
     conditions.push("e.organization_id = ?");
     params.push(scope.orgId);
-    // Per-admin visibility: each org_admin sees only the employee records THEY
-    // personally added. Platform admins are unfiltered.
-    //
-    // Deliberately NOT applied to sub-admins. A sub-admin is staff
-    // (STAFF_ROLES = [org_admin, sub_admin]) and is documented as sharing the
-    // org_admin's operational access, differing only in that it cannot delete
-    // anything, manage sub-admins, or touch org settings. Applying this filter to
-    // them made the Employees page permanently empty for them: the roster belongs
-    // to the org_admin who imported it, so a sub-admin's list was filtered down to
-    // nothing while their granted 'manage_employees' permission appeared to do
-    // nothing at all. A sub-admin sees the whole org roster, which is also what
-    // makes their approve/generate work meaningful — they need to see the people
-    // whose documents they are reviewing.
-    //
-    // ?scope=org opts OUT of it, and only out of it. The organization_id
-    // predicate above is unconditional, so this widens visibility WITHIN the
-    // caller's own org and can never reach another tenant.
-    //
-    // The asset Assign picker needs that: it is a picker over the company roster,
-    // not a work queue of "records I imported". With the filter applied, an
-    // org_admin physically could not hand a laptop to a colleague another admin
-    // had onboarded — the picker showed no such person, and the only visible
-    // symptom was that the company's own employees seemed not to exist.
-    const orgWide = req.query.scope === "org";
-    if (req.user.org_role === ROLE_ORG_ADMIN && !orgWide) {
-      conditions.push("e.added_by_uuid = ?");
-      params.push(req.user.uuid);
-    }
+  }
+
+  const employeeDataScope = employeeScopeCondition(req, "employees", "e");
+  if (employeeDataScope) {
+    conditions.push(employeeDataScope.sql);
+    params.push(...employeeDataScope.params);
   }
 
   if (search) {
     conditions.push("(e.full_name LIKE ? OR e.email LIKE ? OR e.phone LIKE ? OR e.cnic LIKE ? OR dg.name LIKE ? OR dp.name LIKE ? OR o.name LIKE ?)");
     const like = `%${search}%`;
     params.push(like, like, like, like, like, like, like);
+  }
+  const department = typeof req.query.department === "string" ? req.query.department.trim() : "";
+  const designation = typeof req.query.designation === "string" ? req.query.designation.trim() : "";
+  const employmentStatus = typeof req.query.employment_status === "string" ? req.query.employment_status.trim() : "";
+  if (department) { conditions.push("dp.name = ?"); params.push(department); }
+  if (designation) { conditions.push("dg.name = ?"); params.push(designation); }
+  if (employmentStatus) {
+    if (!["current_employee", "active", "inactive"].includes(employmentStatus) || showReferences) throw new ApiError(400, "employment_status must be current_employee, active, or inactive");
+    conditions.push("e.status = ?");
+    params.push(employmentStatus);
   }
 
   const whereClause = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
@@ -535,6 +552,7 @@ export async function getEmployee(req, res) {
   const { uuid } = req.params;
   const scope = await resolveScopeOrganization(req);
   assertUuid(uuid, "Employee UUID");
+  await assertEmployeeInDataScope(req, "employees", uuid);
 
   const [rows] = await pool.query(`${EMPLOYEE_SELECT} WHERE e.uuid=?`, [uuid]);
   if (!rows.length) throw new ApiError(404, "Employee not found");
@@ -559,11 +577,17 @@ export async function updateEmployee(req, res) {
   if (scope.scoped && emp.organization_id !== scope.orgId) {
     throw new ApiError(403, "You can only manage employees within your organization");
   }
+  await assertEmployeeInDataScope(req, "employees", uuid);
 
   const { full_name, email, phone, cnic, designation, department, status, joining_date, emergency_contact, employment_type, work_location, reporting_manager_uuid, organization_uuid } = req.body;
 
   const updateFields = [];
   const updateValues = [];
+  // The values the row will hold after this update. The reactivation check below
+  // must test THESE, not the old row: changing the email and reactivating in one
+  // request is otherwise judged against the identity being replaced.
+  let nextEmail = emp.email;
+  let nextCnic = emp.cnic;
 
   if (full_name !== undefined && String(full_name).trim() !== "") {
     updateFields.push("full_name = ?");
@@ -572,8 +596,13 @@ export async function updateEmployee(req, res) {
   if (email !== undefined) {
     const trimmed = email ? String(email).trim() : null;
     if (trimmed && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed)) throw new ApiError(400, "email is invalid");
-    const [dupeEmp] = await pool.query("SELECT uuid FROM employees WHERE email=? AND uuid<>?", [trimmed, uuid]);
-    if (dupeEmp.length) throw new ApiError(409, "An employee with this email already exists");
+    await assertEmploymentIdentityAvailable({
+      executor: pool,
+      organizationId: emp.organization_id,
+      email: trimmed,
+      excludeEmployeeUuid: uuid,
+    });
+    nextEmail = trimmed;
     updateFields.push("email = ?");
     updateValues.push(trimmed);
   }
@@ -584,10 +613,13 @@ export async function updateEmployee(req, res) {
   if (cnic !== undefined) {
     const trimmed = normalizeCnic(cnic);
     if (cnicError(cnic)) throw new ApiError(400, "CNIC must be 13 digits, e.g. 42101-2345678-9");
-    if (trimmed) {
-      const [dupeCnic] = await pool.query("SELECT uuid FROM employees WHERE cnic=? AND uuid<>?", [trimmed, uuid]);
-      if (dupeCnic.length) throw new ApiError(409, "An employee with this CNIC already exists");
-    }
+    await assertEmploymentIdentityAvailable({
+      executor: pool,
+      organizationId: emp.organization_id,
+      cnic: trimmed || null,
+      excludeEmployeeUuid: uuid,
+    });
+    nextCnic = trimmed || null;
     updateFields.push("cnic = ?");
     updateValues.push(trimmed || null);
   }
@@ -602,15 +634,32 @@ export async function updateEmployee(req, res) {
     updateValues.push(departmentId);
   }
   if (status !== undefined) {
+    const nextStatus = ALLOWED_EMPLOYEE_STATUS.includes(status)
+      ? status
+      : (emp.status ?? "current_employee");
+    // Reactivating an ex_employee must re-run the identity check: while they were
+    // an ex-employee a new current row for the same person could have appeared in
+    // this organization or another one. Without this, flipping the status back to
+    // current would silently create two active employments.
+    if (
+      ["active", "current_employee"].includes(nextStatus) &&
+      !["active", "current_employee"].includes(emp.status)
+    ) {
+      await assertEmploymentIdentityAvailable({
+        executor: pool,
+        organizationId: emp.organization_id,
+        cnic: nextCnic,
+        email: nextEmail,
+        excludeEmployeeUuid: uuid,
+      });
+    }
     updateFields.push("status = ?");
     // An update MAY set 'inactive' — deactivating an existing employee is the
     // whole point of that value, and it is what the auth guards key off. An
     // unrecognised value falls back to the row's CURRENT status rather than to a
     // fixed default: defaulting to 'active' here would silently un-deactivate
     // someone the caller only meant to rename.
-    updateValues.push(
-      ALLOWED_EMPLOYEE_STATUS.includes(status) ? status : (emp.status ?? "current_employee")
-    );
+    updateValues.push(nextStatus);
   }
   if (joining_date !== undefined) {
     updateFields.push("joining_date = ?");
@@ -687,6 +736,16 @@ export async function deleteEmployee(req, res) {
     throw new ApiError(409, "Cannot delete an employee who is a linked platform user. Deactivate the user account first.");
   }
 
+  const [[leaveHistory]] = await pool.query(
+    `SELECT
+       (SELECT COUNT(*) FROM leave_requests WHERE employee_uuid=?) AS request_count,
+       (SELECT COUNT(*) FROM leave_balance_ledger WHERE employee_uuid=?) AS ledger_count`,
+    [uuid, uuid],
+  );
+  if (Number(leaveHistory.request_count) || Number(leaveHistory.ledger_count)) {
+    throw new ApiError(409, "Cannot hard-delete an employee with leave history or balance ledger entries. Deactivate the employee to preserve the audit trail.");
+  }
+
   await pool.query("DELETE FROM employees WHERE uuid=?", [uuid]);
 
   logAudit({
@@ -713,6 +772,7 @@ export async function archiveReference(req, res) {
   if (scope.scoped && emp.organization_id !== scope.orgId) {
     throw new ApiError(403, "You can only manage employees within your organization");
   }
+  await assertEmployeeInDataScope(req, "employees", uuid);
 
   // One column, one value. This used to write both `record_type='learned_reference'`
   // and `status='resigned'`, which is the dual-write that made the two columns

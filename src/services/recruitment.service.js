@@ -11,6 +11,7 @@ import { sendRecruitmentOfferEmail } from "../utils/mailer.js";
 import { queueNotificationEmail, notificationActionUrl } from "./notificationEmail.service.js";
 import { generateHrLetterPdf } from "../utils/hrLetterPdf.js";
 import { cnicError, normalizeCnic } from "../utils/contactFormat.js";
+import { assertEmploymentIdentityAvailable } from "../utils/identityUniqueness.js";
 import { applyDesignationLeavePolicies } from "../utils/designationLeavePolicy.js";
 import { ocrExtract } from "./documentService.js";
 
@@ -317,10 +318,15 @@ export async function listOpenings({
   page = 1,
   limit = 20,
   offset = 0,
+  scopeFilter,
   conn = pool,
 }) {
   const clauses = ["o.organization_id = ?"];
   const params = [orgId];
+  if (scopeFilter) {
+    clauses.push(scopeFilter.sql);
+    params.push(...scopeFilter.params);
+  }
   if (status) {
     if (!JOB_STATUSES.includes(status)) {
       throw new ApiError(400, `status must be one of: ${JOB_STATUSES.join(", ")}`);
@@ -545,19 +551,23 @@ export async function createCandidate({
     [orgId]
   );
   const duplicate = existingCandidates.find((existing) =>
-    (address && String(existing.email ?? "").trim().toLowerCase() === address) ||
     (normalizedPhone && String(existing.phone ?? "").replace(/\D/g, "") === normalizedPhone) ||
     (normalizedCnic && String(existing.cnic ?? "").replace(/\D/g, "") === normalizedCnic)
   );
   if (duplicate) {
-    if (address && String(duplicate.email ?? "").trim().toLowerCase() === address) {
-      throw new ApiError(409, "A candidate with this email already exists");
-    }
     if (normalizedPhone && String(duplicate.phone ?? "").replace(/\D/g, "") === normalizedPhone) {
       throw new ApiError(409, "A candidate with this phone number already exists");
     }
     throw new ApiError(409, "A candidate with this CNIC already exists");
   }
+  const [[emailDuplicateRow]] = await conn.query(
+    `SELECT
+       (EXISTS(SELECT 1 FROM candidates WHERE LOWER(email)=?)
+        OR EXISTS(SELECT 1 FROM users WHERE LOWER(email)=?)
+        OR EXISTS(SELECT 1 FROM employees WHERE LOWER(email)=?)) AS email_duplicate`,
+    [address, address, address],
+  );
+  const emailDuplicate = Boolean(emailDuplicateRow?.email_duplicate);
 
   const uuid = randomUUID();
   try {
@@ -601,7 +611,22 @@ export async function createCandidate({
     details: { opening_uuid: opening.uuid, email: address },
   });
 
-  return getCandidate({ orgId, candidateUuid: uuid, conn });
+  return { ...(await getCandidate({ orgId, candidateUuid: uuid, conn })), email_duplicate: emailDuplicate };
+}
+
+async function assertCandidateEmailAvailable({ orgId, candidateUuid, email, conn = pool }) {
+  const address = String(email ?? "").trim().toLowerCase();
+  if (!address) throw new ApiError(409, "Add the candidate's email address before assigning an offer");
+  const [[row]] = await conn.query(
+    `SELECT
+       (EXISTS(SELECT 1 FROM candidates WHERE LOWER(email)=? AND uuid<>?)
+        OR EXISTS(SELECT 1 FROM users WHERE LOWER(email)=?)
+        OR EXISTS(SELECT 1 FROM employees WHERE LOWER(email)=?)) AS email_in_use`,
+    [address, candidateUuid, address, address],
+  );
+  if (row?.email_in_use) {
+    throw new ApiError(409, "This candidate email is already in use. Update the candidate email to a unique address before assigning or sending an offer.");
+  }
 }
 
 export async function updateCandidate({
@@ -634,12 +659,10 @@ export async function updateCandidate({
     [orgId, candidateUuid]
   );
   const duplicate = existingCandidates.find((existing) =>
-    String(existing.email ?? "").trim().toLowerCase() === nextEmail ||
     (nextPhone && String(existing.phone ?? "").replace(/\D/g, "") === String(nextPhone).replace(/\D/g, "")) ||
     (nextCnic && String(existing.cnic ?? "").replace(/\D/g, "") === nextCnic)
   );
   if (duplicate) {
-    if (String(duplicate.email ?? "").trim().toLowerCase() === nextEmail) throw new ApiError(409, "A candidate with this email already exists");
     if (nextPhone && String(duplicate.phone ?? "").replace(/\D/g, "") === String(nextPhone).replace(/\D/g, "")) throw new ApiError(409, "A candidate with this phone number already exists");
     throw new ApiError(409, "A candidate with this CNIC already exists");
   }
@@ -723,13 +746,20 @@ export async function listCandidates({
   openingUuid,
   stage,
   search,
+  fromDate,
+  toDate,
   page = 1,
   limit = 20,
   offset = 0,
+  scopeFilter,
   conn = pool,
 }) {
   const clauses = ["c.organization_id = ?"];
   const params = [orgId];
+  if (scopeFilter) {
+    clauses.push(scopeFilter.sql);
+    params.push(...scopeFilter.params);
+  }
 
   if (openingUuid) {
     assertUuid(openingUuid, "Job opening UUID");
@@ -743,6 +773,9 @@ export async function listCandidates({
     clauses.push("c.stage = ?");
     params.push(stage);
   }
+  if (fromDate) { clauses.push("DATE(c.created_at) >= ?"); params.push(fromDate); }
+  if (toDate) { clauses.push("DATE(c.created_at) <= ?"); params.push(toDate); }
+  if (fromDate && toDate && fromDate > toDate) throw new ApiError(400, "from_date cannot be after to_date");
   if (search && String(search).trim()) {
     // LIKE with an escaped wildcard, so a search for "100%" is a literal and a
     // search for "_" does not match every single character.
@@ -939,6 +972,7 @@ export async function hireCandidate({
   actorUuid,
   candidateUuid,
   cnic,
+  email,
   joiningDate,
   designationId,
   departmentId,
@@ -991,6 +1025,7 @@ export async function hireCandidate({
       actorUuid,
       candidateUuid,
       cnic,
+      email,
       joiningDate,
       designationId,
       departmentId,
@@ -1027,6 +1062,7 @@ async function hireCandidateInTransaction({
   actorUuid,
   candidateUuid,
   cnic,
+  email,
   joiningDate,
   designationId,
   departmentId,
@@ -1102,10 +1138,20 @@ async function hireCandidateInTransaction({
   // The sent offer snapshot is the offer letter. Hiring must not create a
   // second draft HR letter after marking the candidate hired; it converts the offer once.
   const approvedOfferValues = parseOfferValues(candidate.offer_values);
-  const effectiveCnic = cnic ?? candidate.cnic ?? approvedOfferValues.cnic ?? null;
+  const effectiveCnic = cnic || candidate.cnic || approvedOfferValues.cnic || null;
   const normalizedEffectiveCnic = normalizeCnic(effectiveCnic);
   if (!normalizedEffectiveCnic) throw new ApiError(400, "CNIC is required before hiring");
   if (cnicError(effectiveCnic)) throw new ApiError(400, "CNIC must be 13 digits");
+  const effectiveEmail = email === undefined
+    ? String(candidate.email ?? "").trim().toLowerCase()
+    : String(email ?? "").trim().toLowerCase();
+  if (!effectiveEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(effectiveEmail)) {
+    throw new ApiError(400, "Enter a valid email address before hiring");
+  }
+  await assertCandidateEmailAvailable({ orgId, candidateUuid, email: effectiveEmail, conn: db });
+  if (effectiveEmail !== String(candidate.email ?? "").trim().toLowerCase()) {
+    await db.query("UPDATE candidates SET email=?, updated_at=NOW() WHERE uuid=? AND organization_id=?", [effectiveEmail, candidateUuid, orgId]);
+  }
   const effectiveJoiningDate = joiningDate ?? approvedOfferValues.joining_date ?? null;
   const startingSalaryRaw = approvedOfferValues.new_salary;
   const startingSalary = startingSalaryRaw == null || String(startingSalaryRaw).trim() === "" ? null : Number(String(startingSalaryRaw).replace(/,/g, ""));
@@ -1121,6 +1167,24 @@ async function hireCandidateInTransaction({
    * own email check at that point. A candidate hired from a walk-in with no email
    * on file is therefore a normal, complete hire rather than a refused one.
    */
+  /*
+   * Hiring is an EMPLOYMENT, so the same organization-scoped identity rule as
+   * the Employees screen applies here. Without this check the hire path was the
+   * one way around it: a recruiter could create a second current employee with a
+   * CNIC that an existing employee already holds — or hire a person who is still
+   * on another organization's roster. A previous `ex_employee` row does not
+   * block, which is what lets a former employee be rehired normally.
+   *
+   * Runs inside the same transaction as the INSERT below, so the check and the
+   * write cannot be separated by a concurrent hire.
+   */
+  await assertEmploymentIdentityAvailable({
+    executor: db,
+    organizationId: orgId,
+    cnic: normalizedEffectiveCnic,
+    email: effectiveEmail,
+  });
+
   const employeeUuid = randomUUID();
   const [employeeInsert] = await db.query(
     `INSERT INTO employees
@@ -1131,7 +1195,7 @@ async function hireCandidateInTransaction({
       employeeUuid,
       orgId,
       candidate.full_name,
-      candidate.email,
+      effectiveEmail,
       candidate.phone,
       normalizedEffectiveCnic,
       employeeDesignation,
@@ -1235,10 +1299,15 @@ export async function listOffers({
   page = 1,
   limit = 20,
   offset = 0,
+  scopeFilter,
   conn = pool,
 }) {
   const clauses = ["c.organization_id = ?", "c.offer_status IS NOT NULL"];
   const params = [orgId];
+  if (scopeFilter) {
+    clauses.push(scopeFilter.sql);
+    params.push(...scopeFilter.params);
+  }
 
   if (openingUuid) {
     assertUuid(openingUuid, "Job opening UUID");
@@ -1277,6 +1346,7 @@ export async function listOffers({
   return {
     items: rows.map((r) => ({
       ...r,
+      cnic: r.cnic || parseOfferValues(r.offer_values).cnic || null,
       // Mirrors hrLetters.getLetter: a verify URL is only meaningful once issued,
       // because the QR token is minted at issue time.
       verify_url: r.qr_token && r.letter_status === "issued" ? `/verify/${r.qr_token}` : null,
@@ -1327,6 +1397,8 @@ export async function sendOffer({ orgId, actorUuid, candidateUuid, conn = pool }
   try {
     if (own) await db.beginTransaction();
     const candidate = await loadCandidate({ orgId, candidateUuid, conn: db, forUpdate: true });
+    // Sending an offer is allowed for legacy candidates whose email is already
+    // associated with a user, employee, or another application.
     await assertInterviewFeedbackRecorded({ orgId, candidateUuid, conn: db });
     if (!["selected", "offered"].includes(candidate.stage)) throw new ApiError(409, "Only a selected candidate can receive an offer");
     if (!candidate.email) throw new ApiError(409, "Add the candidate?s email address before sending the offer");
@@ -1398,7 +1470,7 @@ export async function downloadOfferPdf({ orgId, candidateUuid, conn = pool }) {
     employeeName: context.full_name,
     organizationName: context.organization_name,
   });
-  return { buffer, filename: `${referenceNo.replace(/[^\\w.-]+/g, "-")}.pdf` };
+  return { buffer, filename: `${referenceNo.replace(/[^\w.-]+/g, "-")}.pdf` };
 }
 
 /**
@@ -1419,7 +1491,7 @@ export async function downloadOfferPdf({ orgId, candidateUuid, conn = pool }) {
  * something. The controller handles the field it still receives on the body.
  */
 export async function respondToOffer({
-  orgId, actorUuid, candidateUuid, joiningDate, cnic,
+  orgId, actorUuid, candidateUuid, joiningDate, cnic, email,
   designationId, departmentId, emergencyContact, comments, conn = pool,
 }) {
   const candidate = await loadCandidate({ orgId, candidateUuid, conn, forUpdate: true });
@@ -1427,7 +1499,7 @@ export async function respondToOffer({
     throw new ApiError(409, "Only a sent offer can be marked hired");
   }
   return hireCandidate({
-    orgId, actorUuid, candidateUuid, cnic, joiningDate, designationId, departmentId,
+    orgId, actorUuid, candidateUuid, cnic, email, joiningDate, designationId, departmentId,
     emergencyContact, offerAcceptance: true, responseNotes: comments, conn,
   });
 }
@@ -1564,6 +1636,8 @@ export async function scheduleInterview({
     throw new ApiError(400, "scheduled_at must be a valid date and time");
   }
 
+  if (!interviewerUuid) throw new ApiError(400, "Select an interviewer before scheduling this interview");
+
   const candidate = await loadCandidate({ orgId, candidateUuid, conn });
 
   // Booking someone for an interview while they are still in `applied` records a
@@ -1581,6 +1655,17 @@ export async function scheduleInterview({
 
   if (interviewerUuid) {
     assertUuid(interviewerUuid, "Interviewer UUID");
+    const [[userInterviewer]] = await conn.query(
+      "SELECT uuid FROM users WHERE uuid=? AND organization=? AND status='active' LIMIT 1",
+      [interviewerUuid, orgId],
+    );
+    if (!userInterviewer) {
+      const [[employeeInterviewer]] = await conn.query(
+        "SELECT uuid FROM employees WHERE uuid=? AND organization_id=? LIMIT 1",
+        [interviewerUuid, orgId],
+      );
+      if (!employeeInterviewer) throw new ApiError(400, "Choose an active user in this organization as the interviewer");
+    }
   }
 
   const uuid = randomUUID();
@@ -1624,14 +1709,17 @@ export async function scheduleInterview({
 
   try {
     const [[opening]] = await conn.query("SELECT title FROM job_openings WHERE uuid=? AND organization_id=?", [candidate.job_opening_uuid, orgId]);
-    const [[interviewer]] = interviewerUuid
+    const [[interviewerUser]] = interviewerUuid
+      ? await conn.query("SELECT uuid, email, full_name FROM users WHERE uuid=? AND organization=? AND status='active' LIMIT 1", [interviewerUuid, orgId])
+      : [[]];
+    const [[legacyInterviewer]] = interviewerUuid && !interviewerUser
       ? await conn.query(
           `SELECT e.email, e.linked_user_uuid, e.full_name FROM employees e
             WHERE e.uuid=? AND e.organization_id=? LIMIT 1`,
-          [interviewerUuid, orgId]
+          [interviewerUuid, orgId],
         )
       : [[]];
-    const actionUrl = notificationActionUrl("/org/recruitment/interviews");
+    const interviewer = interviewerUser ? { ...interviewerUser, linked_user_uuid: interviewerUser.uuid } : legacyInterviewer;
     const dateLabel = new Date(scheduledAt).toLocaleString("en-PK", { dateStyle: "medium", timeStyle: "short", timeZone: "Asia/Karachi" });
     const deliveries = [queueNotificationEmail({
       category: "recruitment",
@@ -1640,7 +1728,6 @@ export async function scheduleInterview({
       subject: `Interview scheduled — ${opening?.title || "your application"}`,
       title: "Your interview is scheduled",
       message: `Your interview for ${opening?.title || "the position"} is scheduled for ${dateLabel}${mode ? ` (${mode})` : ""}${location ? ` at ${location}` : ""}.`,
-      actionUrl,
     })];
     if (interviewer?.email || interviewer?.linked_user_uuid) {
       deliveries.push(queueNotificationEmail({
@@ -1651,7 +1738,7 @@ export async function scheduleInterview({
         subject: `Interview scheduled — ${candidate.full_name}`,
         title: "Interview added to your schedule",
         message: `You are scheduled to interview ${candidate.full_name} for ${opening?.title || "a position"} on ${dateLabel}.`,
-        actionUrl,
+        actionUrl: notificationActionUrl("/my-interviews"),
       }));
     }
     await Promise.allSettled(deliveries);
@@ -1706,6 +1793,23 @@ export async function getInterview({ orgId, interviewUuid, conn = pool }) {
  * The `total` count reuses the SAME WHERE clause as the page query, so the page
  * count cannot disagree with what a page actually contains.
  */
+export async function listInterviewers({ orgId, scopeFilter, conn = pool }) {
+  const scopeSql = scopeFilter ? ` AND ${scopeFilter.sql}` : "";
+  const [rows] = await conn.query(
+    `SELECT DISTINCT u.uuid, u.full_name, u.email, u.org_role,
+            dg.name AS designation, dp.name AS department
+       FROM users u
+       LEFT JOIN employees e
+         ON e.linked_user_uuid=u.uuid AND e.organization_id=u.organization AND e.status IN ('current_employee','active')
+       LEFT JOIN designations dg ON dg.id=e.designation_id
+       LEFT JOIN departments dp ON dp.id=e.department_id
+      WHERE u.organization=? AND u.status='active' AND (u.org_role IN ('org_admin','sub_admin') OR e.uuid IS NOT NULL)${scopeSql}
+      ORDER BY u.full_name ASC`,
+    [orgId, ...(scopeFilter?.params ?? [])],
+  );
+  return rows;
+}
+
 export async function listInterviews({
   orgId,
   candidateUuid,
@@ -1713,10 +1817,15 @@ export async function listInterviews({
   page = 1,
   limit = 20,
   offset = 0,
+  scopeFilter,
   conn = pool,
 }) {
   const clauses = ["i.organization_id = ?"];
   const params = [orgId];
+  if (scopeFilter) {
+    clauses.push(`EXISTS (SELECT 1 FROM candidates scoped_candidate WHERE scoped_candidate.uuid=i.candidate_uuid AND scoped_candidate.organization_id=i.organization_id AND ${scopeFilter.sql.replace(/\bc\./g, "scoped_candidate.")})`);
+    params.push(...scopeFilter.params);
+  }
   if (candidateUuid) {
     assertUuid(candidateUuid, "Candidate UUID");
     clauses.push("i.candidate_uuid = ?");
@@ -1740,10 +1849,17 @@ export async function listInterviews({
   );
 
   const [rows] = await conn.query(
-    `SELECT i.*, c.full_name AS candidate_name
+    `SELECT i.*, c.full_name AS candidate_name,
+            COALESCE(u.full_name, iu.full_name, e.full_name) AS interviewer_name,
+            COALESCE(u.email, iu.email, e.email) AS interviewer_email,
+            COALESCE(dg.name, idg.name) AS interviewer_designation
        FROM interviews i
-       LEFT JOIN candidates c
-         ON c.uuid = i.candidate_uuid AND c.organization_id = i.organization_id
+       LEFT JOIN candidates c ON c.uuid=i.candidate_uuid AND c.organization_id=i.organization_id
+       LEFT JOIN users u ON u.uuid=i.interviewer_uuid AND u.organization=i.organization_id
+       LEFT JOIN employees e ON e.uuid=i.interviewer_uuid AND e.organization_id=i.organization_id
+       LEFT JOIN users iu ON iu.uuid=e.linked_user_uuid AND iu.organization=i.organization_id
+       LEFT JOIN designations dg ON dg.id=(SELECT e2.designation_id FROM employees e2 WHERE e2.linked_user_uuid=u.uuid AND e2.organization_id=i.organization_id LIMIT 1)
+       LEFT JOIN designations idg ON idg.id=e.designation_id
       WHERE ${where}
       ORDER BY i.scheduled_at DESC, i.created_at DESC
       LIMIT ? OFFSET ?`,
@@ -1765,6 +1881,58 @@ export async function listInterviews({
  * meeting that has not happened is how a decision gets recorded without anyone
  * having actually met, which is the failure this whole module exists to prevent.
  */
+export async function listMyInterviews({
+  orgId, userUuid, search, status, fromDate, toDate,
+  page = 1, limit = 100, offset = 0, conn = pool,
+}) {
+  assertUuid(userUuid, "User UUID");
+  const clauses = [
+    "i.organization_id=?",
+    "(i.interviewer_uuid=? OR i.interviewer_uuid IN (SELECT e.uuid FROM employees e WHERE e.organization_id=? AND e.linked_user_uuid=?))",
+  ];
+  const params = [orgId, userUuid, orgId, userUuid];
+  if (status) {
+    if (!INTERVIEW_STATUSES.includes(status)) throw new ApiError(400, "Invalid interview status");
+    clauses.push("i.status=?");
+    params.push(status);
+  }
+  if (fromDate) {
+    clauses.push("DATE(i.scheduled_at)>=?");
+    params.push(isoDate(fromDate));
+  }
+  if (toDate) {
+    clauses.push("DATE(i.scheduled_at)<=?");
+    params.push(isoDate(toDate));
+  }
+  if (search?.trim()) {
+    clauses.push("c.full_name LIKE ?");
+    params.push(`%${search.trim()}%`);
+  }
+  const where = clauses.join(" AND ");
+  const effectiveOffset = offset || (page - 1) * limit;
+  const [[{ total }]] = await conn.query(
+    `SELECT COUNT(*) AS total FROM interviews i
+       LEFT JOIN candidates c ON c.uuid=i.candidate_uuid AND c.organization_id=i.organization_id
+      WHERE ${where}`,
+    params,
+  );
+  const [rows] = await conn.query(
+    `SELECT i.*, c.full_name AS candidate_name,
+            COALESCE(u.full_name, iu.full_name, e.full_name) AS interviewer_name,
+            COALESCE(u.email, iu.email, e.email) AS interviewer_email
+       FROM interviews i
+       LEFT JOIN candidates c ON c.uuid=i.candidate_uuid AND c.organization_id=i.organization_id
+       LEFT JOIN users u ON u.uuid=i.interviewer_uuid AND u.organization=i.organization_id
+       LEFT JOIN employees e ON e.uuid=i.interviewer_uuid AND e.organization_id=i.organization_id
+       LEFT JOIN users iu ON iu.uuid=e.linked_user_uuid AND iu.organization=i.organization_id
+      WHERE ${where}
+      ORDER BY i.scheduled_at ASC, i.created_at DESC
+      LIMIT ? OFFSET ?`,
+    [...params, limit, effectiveOffset],
+  );
+  return { items: rows.map((r) => ({ ...r, rating: r.rating === null ? null : money(r.rating) })), total: Number(total), page, limit };
+}
+
 export async function recordInterviewFeedback({
   orgId,
   actorUuid,
@@ -1776,6 +1944,14 @@ export async function recordInterviewFeedback({
   conn = pool,
 }) {
   const interview = await loadInterview({ orgId, interviewUuid, conn, forUpdate: true });
+
+  const [[legacyAssignment]] = await conn.query(
+    "SELECT uuid FROM employees WHERE uuid=? AND organization_id=? AND linked_user_uuid=? LIMIT 1",
+    [interview.interviewer_uuid, orgId, actorUuid],
+  );
+  if (!actorUuid || (interview.interviewer_uuid !== actorUuid && !legacyAssignment)) {
+    throw new ApiError(403, "Only the assigned interviewer can record feedback for this interview");
+  }
 
   if (status === "cancelled") {
     if (outcome && outcome !== "pending") {
@@ -1955,13 +2131,14 @@ export async function parseResumeFile({ filePath }) {
  * JavaScript: a busy opening has thousands of applications and the board only
  * needs the shape of it.
  */
-export async function getPipelineBoard({ orgId, openingUuid, conn = pool }) {
+export async function getPipelineBoard({ orgId, openingUuid, scopeFilter, conn = pool }) {
   const opening = await loadOpening({ orgId, openingUuid, conn });
+  const scopeSql = scopeFilter ? ` AND ${scopeFilter.sql}` : "";
   const [counts] = await conn.query(
-    `SELECT stage, COUNT(*) AS n FROM candidates
-      WHERE organization_id=? AND job_opening_uuid=?
-      GROUP BY stage`,
-    [orgId, openingUuid]
+    `SELECT c.stage, COUNT(*) AS n FROM candidates c
+      WHERE c.organization_id=? AND c.job_opening_uuid=?${scopeSql}
+      GROUP BY c.stage`,
+    [orgId, openingUuid, ...(scopeFilter?.params ?? [])]
   );
 
   const byStage = new Map(counts.map((r) => [r.stage, Number(r.n)]));
@@ -1982,11 +2159,13 @@ export async function getPipelineBoard({ orgId, openingUuid, conn = pool }) {
 
 /** Prepare the offer snapshot and leave it ready for direct email dispatch. */
 export async function startCandidateOffer({
-  orgId, actorUuid, candidateUuid, overrideFailedInterviewReason = null,
-  overrideFailedInterviewAuthorized = false, offerTemplateUuid, offerValues = {}, conn = pool,
+  orgId, actorUuid, candidateUuid, offerTemplateUuid, offerValues = {}, conn = pool,
 }) {
   assertUuid(candidateUuid, "Candidate UUID");
   const candidate = await loadCandidate({ orgId, candidateUuid, conn });
+  // A candidate may share an email with an existing platform user/employee or
+  // have applied to another opening with the same address. That must not block
+  // preparing an offer; identity uniqueness is enforced when employment is created.
   if (!["selected", "offered"].includes(candidate.stage)) throw new ApiError(409, "Only a selected candidate can receive an offer");
   await assertInterviewFeedbackRecorded({ orgId, candidateUuid, conn });
   if (["sent", "hired"].includes(candidate.offer_status)) {
@@ -2015,13 +2194,7 @@ export async function startCandidateOffer({
     throw new ApiError(409, "This opening requires a passed final interview before an offer can be prepared");
   }
   if (finalOutcome === "failed") {
-    if (!overrideFailedInterviewAuthorized) throw new ApiError(403, "The final interview failed; an authorized exception with a reason is required");
-    if (!overrideFailedInterviewReason?.trim()) throw new ApiError(400, "An override reason is required");
-    if (overrideFailedInterviewReason.trim().length > 1000) throw new ApiError(400, "The interview override reason must be 1000 characters or fewer");
-    await conn.query(
-      "UPDATE candidates SET failed_interview_override_reason=?, failed_interview_override_by_uuid=?, failed_interview_override_at=NOW() WHERE uuid=? AND organization_id=?",
-      [overrideFailedInterviewReason.trim(), actorUuid, candidate.uuid, orgId]
-    );
+    throw new ApiError(409, "The final interview was failed; an offer cannot be prepared for this candidate.");
   }
   const offerValuesJson = JSON.stringify(prepared.values);
   const snapshotHash = createHash("sha256").update(stableJson({ template_uuid: prepared.template_uuid, values: prepared.values, body: prepared.rendered_body })).digest("hex");
@@ -2037,6 +2210,6 @@ export async function startCandidateOffer({
   }
   logAudit({ actorType: "user", actorId: actorUuid ?? null, action: "candidate.offer.start",
     entityType: ATTACHMENT_ENTITY.CANDIDATE, entityId: candidateUuid,
-    details: { stage: "offered", offer_status: "ready", interview_override: finalOutcome === "failed" } });
+    details: { stage: "offered", offer_status: "ready" } });
   return { candidate: await getCandidate({ orgId, candidateUuid, conn }) };
 }

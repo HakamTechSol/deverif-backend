@@ -7,6 +7,7 @@ import {
   getOpening,
   listOpenings,
   listInterviews,
+  listMyInterviews,
   createCandidate,
   getCandidate,
   listCandidates,
@@ -30,7 +31,7 @@ import {
  * WHY A REAL DATABASE. Every meaningful rule here is a WHERE clause or a foreign
  * key rather than an `if`: the allowed-transition table, the one-shot conversion
  * guard (`converted_employee_uuid IS NULL AND stage='offered'`), the tenant foreign
- * keys, the duplicate-application unique key, the interview double-booking key. A
+ * keys, phone/CNIC duplicate guards, the interview double-booking key. A
  * mocked pool can be told to return success; it cannot tell you a query refuses to
  * match a row it should not, and that refusal IS the guarantee. The 20261115 schema
  * probe also showed the tenant FKs silently allowing a NULL department_id through,
@@ -386,15 +387,15 @@ describe.runIf(HAS_DB)("a candidate application", () => {
     expect(candidate.converted_employee_uuid).toBeNull();
   });
 
-  it("refuses the same person applying twice for the SAME opening", async () => {
+  it("allows a duplicate email with a warning instead of blocking candidate creation", async () => {
     const opening = await open();
-    await apply(opening.uuid, { email: "twice@example.com" });
+    const first = await apply(opening.uuid, { email: "twice@example.com" });
+    const second = await apply(opening.uuid, { email: "twice@example.com" });
 
-    // The unique key is (job_opening_uuid, email). Without it the pipeline board
-    // shows one human as two candidates, each occupying a slot.
-    await expect(
-      apply(opening.uuid, { email: "twice@example.com" }),
-    ).rejects.toThrow(/already applied/i);
+    expect(first.uuid).toBeTruthy();
+    expect(second.uuid).toBeTruthy();
+    expect(second.uuid).not.toBe(first.uuid);
+    expect(second.email_duplicate).toBe(true);
   });
 
   it("allows the same person to apply for a DIFFERENT opening", async () => {
@@ -406,15 +407,17 @@ describe.runIf(HAS_DB)("a candidate application", () => {
     // refuse it, or people apply once and hide their interest elsewhere.
     const again = await apply(second.uuid, { email: "active@example.com" });
     expect(again.uuid).toBeTruthy();
+    expect(again.email_duplicate).toBe(true);
   });
 
   it("treats the same email in different case as the same person", async () => {
     const opening = await open();
     await apply(opening.uuid, { email: "Case@Example.com" });
-    // Lowercased before the insert, or the unique index would let this straight past.
-    await expect(apply(opening.uuid, { email: "case@example.com" })).rejects.toThrow(
-      /already applied/i,
-    );
+    // The duplicate check is case-insensitive and warns, but both applications
+    // are retained until a unique email is required for an offer.
+    const again = await apply(opening.uuid, { email: "case@example.com" });
+    expect(again.email).toBe("case@example.com");
+    expect(again.email_duplicate).toBe(true);
   });
 
   it("is invisible to another organization", async () => {
@@ -582,7 +585,7 @@ describe.runIf(HAS_DB)("interviews", () => {
         await scheduleInterview({
           orgId,
           candidateUuid: candidate.uuid,
-          interviewerUuid: "22222222-2222-4222-8222-222222222222",
+          interviewerUuid: adminUuid,
           scheduledAt: at,
           conn: db,
         }),
@@ -630,6 +633,7 @@ describe.runIf(HAS_DB)("interviews", () => {
       await scheduleInterview({
         orgId,
         candidateUuid: candidate.uuid,
+        interviewerUuid: adminUuid,
         scheduledAt: at,
         conn: db,
       });
@@ -653,6 +657,7 @@ describe.runIf(HAS_DB)("interviews", () => {
         orgId,
         candidateUuid: candidate.uuid,
         scheduledAt: "2026-12-01 10:00:00",
+        interviewerUuid: adminUuid,
         conn: db,
       }),
     ).rejects.toThrow(/interview stage/i);
@@ -667,7 +672,7 @@ describe.runIf(HAS_DB)("interviews", () => {
     const interview = await scheduleInterview({
       orgId,
       candidateUuid: candidate.uuid,
-      interviewerUuid: "11111111-1111-4111-8111-111111111111",
+      interviewerUuid: adminUuid,
       scheduledAt: "2026-12-01 10:00:00",
       mode: "video",
       conn: db,
@@ -682,7 +687,7 @@ describe.runIf(HAS_DB)("interviews", () => {
     const candidate = await apply(opening.uuid);
     await toInterview(candidate.uuid);
 
-    const interviewer = "22222222-2222-4222-8222-222222222222";
+    const interviewer = adminUuid;
     const when = "2026-12-05 14:00:00";
     await scheduleInterview({ orgId, candidateUuid: candidate.uuid, interviewerUuid: interviewer, scheduledAt: when, conn: db });
 
@@ -701,11 +706,13 @@ describe.runIf(HAS_DB)("interviews", () => {
       orgId,
       candidateUuid: candidate.uuid,
       scheduledAt: "2026-12-08 09:00:00",
+      interviewerUuid: adminUuid,
       conn: db,
     });
 
     const done = await recordInterviewFeedback({
       orgId,
+      actorUuid: adminUuid,
       interviewUuid: interview.uuid,
       status: "completed",
       outcome: "passed",
@@ -722,11 +729,39 @@ describe.runIf(HAS_DB)("interviews", () => {
     await expect(
       recordInterviewFeedback({
         orgId,
+        actorUuid: adminUuid,
         interviewUuid: interview.uuid,
         outcome: "failed",
         conn: db,
       }),
     ).rejects.toThrow(/already been recorded/i);
+  });
+
+  it("shows only interviews assigned to the current user and refuses another user's feedback", async () => {
+    const opening = await open();
+    const candidate = await apply(opening.uuid);
+    await toInterview(candidate.uuid);
+    const interview = await scheduleInterview({
+      orgId,
+      candidateUuid: candidate.uuid,
+      interviewerUuid: adminUuid,
+      scheduledAt: "2026-12-10 09:00:00",
+      conn: db,
+    });
+
+    const mine = await listMyInterviews({ orgId, userUuid: adminUuid, conn: db });
+    const approverMine = await listMyInterviews({ orgId, userUuid: approverUuid, conn: db });
+    expect(mine.items.some((item) => item.uuid === interview.uuid)).toBe(true);
+    expect(approverMine.items.some((item) => item.uuid === interview.uuid)).toBe(false);
+
+    await expect(recordInterviewFeedback({
+      orgId,
+      actorUuid: approverUuid,
+      interviewUuid: interview.uuid,
+      status: "completed",
+      outcome: "passed",
+      conn: db,
+    })).rejects.toThrow(/assigned interviewer/i);
   });
 
   it("keeps the interview rating separate from the candidate's overall rating", async () => {
@@ -737,10 +772,12 @@ describe.runIf(HAS_DB)("interviews", () => {
       orgId,
       candidateUuid: candidate.uuid,
       scheduledAt: "2026-12-09 09:00:00",
+      interviewerUuid: adminUuid,
       conn: db,
     });
     await recordInterviewFeedback({
       orgId,
+      actorUuid: adminUuid,
       interviewUuid: interview.uuid,
       outcome: "passed",
       rating: 5,

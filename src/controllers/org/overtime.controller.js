@@ -4,6 +4,7 @@ import { ok, created } from "../../utils/response.js";
 import { assertUuid } from "../../utils/publicResponse.js";
 import { parsePagination, paginatedResponse } from "../../utils/pagination.js";
 import { logAudit, getActorFromReq } from "../../utils/auditLog.js";
+import { employeeScopeCondition, assertEmployeeInDataScope } from "../../utils/dataScopes.js";
 
 /**
  * Overtime requests and their approval.
@@ -53,6 +54,7 @@ export async function createOvertimeRequest(req, res) {
   const orgId = req.scopeOrgId ?? req.user?.organization;
   const { employee_uuid, work_date, requested_hours, reason } = req.body || {};
   const employee = await employeeInOrg(orgId, employee_uuid);
+  await assertEmployeeInDataScope(req, "attendance", employee.uuid);
 
   if (!isValidDate(work_date)) throw new ApiError(400, "work_date must be a valid YYYY-MM-DD date");
   const hours = hoursField(requested_hours, "requested_hours");
@@ -107,6 +109,11 @@ export async function listOvertimeRequests(req, res) {
 
   const clauses = ["orq.organization_id = ?"];
   const params = [orgId];
+  const scopeFilter = employeeScopeCondition(req, "attendance", "e");
+  if (scopeFilter) {
+    clauses.push(`EXISTS (SELECT 1 FROM employees e WHERE e.uuid=orq.employee_uuid AND e.organization_id=orq.organization_id AND ${scopeFilter.sql})`);
+    params.push(...scopeFilter.params);
+  }
 
   if (req.query.status) {
     const s = String(req.query.status);
@@ -165,6 +172,7 @@ export async function decideOvertimeRequest(req, res) {
   );
   if (!rows.length) throw new ApiError(404, "Overtime request not found");
   const existing = rows[0];
+  await assertEmployeeInDataScope(req, "attendance", existing.employee_uuid);
 
   if (existing.status !== "pending") {
     // Deciding twice is how an approved claim quietly becomes a rejected one with

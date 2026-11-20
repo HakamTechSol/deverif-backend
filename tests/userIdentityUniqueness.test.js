@@ -151,6 +151,34 @@ describe("rethrowIdentityDuplicate", () => {
     }
   });
 
+  it("turns a per-organization employment CNIC violation into a readable 409", () => {
+    const err = new Error(
+      "Duplicate entry '5-4210123456789' for key 'uq_employees_org_active_cnic'"
+    );
+    try {
+      rethrowIdentityDuplicate(err);
+      throw new Error("should have thrown");
+    } catch (e) {
+      expect(e.statusCode).toBe(409);
+      expect(e.message).toMatch(/already exists in this organization/i);
+      expect(e.message).not.toMatch(/key '|Duplicate entry|another user/);
+    }
+  });
+
+  it("turns a per-organization employment email violation into a readable 409", () => {
+    const err = new Error(
+      "Duplicate entry '5-a@b.com' for key 'uq_employees_org_active_email'"
+    );
+    try {
+      rethrowIdentityDuplicate(err);
+      throw new Error("should have thrown");
+    } catch (e) {
+      expect(e.statusCode).toBe(409);
+      expect(e.message).toMatch(/already exists in this organization/i);
+      expect(e.message).not.toMatch(/key '|Duplicate entry/);
+    }
+  });
+
   it("never leaks a raw index name for any other unique key", () => {
     const err = new Error("Duplicate entry 'a@b.com' for key 'email'");
     try {

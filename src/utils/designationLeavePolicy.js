@@ -17,5 +17,20 @@ export async function applyDesignationLeavePolicies(conn, organizationId, employ
     [employeeUuid, organizationId, designationId, currentYear]
   );
 
+  await conn.query(
+    `INSERT INTO leave_balance_ledger
+       (employee_uuid, leave_type_id, allocation_id, transaction_type,
+        credited_days, debited_days, previous_balance, updated_balance, reason)
+     SELECT ela.employee_uuid, ela.leave_type_id, ela.id, 'allocation',
+            ela.remaining_days, 0, 0, ela.remaining_days,
+            CONCAT('Initial designation policy allocation for ', ela.year, '.')
+     FROM employee_leave_allocations ela
+     WHERE ela.employee_uuid=? AND ela.year>=?
+       AND NOT EXISTS (
+         SELECT 1 FROM leave_balance_ledger ledger WHERE ledger.allocation_id=ela.id
+       )`,
+    [employeeUuid, currentYear],
+  );
+
   return result.affectedRows;
 }

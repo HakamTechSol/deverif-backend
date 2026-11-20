@@ -204,37 +204,6 @@ BEGIN
   END IF;
 END */;;
 DELIMITER ;
-CREATE TABLE IF NOT EXISTS `asset_categories` (
-  `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT,
-  `uuid` char(36) NOT NULL,
-  `organization_id` bigint(20) unsigned NOT NULL,
-  `name` varchar(120) NOT NULL,
-  `description` varchar(500) DEFAULT NULL,
-  `default_lifespan_months` int(10) unsigned DEFAULT NULL,
-  `is_active` tinyint(1) NOT NULL DEFAULT 1,
-  `created_by_uuid` char(36) DEFAULT NULL,
-  `created_at` datetime NOT NULL DEFAULT current_timestamp(),
-  `updated_at` datetime NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp(),
-  PRIMARY KEY (`id`),
-  UNIQUE KEY `uk_asset_categories_uuid` (`uuid`),
-  UNIQUE KEY `uk_asset_categories_org_name` (`organization_id`,`name`),
-  UNIQUE KEY `uk_asset_categories_uuid_org` (`uuid`,`organization_id`),
-  KEY `idx_asset_categories_org` (`organization_id`,`is_active`),
-  KEY `fk_asset_categories_creator` (`created_by_uuid`),
-  CONSTRAINT `fk_asset_categories_creator` FOREIGN KEY (`created_by_uuid`) REFERENCES `users` (`uuid`) ON DELETE SET NULL,
-  CONSTRAINT `fk_asset_categories_org` FOREIGN KEY (`organization_id`) REFERENCES `organizations` (`id`) ON DELETE CASCADE
-) ENGINE=InnoDB AUTO_INCREMENT=273 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
-DROP TRIGGER IF EXISTS `bi_asset_categories_uuid`;
-DELIMITER ;;
-/*!50003 CREATE*/ /*!50017 DEFINER=`root`@`localhost`*/ /*!50003 TRIGGER `bi_asset_categories_uuid`
-BEFORE INSERT ON `asset_categories`
-FOR EACH ROW
-BEGIN
-  IF NEW.`uuid` IS NULL OR NEW.`uuid` = '' THEN
-    SET NEW.`uuid` = UUID();
-  END IF;
-END */;;
-DELIMITER ;
 CREATE TABLE IF NOT EXISTS `asset_maintenance` (
   `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT,
   `uuid` char(36) NOT NULL,
@@ -279,7 +248,6 @@ CREATE TABLE IF NOT EXISTS `assets` (
   `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT,
   `uuid` char(36) NOT NULL,
   `organization_id` bigint(20) unsigned NOT NULL,
-  `category_uuid` char(36) NOT NULL,
   `asset_tag` varchar(40) NOT NULL,
   `name` varchar(200) NOT NULL,
   `model_details` varchar(200) DEFAULT NULL,
@@ -299,12 +267,9 @@ CREATE TABLE IF NOT EXISTS `assets` (
   UNIQUE KEY `uk_assets_org_tag` (`organization_id`,`asset_tag`),
   UNIQUE KEY `uk_assets_single_holder` (`active_assignment_guard`),
   KEY `idx_assets_org_status` (`organization_id`,`status`),
-  KEY `idx_assets_category` (`category_uuid`),
   KEY `idx_assets_serial` (`organization_id`,`serial_number`),
   KEY `idx_assets_purchase_date` (`organization_id`,`purchase_date`),
   KEY `fk_assets_creator` (`created_by_uuid`),
-  KEY `fk_assets_category_same_org` (`category_uuid`,`organization_id`),
-  CONSTRAINT `fk_assets_category_same_org` FOREIGN KEY (`category_uuid`, `organization_id`) REFERENCES `asset_categories` (`uuid`, `organization_id`) ON DELETE CASCADE,
   CONSTRAINT `fk_assets_creator` FOREIGN KEY (`created_by_uuid`) REFERENCES `users` (`uuid`) ON DELETE SET NULL,
   CONSTRAINT `fk_assets_org` FOREIGN KEY (`organization_id`) REFERENCES `organizations` (`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB AUTO_INCREMENT=433 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
@@ -1410,6 +1375,25 @@ BEGIN
   END IF;
 END */;;
 DELIMITER ;
+CREATE TABLE IF NOT EXISTS `monthly_salary_variables` (
+  `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+  `uuid` char(36) NOT NULL,
+  `organization_id` bigint(20) unsigned NOT NULL,
+  `employee_uuid` char(36) NOT NULL,
+  `label` varchar(150) NOT NULL,
+  `type` enum('allowance','deduction') NOT NULL,
+  `amount` decimal(14,2) NOT NULL,
+  `month` tinyint(3) unsigned NOT NULL,
+  `year` smallint(5) unsigned NOT NULL,
+  `created_by` bigint(20) unsigned DEFAULT NULL,
+  `created_at` datetime NOT NULL DEFAULT current_timestamp(),
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_msv_uuid` (`uuid`),
+  KEY `idx_msv_period_employee` (`organization_id`,`employee_uuid`,`year`,`month`),
+  CONSTRAINT `fk_msv_org` FOREIGN KEY (`organization_id`) REFERENCES `organizations` (`id`) ON DELETE CASCADE,
+  CONSTRAINT `fk_msv_employee` FOREIGN KEY (`employee_uuid`) REFERENCES `employees` (`uuid`) ON DELETE CASCADE,
+  CONSTRAINT `fk_msv_created_by` FOREIGN KEY (`created_by`) REFERENCES `users` (`id`) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 CREATE TABLE IF NOT EXISTS `salary_record_lines` (
   `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT,
   `uuid` char(36) NOT NULL,
@@ -1420,7 +1404,7 @@ CREATE TABLE IF NOT EXISTS `salary_record_lines` (
   `year` smallint(5) unsigned NOT NULL,
   `label` varchar(150) NOT NULL,
   `type` enum('earning','deduction') NOT NULL,
-  `source` enum('basic','component','auto_unpaid_leave','auto_absenteeism','auto_late','auto_overtime','auto_expense','manual') NOT NULL,
+  `source` enum('basic','component','monthly_variable','auto_unpaid_leave','auto_absenteeism','auto_late','auto_overtime','auto_expense','manual') NOT NULL,
   `amount` decimal(14,2) NOT NULL DEFAULT 0.00,
   `basis_value` decimal(10,2) DEFAULT NULL,
   `basis_unit` enum('days','hours','late_arrivals','claims') DEFAULT NULL,

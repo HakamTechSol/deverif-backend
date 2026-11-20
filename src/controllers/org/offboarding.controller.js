@@ -1,5 +1,6 @@
 import ApiError from "../../utils/ApiError.js";
 import { pool } from "../../config/db.js";
+import { employeeScopeCondition, assertEmployeeInDataScope } from "../../utils/dataScopes.js";
 import { ok, created } from "../../utils/response.js";
 import { assertUuid } from "../../utils/publicResponse.js";
 import { parsePagination, paginatedResponse } from "../../utils/pagination.js";
@@ -15,6 +16,10 @@ import {
   processSettlement,
   completeExit,
   getMyExit,
+  listClearanceTemplates,
+  createClearanceTemplate,
+  updateClearanceTemplate,
+  deleteClearanceTemplate,
 } from "../../services/offboarding.service.js";
 import { isoDate } from "../../utils/dateRange.js";
 import { sendOffboardingUpdateEmail } from "../../utils/mailer.js";
@@ -55,8 +60,16 @@ async function callerEmployee(orgId, req) {
  * checklists are useful for the exit in front of you; this answers the other
  * question, which is how many exits are in flight and who is holding each one up.
  */
+async function scopedExit(req, exitUuid) {
+  const detail = await getExitRequest({ orgId: req.scopeOrgId, exitUuid });
+  await assertEmployeeInDataScope(req, "offboarding", detail.employee_uuid);
+  return detail;
+}
+
 export async function listExitChecklistPending(req, res) {
   const orgId = req.scopeOrgId;
+  const scopeFilter = employeeScopeCondition(req, "offboarding", "e");
+  const scopeSql = scopeFilter ? ` AND EXISTS (SELECT 1 FROM employees e WHERE e.uuid=er.employee_uuid AND e.organization_id=er.organization_id AND ${scopeFilter.sql})` : "";
   const [rows] = await pool.query(
     `SELECT er.uuid AS exit_request_uuid, er.employee_uuid, er.employee_name, er.designation,
             er.status, er.request_type, er.last_working_day,
@@ -72,11 +85,11 @@ export async function listExitChecklistPending(req, res) {
        JOIN exit_requests er ON er.uuid = c.exit_request_uuid
       WHERE er.organization_id = ?
         AND er.status IN ('pending','approved')
-        AND c.status = 'pending'
+        AND c.status = 'pending'${scopeSql}
       GROUP BY er.uuid, er.employee_uuid, er.employee_name, er.designation,
                er.status, er.request_type, er.last_working_day
       ORDER BY er.last_working_day ASC, er.employee_name`,
-    [orgId],
+    [orgId, ...(scopeFilter?.params ?? [])],
   );
 
   // last_working_day comes back as a Date at local midnight, so it is normalised
@@ -102,6 +115,11 @@ export async function listExitRequests(req, res) {
 
   const clauses = ["er.organization_id = ?"];
   const params = [orgId];
+  const scopeFilter = employeeScopeCondition(req, "offboarding", "e");
+  if (scopeFilter) {
+    clauses.push(`EXISTS (SELECT 1 FROM employees e WHERE e.uuid=er.employee_uuid AND e.organization_id=er.organization_id AND ${scopeFilter.sql})`);
+    params.push(...scopeFilter.params);
+  }
 
   const status = req.query.status ? String(req.query.status) : "";
   if (status) {
@@ -112,9 +130,26 @@ export async function listExitRequests(req, res) {
     params.push(status);
   }
   if (req.query.employee_uuid) {
+    assertUuid(req.query.employee_uuid, "Employee UUID");
     clauses.push("er.employee_uuid = ?");
     params.push(req.query.employee_uuid);
   }
+  const fromDate = typeof req.query.from_date === "string" ? req.query.from_date : "";
+  const toDate = typeof req.query.to_date === "string" ? req.query.to_date : "";
+  if (fromDate && !/^\\d{4}-\\d{2}-\\d{2}$/.test(fromDate)) throw new ApiError(400, "from_date must use YYYY-MM-DD format");
+  if (toDate && !/^\\d{4}-\\d{2}-\\d{2}$/.test(toDate)) throw new ApiError(400, "to_date must use YYYY-MM-DD format");
+  if (fromDate && toDate && fromDate > toDate) throw new ApiError(400, "from_date cannot be after to_date");
+  if (fromDate) { clauses.push("er.last_working_day >= ?"); params.push(fromDate); }
+  if (toDate) { clauses.push("er.last_working_day <= ?"); params.push(toDate); }
+  const department = typeof req.query.department === "string" ? req.query.department.trim() : "";
+  if (department) {
+    clauses.push("EXISTS (SELECT 1 FROM employees ed JOIN departments dp ON dp.id=ed.department_id WHERE ed.uuid=er.employee_uuid AND ed.organization_id=er.organization_id AND dp.organization_id=er.organization_id AND dp.name=?)");
+    params.push(department);
+  }
+  const clearanceStatus = typeof req.query.clearance_status === "string" ? req.query.clearance_status : "";
+  if (clearanceStatus && !["pending", "cleared"].includes(clearanceStatus)) throw new ApiError(400, "clearance_status must be pending or cleared");
+  if (clearanceStatus === "pending") clauses.push("EXISTS (SELECT 1 FROM offboarding_checklists cf WHERE cf.exit_request_uuid=er.uuid AND cf.status='pending')");
+  if (clearanceStatus === "cleared") clauses.push("EXISTS (SELECT 1 FROM offboarding_checklists cf WHERE cf.exit_request_uuid=er.uuid) AND NOT EXISTS (SELECT 1 FROM offboarding_checklists cf WHERE cf.exit_request_uuid=er.uuid AND cf.status='pending')");
   const search = typeof req.query.search === "string" ? req.query.search.trim() : "";
   if (search) {
     // Scoped to this org's own exit records so another tenant's employee name is
@@ -157,7 +192,7 @@ export async function listExitRequests(req, res) {
 }
 
 export async function getExitRequestDetail(req, res) {
-  const detail = await getExitRequest({ orgId: req.scopeOrgId, exitUuid: req.params.uuid });
+  const detail = await scopedExit(req, req.params.uuid);
   return ok(res, { exit_request: detail }, "Exit request");
 }
 
@@ -166,6 +201,7 @@ export async function submitExitRequest(req, res) {
   const { employee_uuid, request_type, last_working_day, reason, hr_notes } =
     req.body || {};
 
+  await assertEmployeeInDataScope(req, "offboarding", employee_uuid);
   if (request_type !== "termination") {
     throw new ApiError(403, "Org Admins can submit termination requests only. Employees must submit their own resignation.");
   }
@@ -215,6 +251,7 @@ export async function submitExitRequest(req, res) {
 
 export async function reviewExitRequest(req, res) {
   const orgId = req.scopeOrgId;
+  await scopedExit(req, req.params.uuid);
   const { decision, last_working_day, decision_notes } = req.body || {};
 
   const detail = await decideExitRequest({
@@ -267,6 +304,7 @@ export async function reviewExitRequest(req, res) {
 }
 
 export async function clearExitChecklistItem(req, res) {
+  await scopedExit(req, req.params.uuid);
   const detail = await clearChecklistItem({
     orgId: req.scopeOrgId,
     actorUuid: req.user?.uuid ?? null,
@@ -279,7 +317,7 @@ export async function clearExitChecklistItem(req, res) {
 
 export async function listExitAssets(req, res) {
   const orgId = req.scopeOrgId;
-  const detail = await getExitRequest({ orgId, exitUuid: req.params.uuid });
+  const detail = await scopedExit(req, req.params.uuid);
   const assets = await getOutstandingAssets({ orgId, employeeUuid: detail.employee_uuid });
   return ok(res, assets, "Assets outstanding");
 }
@@ -297,11 +335,13 @@ export async function listExitAssets(req, res) {
  * see them again.
  */
 export async function previewSettlement(req, res) {
+  await scopedExit(req, req.params.uuid);
   const calc = await calculateSettlement({ orgId: req.scopeOrgId, exitUuid: req.params.uuid });
   return ok(res, calc, "Settlement preview");
 }
 
 export async function draftSettlement(req, res) {
+  await scopedExit(req, req.params.uuid);
   const orgId = req.scopeOrgId;
   const settlement = await saveSettlement({
     orgId,
@@ -327,6 +367,7 @@ export async function draftSettlement(req, res) {
 }
 
 export async function advanceSettlement(req, res) {
+  await scopedExit(req, req.params.uuid);
   const orgId = req.scopeOrgId;
   const target = req.body?.target === "paid" ? "paid" : "processed";
 
@@ -351,6 +392,7 @@ export async function advanceSettlement(req, res) {
 }
 
 export async function completeExitRequest(req, res) {
+  await scopedExit(req, req.params.uuid);
   const orgId = req.scopeOrgId;
   const detail = await completeExit({
     orgId,
@@ -369,6 +411,43 @@ export async function completeExitRequest(req, res) {
   });
 
   return ok(res, { exit_request: detail }, "Exit completed");
+}
+
+// ---------------------------------------------------------------------------
+// Organization clearance template settings
+// ---------------------------------------------------------------------------
+
+export async function listExitClearanceTemplates(req, res) {
+  const items = await listClearanceTemplates({ orgId: req.scopeOrgId });
+  return ok(res, { items }, "Clearance template tasks");
+}
+
+export async function createExitClearanceTemplate(req, res) {
+  const item = await createClearanceTemplate({
+    orgId: req.scopeOrgId,
+    department: req.body?.department,
+    taskName: req.body?.task_name,
+  });
+  logAudit({ ...getActorFromReq(req), action: "offboarding.clearance_template.create", entityType: "offboarding_clearance_template", entityId: item.uuid, details: { department: item.department, task_name: item.task_name }, req });
+  return created(res, { item }, "Clearance task created");
+}
+
+export async function updateExitClearanceTemplate(req, res) {
+  const item = await updateClearanceTemplate({
+    orgId: req.scopeOrgId,
+    uuid: req.params.uuid,
+    department: req.body?.department,
+    taskName: req.body?.task_name,
+    isActive: req.body?.is_active,
+  });
+  logAudit({ ...getActorFromReq(req), action: "offboarding.clearance_template.update", entityType: "offboarding_clearance_template", entityId: item.uuid, details: { department: item.department, task_name: item.task_name, is_active: item.is_active }, req });
+  return ok(res, { item }, "Clearance task updated");
+}
+
+export async function deleteExitClearanceTemplate(req, res) {
+  const result = await deleteClearanceTemplate({ orgId: req.scopeOrgId, uuid: req.params.uuid });
+  logAudit({ ...getActorFromReq(req), action: "offboarding.clearance_template.delete", entityType: "offboarding_clearance_template", entityId: result.uuid, req });
+  return ok(res, result, "Clearance task deleted");
 }
 
 // ---------------------------------------------------------------------------

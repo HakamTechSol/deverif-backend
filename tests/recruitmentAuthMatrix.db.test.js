@@ -86,16 +86,14 @@ const ROUTES = [
   // a post-approval event, so a bare POST could never satisfy it. The entry point is
   // the candidate's response to a sent offer.
   ["POST", "/api/v1/org/applications/11111111-1111-4111-8111-111111111111/start-offer"],
-  // The failed-final-interview exception. Separately gated with
-  // requirePermission("override_failed_interview") and listed separately from
-  // start-offer so the extra permission on it is visible in this matrix rather than
-  // hidden behind a shared entry.
-  ["POST", "/api/v1/org/applications/11111111-1111-4111-8111-111111111111/start-offer/override"],
   ["GET", "/api/v1/org/pipeline"],
   ["GET", "/api/v1/org/pipeline/11111111-1111-4111-8111-111111111111"],
   ["POST", "/api/v1/org/interviews"],
+  ["GET", "/api/v1/org/interviewers"],
   ["GET", "/api/v1/org/interviews"],
   ["POST", "/api/v1/org/interviews/11111111-1111-4111-8111-111111111111/feedback"],
+  ["GET", "/api/v1/org/my/interviews"],
+  ["POST", "/api/v1/org/my/interviews/11111111-1111-4111-8111-111111111111/feedback"],
   ["GET", "/api/v1/org/offers"],
   // Prepare and preview are available before direct offer dispatch.
   ["GET", "/api/v1/org/offers/11111111-1111-4111-8111-111111111111/prepare"],
@@ -136,12 +134,6 @@ beforeAll(async () => {
     ["subAdminWith", "sub_admin", { manage_recruitment: true }],
     ["subAdminWithout", "sub_admin", {}],
     ["employee", "employee", { manage_recruitment: true }],
-    // Holds manage_recruitment AND the failed-interview override. Separate from
-    // subAdminWith on purpose: `override_failed_interview` defaults to DENIED, so a
-    // sub-admin with recruitment rights alone must still be refused at the
-    // override route. Folding the two into one persona would hide that distinction
-    // and make the override route look like it needs no extra permission.
-    ["subAdminWithOverride", "sub_admin", { manage_recruitment: true, override_failed_interview: true }],
   ];
 
   for (const [tag, role, featureAccess] of personas) {
@@ -212,45 +204,29 @@ const call = (method, path, tag) =>
  * What each persona is allowed to reach.
  *
  * org_admin: everything, on the role alone.
- * sub_admin WITH manage_recruitment: everything EXCEPT routes carrying an extra
- *   permission it does not hold (see EXTRA_PERMISSION below).
- * sub_admin WITH manage_recruitment + that extra permission: everything.
+ * sub_admin WITH manage_recruitment: all recruitment routes.
  * sub_admin WITHOUT: nothing. This is the regression.
  * employee: nothing, however many permissions they hold.
  */
 const ALLOWED = {
   orgAdmin: true,
   subAdminWith: true,
-  subAdminWithOverride: true,
   subAdminWithout: false,
   employee: false,
 };
 
 /**
- * Routes that demand a permission beyond manage_recruitment, and the persona that
- * holds it.
- *
- * `start-offer/override` is the only one. It is the route that lets an
- * organization hire someone whose final interview FAILED, so it is deliberately not
- * covered by the recruitment permission: manage_recruitment means "run
- * recruitment", and overriding a failed interview is a rarer, more accountable act.
+ * Interviewer self-service routes are limited to the assigned interviewer.
  */
-const EXTRA_PERMISSION = {
-  "/api/v1/org/applications/11111111-1111-4111-8111-111111111111/start-offer/override": {
-    key: "override_failed_interview",
-    holder: "subAdminWithOverride",
-  },
-};
+const PERSONAL_ASSIGNED_ROUTES = new Set([
+  "/api/v1/org/my/interviews",
+  "/api/v1/org/my/interviews/11111111-1111-4111-8111-111111111111/feedback",
+]);
 
 describe.runIf(HAS_DB)("auth matrix — every recruitment route x every persona", () => {
   for (const [method, path] of ROUTES) {
-    const extra = EXTRA_PERMISSION[path];
     for (const [persona, baseAllowed] of Object.entries(ALLOWED)) {
-      // A persona that does not hold the route's extra permission must be refused,
-      // however much of everything else it holds. org_admin is exempt: hasPermission
-      // short-circuits on the role, so an org admin is never refused a permission
-      // check at all and the extra permission does not restrict them.
-      const allowed = baseAllowed && (!extra || persona === "orgAdmin" || persona === extra.holder);
+      const allowed = PERSONAL_ASSIGNED_ROUTES.has(path) || baseAllowed;
       it(`${persona} ${allowed ? "may" : "may NOT"} ${method} ${path.replace("/api/v1/org", "")}`, async () => {
         const res = await call(method, path, persona);
 
@@ -298,7 +274,7 @@ describe.runIf(HAS_DB)("every registered recruitment route is covered by this ma
     const src = readFileSync("src/routes/org.routes.js", "utf8");
     const registered = [
       ...src.matchAll(
-        /router\.(get|post|put|delete)\(\s*"(\/(?:job-openings|candidates|applications|pipeline|interviews|offers|candidate-attachments)[^"]*)"/g,
+        /router\.(get|post|put|delete)\(\s*"(\/(?:job-openings|candidates|applications|pipeline|interviewers|interviews|my\/interviews|offers|candidate-attachments)[^"]*)"/g,
       ),
     ]
       .map((m) => [m[1].toUpperCase(), `/api/v1/org${m[2]}`])

@@ -6,20 +6,19 @@ import request from "supertest";
 /**
  * AN ORG ADMIN CANNOT FILE AN EXPENSE CLAIM. NOT FOR THEMSELVES, NOT FOR ANYONE.
  *
- * This used to be permitted: POST /org/expense-claims sat on `expenseCategoryMgmt`,
- * the same gate as the review queue. That gate ends in requirePermission
- * ("approve_expenses"), and `hasPermission` returns true for an org_admin on the
- * ROLE alone, with nothing granted. So the single account in the company that can
- * approve any reimbursement was also handed the power to originate one — file it
- * and approve it in the same sitting, against an employee of its choosing, with
- * the receipt and the 90-day backdate rules the only brakes.
+ * This used to be permitted: POST /org/expense-claims sat on the same gate as the
+ * review queue. That gate ends in requirePermission("approve_expenses"), and
+ * `hasPermission` returns true for an org_admin on the ROLE alone, with nothing
+ * granted. So the single account in the company that can approve any
+ * reimbursement was also handed the power to originate one — file it and approve
+ * it in the same sitting, against an employee of its choosing.
  *
  * The restriction is now structural rather than conditional, and that is the point.
  * There is no `unless (isOwner)` and no `assertNotSelf`, which is what a
  * conditional rule looks like one refactor away from being wrong. The route is not
  * registered, so the request cannot reach a handler at all.
  *
- * Staff keep what the policy gives them — categories, review, settlement — because
+ * Staff keep what the permission gives them — review and settlement — because
  * adjudicating a claim someone else filed is the job. Employees file through
  * /api/v1/my/expenses, which derives the claimant from the session.
  */
@@ -91,8 +90,6 @@ vi.mock("../src/middleware/requirePermission.js", () => ({
 
 const { default: orgRouter } = await import("../src/routes/org.routes.js");
 const { default: errorHandler } = await import("../src/middleware/errorHandler.js");
-const { default: asyncHandler } = await import("../src/utils/asyncHandler.js");
-const { myExpenseCategories } = await import("../src/controllers/org/expenses.controller.js");
 
 /**
  * A message only THIS file's catch-all can produce.
@@ -109,7 +106,7 @@ const ROUTER_MISS = "no such route in this test app";
 /** A well-formed claim body, so a 404 cannot be explained by bad input. */
 const CLAIM_BODY = {
   employee_uuid: "22222222-2222-4222-8222-222222222222",
-  category_uuid: "33333333-3333-4333-8333-333333333333",
+  expense_name: "Taxi to client visit",
   amount: 500,
   expense_date: "2026-10-05",
   payment_mode: "payroll",
@@ -168,8 +165,6 @@ describe("the review side of the module is untouched", () => {
     ["post", `/api/v1/org/expense-claims/${CLAIM_UUID}/pay`],
     ["post", "/api/v1/org/expense-claims/bulk-pay"],
     ["post", `/api/v1/org/expense-claims/${CLAIM_UUID}/receipts`],
-    ["get", "/api/v1/org/expense-categories"],
-    ["post", "/api/v1/org/expense-categories"],
   ];
 
   for (const [method, path] of STILL_ROUTED) {
@@ -186,6 +181,19 @@ describe("the review side of the module is untouched", () => {
     expect(res.status).toBe(200);
     expect(res.body.data.items).toEqual([]);
   });
+
+  it("category routes are gone, because the category system is gone", async () => {
+    for (const [method, path] of [
+      ["get", "/api/v1/org/expense-categories"],
+      ["post", "/api/v1/org/expense-categories"],
+      ["put", `/api/v1/org/expense-categories/${CLAIM_UUID}`],
+      ["delete", `/api/v1/org/expense-categories/${CLAIM_UUID}`],
+    ]) {
+      const res = await request(app())[method](path).send({});
+      expect(res.status, `${method.toUpperCase()} ${path} is still routed`).toBe(404);
+      expect(res.body.message).toBe(ROUTER_MISS);
+    }
+  });
 });
 
 describe("the employee portal is the only way in", () => {
@@ -199,102 +207,13 @@ describe("the employee portal is the only way in", () => {
     expect(ess).not.toMatch(/req\.body[^)]*employee_uuid/);
     expect(ess).toContain('router.post("/"');
   });
-});
 
-describe("the employee portal can read the categories it must file against", () => {
-  // THIS ONE WAS BROKEN AND SHIPPED. GET /org/expense-categories is gated on
-  // org_admin/sub_admin plus approve_expenses, so the employee form's category
-  // dropdown 403'd and rendered "No categories found. Create a new category
-  // first." — false (they existed) and unactionable (the employee cannot open
-  // that page). Dispatched here, not asserted as text: a 403 from a handler is
-  // indistinguishable from a 403 from the router by status alone, which is
-  // exactly how the original went unnoticed.
-  // Stands in for GET /org/expense-categories, which is gated on
-  // requireRole("org_admin","sub_admin") + requirePermission("approve_expenses").
-  const staffOnly = express();
-  staffOnly.get("/org/expense-categories", (_req, res) =>
-    res.status(403).json({ success: false, message: "org_admin or sub_admin only" }),
-  );
-  staffOnly.use((_req, res) => res.status(404).json({ message: ROUTER_MISS }));
-
-  /** The claim detail route, which is what a mis-ordered /categories falls into. */
-  const claimDetail = (_req, res) => res.status(200).json({ data: { claim: "A CLAIM, not a category" } });
-
-  function essApp(categoriesFirst = true) {
-    const r = express.Router();
-    r.use((req, _res, next) => {
-      req.user = { uuid: "aaaaaaaa-0000-4000-8000-000000000002", organization: 1 };
-      req.scopeOrgId = 1;
-      next();
-    });
-    const categories = asyncHandler(myExpenseCategories);
-    // Exactly two routes, in one of the two orders. Nothing else is registered —
-    // an extra `/:uuid` left above this conditional silently won every match and
-    // made both tests describe the same router.
-    if (categoriesFirst) {
-      r.get("/categories", categories);
-      r.get("/:uuid", claimDetail);
-    } else {
-      r.get("/:uuid", claimDetail);
-      r.get("/categories", categories);
-    }
-    const a = express();
-    a.use(express.json());
-    a.use("/api/v1/my/expenses", r);
-    a.use(errorHandler);
-    a.use((_req, res) => res.status(404).json({ message: ROUTER_MISS }));
-    return a;
-  }
-
-  it("/my/expenses/categories is routed, and does not fall into /:uuid", async () => {
-    const res = await request(essApp()).get("/api/v1/my/expenses/categories");
-    expect(res.status).toBe(200);
-    expect(res.body.message).toBe("Expense categories");
-    expect(res.body.data.items).toEqual([]);
-  });
-
-  it("the ORDER is the only thing that makes that true", async () => {
-    // The same two routes, registered the other way round. Express matches in
-    // registration order, so "/categories" is consumed as a claim uuid and the
-    // employee is handed a CLAIM-shaped answer to a request about categories.
-    //
-    // Asserted as a 200 either way on purpose: both orders return 200, which is
-    // precisely why a status-code check cannot catch this mis-ordering, and why
-    // the test has to look at the payload.
-    const res = await request(essApp(false)).get("/api/v1/my/expenses/categories");
-    expect(res.status).toBe(200);
-    expect(res.body.data.claim).toBe("A CLAIM, not a category");
-    // ...and the correct order does not.
-    const good = await request(essApp(true)).get("/api/v1/my/expenses/categories");
-    expect(good.body.data.claim).toBeUndefined();
-    expect(good.body.message).toBe("Expense categories");
-  });
-
-  it("the real route file registers /categories before /:uuid", () => {
-    const src = readFileSync("src/routes/myExpenses.routes.js", "utf8");
-    const categoriesAt = src.indexOf('router.get("/categories"');
-    const uuidAt = src.indexOf('router.get("/:uuid"');
-    expect(categoriesAt).toBeGreaterThan(-1);
-    expect(uuidAt).toBeGreaterThan(-1);
-    expect(categoriesAt, "/categories must be registered BEFORE /:uuid").toBeLessThan(uuidAt);
-  });
-
-  it("and it is wired to the handler, not left dangling", () => {
-    const src = readFileSync("src/routes/myExpenses.routes.js", "utf8");
-    expect(src).toContain("myExpenseCategories");
-    expect(readFileSync("src/controllers/org/expenses.controller.js", "utf8")).toContain(
-      "export async function myExpenseCategories",
-    );
-  });
-
-  it("the categories a user may file under are not behind a staff-only gate", async () => {
-    // The actual defect, stated as a gate check: an employee must reach the
-    // category list without passing the role check the staff route requires.
-    const staff = await request(staffOnly).get("/org/expense-categories");
-    expect(staff.status, "precondition: staff categories are org-gated").toBe(403);
-    expect(readFileSync("src/routes/myExpenses.routes.js", "utf8")).toContain(
-      'router.get("/categories", selfService',
-    );
+  it("the ESS portal files a free-text claim, not a category reference", () => {
+    const ess = readFileSync("src/routes/myExpenses.routes.js", "utf8");
+    expect(ess).not.toMatch(/categor/i);
+    const ctrl = readFileSync("src/controllers/org/expenses.controller.js", "utf8");
+    expect(ctrl).toContain("expenseName: req.body?.expense_name");
+    expect(ctrl).not.toMatch(/categoryUuid|req\.body[^)]*category_uuid/);
   });
 });
 
@@ -321,8 +240,13 @@ describe("the source agrees, as a second opinion rather than the proof", () => {
     expect(calls.length, "createClaim has more than one call site").toBe(1);
   });
 
-  it("categories and review are still here, because those are the org admin's job", () => {
-    expect(code(ORG_ROUTES)).toMatch(/router\.post\(\s*"\/expense-categories"/);
+  it("review and settlement are still here, because that is the reviewer's job", () => {
     expect(code(ORG_ROUTES)).toMatch(/router\.post\(\s*"\/expense-claims\/:uuid\/review"/);
+    expect(code(ORG_ROUTES)).toMatch(/router\.post\(\s*"\/expense-claims\/:uuid\/pay"/);
+  });
+
+  it("no category management survives anywhere", () => {
+    expect(code(ORG_ROUTES)).not.toMatch(/expense-categories/);
+    expect(code(CTRL)).not.toMatch(/ExpenseCategory|myExpenseCategories/);
   });
 });

@@ -12,6 +12,7 @@ import {
   collectableTags,
   allTagLabels,
   unsupportedTags,
+  tagsForBody,
 } from "../utils/letterMerge.js";
 import { generateHrLetterPdf } from "../utils/hrLetterPdf.js";
 import { ORGS_DIR } from "../config/uploadPaths.js";
@@ -401,7 +402,64 @@ export async function createDraftLetter({ orgId, actorUuid, employeeUuid, templa
   return getLetter({ orgId, letterUuid: row.uuid, mergedValues: merged, conn });
 }
 
-export async function listLetters({ orgId, page, limit, offset, employeeUuid, letterType, status, search }) {
+/**
+ * Edit a draft letter's editable fields. Issued letters are immutable; revoked
+ * letters must first be explicitly reverted to draft.
+ */
+export async function updateDraftLetter({
+  orgId,
+  letterUuid,
+  actorUuid,
+  templateUuid,
+  letterType,
+  title,
+  values,
+}) {
+  assertUuid(letterUuid, "Letter UUID");
+  const existing = await loadLetterForOrg({ orgId, letterUuid });
+  if (existing.status !== "draft") {
+    throw new ApiError(409, "Only a draft letter can be edited");
+  }
+  if (values !== undefined && (!values || typeof values !== "object" || Array.isArray(values))) {
+    throw new ApiError(400, "values must be an object");
+  }
+  if (values !== undefined && Object.values(values).some((value) => typeof value !== "string")) {
+    throw new ApiError(400, "values must contain only text");
+  }
+
+  const nextTemplateUuid = templateUuid === undefined
+    ? existing.template_uuid
+    : (templateUuid || null);
+  if (nextTemplateUuid) {
+    assertUuid(nextTemplateUuid, "Template UUID");
+    await getTemplate({ orgId, templateUuid: nextTemplateUuid });
+  }
+
+  const nextLetterType = letterType === undefined
+    ? existing.letter_type
+    : letterTypeOrThrow(letterType);
+  const nextTitle = title === undefined ? existing.title : String(title).trim();
+  if (!nextTitle) throw new ApiError(400, "title is required");
+  const nextPayload = values === undefined
+    ? parseJson(existing.payload)
+    : { ...parseJson(existing.payload), ...values };
+
+  const [result] = await pool.query(
+    `UPDATE hr_letters
+        SET template_uuid=?, letter_type=?, title=?, payload=?, updated_at=NOW()
+      WHERE uuid=? AND organization_id=? AND status='draft'`,
+    [nextTemplateUuid, nextLetterType, nextTitle, JSON.stringify(nextPayload), letterUuid, orgId],
+  );
+  if (!result.affectedRows) throw new ApiError(409, "This letter is no longer a draft");
+
+  auditTemplate(actorUuid, "hr_letter.update_draft", orgId, letterUuid, {
+    letterType: nextLetterType,
+    templateUuid: nextTemplateUuid,
+  });
+  return getLetter({ orgId, letterUuid });
+}
+
+export async function listLetters({ orgId, page, limit, offset, employeeUuid, letterType, status, search, scopeFilter }) {
   const clauses = ["l.organization_id = ?"];
   const params = [orgId];
 
@@ -409,6 +467,10 @@ export async function listLetters({ orgId, page, limit, offset, employeeUuid, le
     assertUuid(employeeUuid, "Employee UUID");
     clauses.push("l.employee_uuid = ?");
     params.push(employeeUuid);
+  }
+  if (scopeFilter) {
+    clauses.push(scopeFilter.sql);
+    params.push(...scopeFilter.params);
   }
   if (letterType) {
     clauses.push("l.letter_type = ?");
@@ -662,6 +724,57 @@ export async function renderLetterPdf({ orgId, letterUuid }) {
   return { buffer, filename: `${letter.reference_no.replace(/[^\w.-]+/g, "-")}.pdf` };
 }
 
+/** Render an unsaved template with sample values so its author can check the PDF layout. */
+export async function renderTemplatePreviewPdf({ orgId, letterType, name, body }) {
+  letterTypeOrThrow(letterType);
+  const bodyText = String(body ?? "");
+  if (bodyText.length > 65_000) throw new ApiError(400, "body is too long");
+
+  const [rows] = await pool.query(
+    "SELECT name, logo FROM organizations WHERE id=? LIMIT 1",
+    [orgId],
+  );
+  const organization = rows[0];
+  if (!organization) throw new ApiError(404, "Organization not found");
+
+  const issuedAt = new Date();
+  const previewValues = {
+    employee_name: "Sample Employee",
+    designation: "Job Title",
+    department: "Department",
+    joining_date: "01 January 2026",
+    cnic: "35202-1234567-1",
+    organization_name: organization.name,
+    issue_date: issuedAt,
+    letter_date: issuedAt,
+    reference_no: "HR/PREVIEW/0000",
+    current_salary: "PKR 50,000",
+    new_salary: "PKR 60,000",
+    effective_date: "01 January 2026",
+    increment_percentage: "20%",
+    total_experience: "3 years",
+    last_working_date: "31 December 2025",
+    warning_reason: "Policy violation",
+  };
+  const renderedBody = renderTemplate(bodyText, previewValues).text;
+  const letter = {
+    letter_type: letterType,
+    reference_no: "HR/PREVIEW/0000",
+    title: String(name ?? "").trim() || null,
+    body_snapshot: renderedBody,
+    status: "draft",
+    issued_at: issuedAt,
+  };
+  const buffer = await generateHrLetterPdf({
+    letter,
+    employeeName: "Sample Employee",
+    organizationName: organization.name,
+    organizationLogoPath: organizationLogoFile(organization.logo),
+    verifyUrl: null,
+  });
+  return { buffer, filename: "letter-template-preview.pdf" };
+}
+
 /**
  * Public verification.
  *
@@ -728,6 +841,7 @@ export async function previewTemplate({ orgId, employeeUuid, templateUuid, value
     ...values,
   };
   const { text, unresolved } = renderTemplate(template.body, merged);
+  const bodyTags = new Set(tagsForBody(template.body));
   return {
     text,
     unresolved,
@@ -740,6 +854,7 @@ export async function previewTemplate({ orgId, employeeUuid, templateUuid, value
     // Labels so the form can render "CNIC" rather than humanising "cnic" into
     // "Cnic". Purely presentational; the tag key is what gets submitted.
     tag_labels: allTagLabels(template.letter_type),
+    editable_tags: [...bodyTags],
   };
 }
 

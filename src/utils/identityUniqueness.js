@@ -102,6 +102,17 @@ export function rethrowIdentityDuplicate(err, context = {}) {
   const message = String(err?.message || "");
   if (!/duplicate entry/i.test(message)) throw err;
 
+  // Per-organization employment keys (migrations/20261210_employee_org_scoped_identity.sql).
+  // These are checked FIRST: the CNIC key name also matches the generic /uq.*cnic/
+  // test below, which would otherwise claim the number belongs to "another user"
+  // on the platform when the conflict is really this organization's roster.
+  if (/uq_employees_org_active_cnic/i.test(message)) {
+    throw new ApiError(409, "An employee with this CNIC already exists in this organization.");
+  }
+  if (/uq_employees_org_active_email/i.test(message)) {
+    throw new ApiError(409, "An employee with this email address already exists in this organization.");
+  }
+
   if (/uq_users_phone_normalized|\.phone_normalized/i.test(message)) {
     throw new ApiError(
       409,
@@ -119,6 +130,105 @@ export function rethrowIdentityDuplicate(err, context = {}) {
   // A different unique key (email, uuid) — keep the historical behaviour of
   // surfacing the conflict, but strip the raw index name.
   throw new ApiError(409, "That value is already in use by another record.");
+}
+
+/**
+ * Employment identity is per organization.
+ *
+ * `employees` is an EMPLOYMENT record, not the person. When someone leaves one
+ * company and joins another, the second company must be able to store the same
+ * CNIC/email: the first row becomes `ex_employee` and stays as history, while a
+ * new row is created in the new organization. Only a person who is CURRENTLY on
+ * another organization's roster blocks the new employment.
+ *
+ * This is deliberately separate from assertIdentityAvailable(), which still
+ * enforces one login identity in `users`: a returning employee links to their
+ * existing platform account instead of creating a second one.
+ *
+ * `ex_employee` is the release status. It is the one lifecycle value written by
+ * offboarding/archiving, and it means the person has left; a historical row must
+ * not make them un-hireable forever. `inactive` is NOT released: it is a
+ * deactivated account that is still on the roster.
+ */
+const EMPLOYMENT_RELEASED_STATUS = "ex_employee";
+
+async function hasActiveEmployment({
+  executor,
+  column,
+  value,
+  organizationId,
+  excludeEmployeeUuid,
+  sameOrganization,
+}) {
+  const params = [value];
+  let sql = `SELECT uuid FROM employees WHERE ${column}=? AND status <> '${EMPLOYMENT_RELEASED_STATUS}'`;
+  sql += sameOrganization ? " AND organization_id=?" : " AND organization_id<>?";
+  params.push(organizationId);
+  if (excludeEmployeeUuid) {
+    sql += " AND uuid<>?";
+    params.push(excludeEmployeeUuid);
+  }
+  sql += " LIMIT 1";
+  const [rows] = await executor.query(sql, params);
+  return rows[0] || null;
+}
+
+/**
+ * Reject a CNIC/email that is already held by a CURRENT employee in this
+ * organization or in another one. Historical (`ex_employee`) rows are ignored,
+ * which is what makes cross-company rehiring work.
+ *
+ * The message never names the other organization: that would leak one tenant's
+ * roster to another tenant's admin.
+ */
+export async function assertEmploymentIdentityAvailable({
+  executor,
+  organizationId,
+  cnic,
+  email,
+  excludeEmployeeUuid = null,
+  cnicLabel = "CNIC",
+  emailLabel = "email address",
+} = {}) {
+  const fields = [
+    { column: "cnic", value: cnic, label: cnicLabel },
+    { column: "email", value: email, label: emailLabel },
+  ];
+
+  for (const field of fields) {
+    if (!hasValue(field.value)) continue;
+
+    const sameOrg = await hasActiveEmployment({
+      executor,
+      column: field.column,
+      value: String(field.value).trim(),
+      organizationId,
+      excludeEmployeeUuid,
+      sameOrganization: true,
+    });
+    if (sameOrg) {
+      throw new ApiError(
+        409,
+        `An employee with this ${field.label} already exists in this organization.`
+      );
+    }
+
+    const otherOrg = await hasActiveEmployment({
+      executor,
+      column: field.column,
+      value: String(field.value).trim(),
+      organizationId,
+      excludeEmployeeUuid,
+      sameOrganization: false,
+    });
+    if (otherOrg) {
+      throw new ApiError(
+        409,
+        `This ${field.label} belongs to a person who is currently employed at another organization. ` +
+          `Their exit must be completed before they can be added here.`
+      );
+    }
+  }
 }
 
 /**

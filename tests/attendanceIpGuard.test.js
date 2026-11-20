@@ -5,7 +5,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
-vi.mock("../src/config/db.js", () => ({ pool: { query: vi.fn() } }));
+vi.mock("../src/config/db.js", () => ({ pool: { query: vi.fn(), getConnection: vi.fn() } }));
 
 import { pool } from "../src/config/db.js";
 import { checkIn, checkOut } from "../src/controllers/attendance.controller.js";
@@ -37,12 +37,36 @@ function installRouter(rules) {
     }
     if (s.includes("FROM organizations WHERE id")) return [[{ id: ORG_ID }]];
     if (s.includes("FROM organization_ip_rules")) return [rules];
-    if (s.includes("FROM attendance_records WHERE id")) {
-      return [[{ uuid: "att-uuid", employee_uuid: "emp-uuid", status: "checked_in" }]];
-    }
     if (s.includes("FROM attendance_records WHERE employee_uuid")) return [[]];
+    if (s.includes("WHERE ar.id=?")) {
+      return [[{
+        uuid: "att-uuid",
+        employee_uuid: "emp-uuid",
+        organization_id: ORG_ID,
+        date: "2026-11-10",
+        check_in_at: "2026-11-10 09:00:00",
+        check_out_at: null,
+        status: "checked_in",
+      }]];
+    }
     return [{ affectedRows: 1, insertId: 1 }];
   });
+  const connection = {
+    beginTransaction: vi.fn(),
+    commit: vi.fn(),
+    rollback: vi.fn(),
+    release: vi.fn(),
+    query: vi.fn(async (sql) => {
+      const statement = String(sql);
+      if (statement.includes("FROM employees WHERE uuid=? AND organization_id=?")) {
+        return [[{ uuid: "emp-uuid" }]];
+      }
+      if (statement.includes("check_out_at IS NULL AND status='checked_in'")) return [[]];
+      if (statement.includes("SELECT id, status FROM attendance_records")) return [[]];
+      return [{ affectedRows: 1, insertId: 1 }];
+    }),
+  };
+  pool.getConnection.mockResolvedValue(connection);
 }
 
 const originalLoopback = process.env.ALLOW_LOOPBACK_ATTENDANCE;

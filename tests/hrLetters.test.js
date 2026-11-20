@@ -26,6 +26,7 @@ import {
   createTemplate,
   deleteTemplate,
   createDraftLetter,
+  updateDraftLetter,
   issueLetter,
   revokeLetter,
   deleteLetter,
@@ -33,6 +34,7 @@ import {
   verifyLetterPublic,
   previewTemplate,
   renderLetterPdf,
+  renderTemplatePreviewPdf,
   LETTER_TYPES,
 } from "../src/services/hrLetters.service.js";
 
@@ -309,6 +311,45 @@ describe("revokeLetter — invalidation, not just a status flip", () => {
   });
 });
 
+describe("updateDraftLetter — persisting draft values", () => {
+  it("merges supplied values into the draft payload without dropping existing values", async () => {
+    pool.query
+      .mockResolvedValueOnce([[letterRow({ payload: { effective_date: "2026-01-01" } })], []])
+      .mockResolvedValueOnce([[templateRow()], []])
+      .mockResolvedValueOnce([{ affectedRows: 1 }])
+      .mockResolvedValueOnce([[letterRow({
+        payload: { effective_date: "2026-01-01", new_salary: "85000" },
+      })], []]);
+
+    const updated = await updateDraftLetter({
+      orgId: ORG,
+      letterUuid: LETTER,
+      actorUuid: ADMIN,
+      values: { new_salary: "85000" },
+    });
+
+    const [sql, params] = pool.query.mock.calls[2];
+    expect(sql).toContain("payload=?");
+    expect(JSON.parse(params[3])).toEqual({
+      effective_date: "2026-01-01",
+      new_salary: "85000",
+    });
+    expect(updated.payload).toEqual({ effective_date: "2026-01-01", new_salary: "85000" });
+  });
+
+  it("rejects non-text merge values before updating", async () => {
+    pool.query.mockResolvedValueOnce([[letterRow()], []]);
+
+    await expect(updateDraftLetter({
+      orgId: ORG,
+      letterUuid: LETTER,
+      actorUuid: ADMIN,
+      values: { new_salary: 85000 },
+    })).rejects.toMatchObject({ statusCode: 400 });
+    expect(pool.query).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("verifyLetterPublic — fails closed", () => {
   const issuedRow = (over = {}) => ({
     uuid: LETTER,
@@ -395,6 +436,7 @@ describe("previewTemplate", () => {
     const preview = await previewTemplate({ orgId: ORG, employeeUuid: EMPLOYEE, templateUuid: TEMPLATE });
     expect(preview.missing_manual).toEqual(["new_salary", "effective_date"]);
     expect(preview.unresolved).toEqual(["new_salary", "effective_date"]);
+    expect(preview.editable_tags).toEqual(["employee_name", "new_salary", "effective_date"]);
   });
 });
 
@@ -413,6 +455,38 @@ describe("renderLetterPdf", () => {
     pool.query.mockResolvedValueOnce([[]]);
     await expect(renderLetterPdf({ orgId: OTHER_ORG, letterUuid: LETTER })).rejects.toMatchObject({
       statusCode: 404,
+    });
+  });
+
+  describe("renderTemplatePreviewPdf", () => {
+    it("renders a PDF preview from unsaved content using the current organization", async () => {
+      pool.query.mockResolvedValueOnce([[{ name: "Acme", logo: null }], []]);
+
+      const { buffer, filename } = await renderTemplatePreviewPdf({
+        orgId: ORG,
+        letterType: "increment",
+        name: "Salary increase",
+        body: "Dear $employee_name, your new salary is $new_salary.",
+      });
+
+      expect(buffer.subarray(0, 5).toString("latin1")).toBe("%PDF-");
+      expect(filename).toBe("letter-template-preview.pdf");
+      expect(pool.query).toHaveBeenCalledWith(
+        expect.stringContaining("FROM organizations"),
+        [ORG],
+      );
+      expect(pool.query.mock.calls).toHaveLength(1);
+    });
+
+    it("rejects unsupported letter types before querying the organization", async () => {
+      await expect(
+        renderTemplatePreviewPdf({
+          orgId: ORG,
+          letterType: "not-a-letter",
+          body: "Preview",
+        }),
+      ).rejects.toMatchObject({ statusCode: 400 });
+      expect(pool.query).not.toHaveBeenCalled();
     });
   });
 });

@@ -3,6 +3,7 @@ import path from "path";
 import crypto from "crypto";
 import ApiError from "../../utils/ApiError.js";
 import { pool } from "../../config/db.js";
+import { assertEmployeeInDataScope } from "../../utils/dataScopes.js";
 import { ok, created } from "../../utils/response.js";
 import { assertUuid } from "../../utils/publicResponse.js";
 import { DOCS_DIR } from "../../config/uploadPaths.js";
@@ -107,6 +108,7 @@ export async function deleteDesignation(req, res) {
 export async function listEmployeeDocuments(req, res) {
   const { uuid } = req.params;
   assertUuid(uuid, "Employee UUID");
+  await assertEmployeeInDataScope(req, "employees", uuid);
   const [rows] = await pool.query(
     `SELECT d.uuid, d.employee_uuid, d.document_type, d.file_name, d.file_path, d.file_size, d.uploaded_at, d.created_at,
             d.document_hash, d.extraction_status, d.extracted_at
@@ -122,6 +124,7 @@ export async function uploadEmployeeDocuments(req, res) {
   const { uuid } = req.params;
   assertUuid(uuid, "Employee UUID");
   const orgId = requireOrgId(req);
+  await assertEmployeeInDataScope(req, "employees", uuid);
   const [empRows] = await pool.query("SELECT uuid FROM employees WHERE uuid=? AND organization_id=?", [uuid, orgId]);
   if (!empRows.length) throw new ApiError(404, "Employee not found");
 
@@ -203,13 +206,14 @@ export async function deleteEmployeeDocument(req, res) {
   const { docUuid } = req.params;
   assertUuid(docUuid, "Document UUID");
   const [rows] = await pool.query(
-    `SELECT d.id, d.file_path FROM employee_documents d
+    `SELECT d.id, d.file_path, d.employee_uuid FROM employee_documents d
      JOIN employees e ON e.uuid = d.employee_uuid
      WHERE d.uuid = ? AND e.organization_id = ?`,
     [docUuid, orgId]
   );
   if (!rows.length) throw new ApiError(404, "Document not found");
   const doc = rows[0];
+  await assertEmployeeInDataScope(req, "employees", doc.employee_uuid);
   const diskPath = path.join(DOCS_DIR, path.basename(doc.file_path));
   try {
     if (fs.existsSync(diskPath)) fs.unlinkSync(diskPath);

@@ -61,6 +61,9 @@ function esc(v) {
     .replace(/'/g, "&#39;");
 }
 
+let cachedTransporter = null;
+let cachedTransporterKey = null;
+
 export function getMailerTransport() {
   const host = process.env.SMTP_HOST;
   const port = Number(process.env.SMTP_PORT || 587);
@@ -69,7 +72,21 @@ export function getMailerTransport() {
 
   if (!host || !port || !user || !pass) return null;
 
-  return nodemailer.createTransport({
+  const currentKey = `${host}:${port}:${user}:${pass}:${process.env.SMTP_SECURE}:${process.env.SMTP_EHLO_NAME}`;
+  if (cachedTransporter && cachedTransporterKey === currentKey) {
+    return cachedTransporter;
+  }
+
+  cachedTransporterKey = currentKey;
+  cachedTransporter = nodemailer.createTransport({
+    // A single pooled connection avoids bursts against SMTP providers that
+    // reset concurrent sessions. Timeouts make dead sockets fail promptly.
+    pool: true,
+    maxConnections: 1,
+    maxMessages: 50,
+    connectionTimeout: 15000,
+    greetingTimeout: 15000,
+    socketTimeout: 30000,
     host,
     port,
     secure: toBool(process.env.SMTP_SECURE, port === 465),
@@ -79,6 +96,8 @@ export function getMailerTransport() {
     name: process.env.SMTP_EHLO_NAME || user.split("@")[1] || undefined,
     hostname: process.env.SMTP_EHLO_NAME || user.split("@")[1] || undefined,
   });
+
+  return cachedTransporter;
 }
 
 function getFromAddress() {
@@ -395,6 +414,45 @@ function requireTransport() {
   return transporter;
 }
 
+/**
+ * Invite delivery occasionally fails because an SMTP provider closes a pooled
+ * socket while it is idle. Reconnect once for transient socket failures and
+ * retry the exact same message (and therefore the same invite link).
+ */
+async function sendMailWithReconnect(message, label) {
+  let transporter = requireTransport();
+  try {
+    return await transporter.sendMail(message);
+  } catch (error) {
+    const codes = [error?.code, error?.cause?.code, error?.errno];
+    const transient = codes.some((code) =>
+      ["ECONNRESET", "ECONNECTION", "ETIMEDOUT", "EPIPE"].includes(String(code))
+    );
+    if (!transient) {
+      dumpSmtpError(label, error);
+      throw error;
+    }
+
+    try {
+      transporter.close();
+    } catch {
+      // The socket may already be closed; the fresh transport below is the recovery.
+    }
+    if (cachedTransporter === transporter) {
+      cachedTransporter = null;
+      cachedTransporterKey = null;
+    }
+
+    transporter = requireTransport();
+    try {
+      return await transporter.sendMail(message);
+    } catch (retryError) {
+      dumpSmtpError(label, retryError);
+      throw retryError;
+    }
+  }
+}
+
 // ─────────────────────────────────────────────────────────────
 // Emails
 // ─────────────────────────────────────────────────────────────
@@ -527,8 +585,6 @@ export async function sendLoginOtpEmail({ to, otp, lang = "en" }) {
 }
 
 export async function sendInviteEmail({ to, setLink, invitedByName, lang = "en" }) {
-  const transporter = requireTransport();
-
   const appName = process.env.APP_NAME || "Dverif";
   const expiryHours = process.env.INVITE_EXPIRES_IN_HOURS || "72";
   const T = emailTexts(lang);
@@ -554,13 +610,14 @@ export async function sendInviteEmail({ to, setLink, invitedByName, lang = "en" 
     T.inviteTextIgnore,
   ].join("\n");
 
-  await transporter.sendMail(
+  await sendMailWithReconnect(
     buildMail({
       to,
       subject: `${appName} — ${T.inviteSubject}`,
       text,
       html: emailWrapper(bodyHtml, lang, T.inviteTextTitle(appName)),
-    })
+    }),
+    "sendInviteEmail"
   );
 }
 

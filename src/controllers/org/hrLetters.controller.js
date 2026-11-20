@@ -1,4 +1,5 @@
 import { ok, created } from "../../utils/response.js";
+import { employeeScopeCondition, assertEmployeeInDataScope } from "../../utils/dataScopes.js";
 import { parsePagination } from "../../utils/pagination.js";
 import ApiError from "../../utils/ApiError.js";
 import { sendPdf } from "../../utils/exportBuilders.js";
@@ -32,6 +33,12 @@ function pickWritable(body = {}, writable = TEMPLATE_WRITABLE) {
 // ---------------------------------------------------------------------------
 // Templates
 // ---------------------------------------------------------------------------
+
+async function scopedLetter(req, letterUuid) {
+  const letter = await letters.getLetter({ orgId: req.scopeOrgId, letterUuid });
+  await assertEmployeeInDataScope(req, "hr_letters", letter.employee_uuid);
+  return letter;
+}
 
 export async function listTemplates(req, res) {
   const data = await letters.listTemplates({
@@ -99,19 +106,18 @@ export async function listLetters(req, res) {
     letterType: req.query.letter_type || undefined,
     status: req.query.status || undefined,
     search: req.query.search || undefined,
+    scopeFilter: employeeScopeCondition(req, "hr_letters", "e"),
   });
   return ok(res, data, "Letters");
 }
 
 export async function getLetter(req, res) {
-  const letter = await letters.getLetter({
-    orgId: req.scopeOrgId,
-    letterUuid: req.params.uuid,
-  });
+  const letter = await scopedLetter(req, req.params.uuid);
   return ok(res, { letter }, "Letter");
 }
 
 export async function createLetter(req, res) {
+  await assertEmployeeInDataScope(req, "hr_letters", req.body?.employee_uuid);
   const letter = await letters.createDraftLetter({
     orgId: req.scopeOrgId,
     actorUuid: req.user?.uuid,
@@ -124,7 +130,22 @@ export async function createLetter(req, res) {
   return created(res, { letter }, "Draft letter created");
 }
 
+export async function updateLetter(req, res) {
+  await scopedLetter(req, req.params.uuid);
+  const letter = await letters.updateDraftLetter({
+    orgId: req.scopeOrgId,
+    letterUuid: req.params.uuid,
+    actorUuid: req.user?.uuid,
+    templateUuid: req.body?.template_uuid,
+    letterType: req.body?.letter_type,
+    title: req.body?.title,
+    values: req.body?.values,
+  });
+  return ok(res, { letter }, "Draft letter updated");
+}
+
 export async function issueLetter(req, res) {
+  await scopedLetter(req, req.params.uuid);
   const letter = await letters.issueLetter({
     orgId: req.scopeOrgId,
     letterUuid: req.params.uuid,
@@ -135,6 +156,7 @@ export async function issueLetter(req, res) {
 }
 
 export async function revokeLetter(req, res) {
+  await scopedLetter(req, req.params.uuid);
   const letter = await letters.revokeLetter({
     orgId: req.scopeOrgId,
     letterUuid: req.params.uuid,
@@ -153,6 +175,7 @@ export async function revokeLetter(req, res) {
  * meant to prevent.
  */
 export async function revertLetter(req, res) {
+  await scopedLetter(req, req.params.uuid);
   const letter = await letters.revertLetterToDraft({
     orgId: req.scopeOrgId,
     letterUuid: req.params.uuid,
@@ -162,6 +185,7 @@ export async function revertLetter(req, res) {
 }
 
 export async function deleteLetter(req, res) {
+  await scopedLetter(req, req.params.uuid);
   await letters.deleteLetter({
     orgId: req.scopeOrgId,
     letterUuid: req.params.uuid,
@@ -171,6 +195,7 @@ export async function deleteLetter(req, res) {
 }
 
 export async function downloadLetterPdf(req, res) {
+  await scopedLetter(req, req.params.uuid);
   const { buffer, filename } = await letters.renderLetterPdf({
     orgId: req.scopeOrgId,
     letterUuid: req.params.uuid,
@@ -180,6 +205,7 @@ export async function downloadLetterPdf(req, res) {
 
 export async function previewTemplate(req, res) {
   if (!req.body?.employee_uuid) throw new ApiError(400, "employee_uuid is required");
+  await assertEmployeeInDataScope(req, "hr_letters", req.body.employee_uuid);
   const preview = await letters.previewTemplate({
     orgId: req.scopeOrgId,
     employeeUuid: req.body.employee_uuid,
@@ -187,6 +213,19 @@ export async function previewTemplate(req, res) {
     values: req.body?.values ?? {},
   });
   return ok(res, preview, "Preview");
+}
+
+export async function previewTemplatePdf(req, res) {
+  const { buffer, filename } = await letters.renderTemplatePreviewPdf({
+    orgId: req.scopeOrgId,
+    letterType: req.body?.letterType,
+    name: req.body?.name,
+    body: req.body?.body,
+  });
+  res.setHeader("Content-Type", "application/pdf");
+  res.setHeader("Content-Disposition", `inline; filename="${filename}"`);
+  res.setHeader("Cache-Control", "no-store");
+  return res.send(buffer);
 }
 
 // ---------------------------------------------------------------------------

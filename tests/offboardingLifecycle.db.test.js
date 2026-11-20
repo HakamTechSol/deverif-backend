@@ -3,7 +3,7 @@ import dotenv from "dotenv";
 import mysql from "mysql2/promise";
 import { randomUUID } from "node:crypto";
 import { purgeTestOrgs } from "./helpers/dbCleanup.js";
-import { seedPayrollBaseline } from "./helpers/payrollPolicy.js";
+import { seedPayrollBaseline } from "./helpers/payrollSettings.js";
 import {
   createExitRequest,
   getExitRequest,
@@ -79,7 +79,6 @@ let db;
 let orgId;
 let paidTypeId;
 let unpaidTypeId;
-let categoryId;
 const employeeUuids = [];
 
 beforeAll(async () => {
@@ -90,7 +89,7 @@ beforeAll(async () => {
     `Offboarding Test ${Date.now()}`,
   ]);
   orgId = org.insertId;
-  // Seeds the working week AND a confirmed payroll policy. Final-pay settlement
+  // Seeds the organization's monthly working calendar and payroll settings. Final-pay settlement
   // reads employee_salary_history and divides by the org's working days, so a suite
   // that settles an exit needs both configured or it 409s before reaching anything
   // it was written to test.
@@ -108,11 +107,6 @@ beforeAll(async () => {
   );
   unpaidTypeId = unpaid.insertId;
 
-  const [cat] = await db.query(
-    "INSERT INTO asset_categories (uuid, organization_id, name) VALUES (UUID(), ?, 'Laptops')",
-    [orgId],
-  );
-  categoryId = (await db.query("SELECT uuid FROM asset_categories WHERE id=?", [cat.insertId]))[0][0].uuid;
 });
 
 afterAll(async () => {
@@ -163,14 +157,16 @@ async function allocateLeave(employeeUuid, { typeId, allocated, used }) {
 }
 
 /** Create an asset and hand it to the employee, open (never returned). */
-async function assignAsset(employeeUuid, { cost, tag }) {
+async function assignAsset(employeeUuid, { cost, name }) {
+  const assetName = name ?? `Test Asset ${randomUUID()}`;
+  const assetTag = name ?? `AST-${randomUUID()}`;
   await db.query(
-    `INSERT INTO assets (uuid, organization_id, category_uuid, asset_tag, name, purchase_cost, status, created_at)
-     VALUES (UUID(), ?, ?, ?, 'Test Asset', ?, 'assigned', NOW())`,
-    [orgId, categoryId, tag ?? `AST-${Math.random().toString(36).slice(2, 8).toUpperCase()}`, cost],
+    `INSERT INTO assets (uuid, organization_id, asset_tag, name, purchase_cost, status, created_at)
+     VALUES (UUID(), ?, ?, ?, ?, 'assigned', NOW())`,
+    [orgId, assetTag, assetName, cost],
   );
   const assetUuid = (
-    await db.query("SELECT uuid FROM assets WHERE organization_id=? AND asset_tag=?", [orgId, tag])
+    await db.query("SELECT uuid FROM assets WHERE organization_id=? AND name=?", [orgId, assetName])
   )[0][0].uuid;
   await db.query(
     `INSERT INTO asset_assignments (uuid, organization_id, asset_uuid, employee_uuid, assigned_at, created_at)
@@ -368,7 +364,7 @@ describe.runIf(HAS_DB)("HR review", () => {
 describe.runIf(HAS_DB)("asset clearance reads the same rows the asset register does", () => {
   it("finds assets still held, with their recovery value", async () => {
     const uuid = await newEmployee("HoldsLaptop");
-    await assignAsset(uuid, { cost: 250000, tag: "AST-CLEAR-1" });
+    await assignAsset(uuid, { cost: 250000, name: "AST-CLEAR-1" });
 
     const assets = await getOutstandingAssets({ orgId, employeeUuid: uuid });
     expect(assets.count).toBe(1);
@@ -379,7 +375,7 @@ describe.runIf(HAS_DB)("asset clearance reads the same rows the asset register d
 
   it("does not report an asset that has been returned", async () => {
     const uuid = await newEmployee("Returned");
-    const assetUuid = await assignAsset(uuid, { cost: 5000, tag: "AST-CLEAR-2" });
+    const assetUuid = await assignAsset(uuid, { cost: 5000, name: "AST-CLEAR-2" });
     await db.query(
       "UPDATE asset_assignments SET returned_at=NOW(), return_condition='good' WHERE asset_uuid=?",
       [assetUuid],
@@ -522,7 +518,7 @@ it("refuses to settle when the organization has NO working days", async () => {
 
     try {
       await db.query(
-        "UPDATE work_week_config SET mon=0,tue=0,wed=0,thu=0,fri=0,sat=0,sun=0 WHERE organization_id=?",
+        "UPDATE organization_monthly_work_schedules SET day_type='off' WHERE organization_id=?",
         [orgId],
       );
 
@@ -543,7 +539,7 @@ it("refuses to settle when the organization has NO working days", async () => {
       // inherited an all-zero work week and failed for the wrong reason - which is
       // how one test turned into ten unrelated-looking failures.
       await db.query(
-        "UPDATE work_week_config SET mon=1,tue=1,wed=1,thu=1,fri=1,sat=0,sun=0 WHERE organization_id=?",
+        "UPDATE organization_monthly_work_schedules SET day_type=CASE WHEN DAYOFWEEK(schedule_date) IN (1,7) THEN 'off' ELSE 'working' END WHERE organization_id=?",
         [orgId],
       );
     }
@@ -613,7 +609,7 @@ describe.runIf(HAS_DB)("the guards that make this module worth having", () => {
 
     // Returning the asset releases it.
     await db.query(
-      "UPDATE asset_assignments SET returned_at=NOW(), return_condition='good' WHERE asset_uuid=(SELECT uuid FROM assets WHERE asset_tag='AST-GUARD-1')",
+      "UPDATE asset_assignments SET returned_at=NOW(), return_condition='good' WHERE asset_uuid=(SELECT uuid FROM assets WHERE name='AST-GUARD-1')",
     );
     const done = await processSettlement({ orgId, actorUuid: null, exitUuid: exit.uuid, target: "processed" });
     expect(done.status).toBe("processed");

@@ -85,7 +85,10 @@ export function legacyPreBackfillFlags() {
   return Object.fromEntries(ORIGINAL_MODULE_KEYS.map((key) => [key, true]));
 }
 
-/** The seeded Free plan: Employee Management is the only included module. */
+/**
+ * The seeded Free plan: Employee Management plus User Management (portal
+ * accounts/invitations). Every other module is excluded.
+ */
 export function freePlanFlags() {
-  return { employee_management: true };
+  return { employee_management: true, user_management: true };
 }

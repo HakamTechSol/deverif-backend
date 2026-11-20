@@ -283,6 +283,35 @@ describe.runIf(HAS_DB)("starting an offer prepares it, and creates NO employee",
    * candidate's acceptance.
    */
 
+  it("prepares and sends an offer when a legacy candidate email already belongs to a platform user", async () => {
+    const { candidate } = await atOffered("Legacy Email Overlap");
+    const [[admin]] = await db.query("SELECT email FROM users WHERE uuid=?", [adminUuid]);
+    await db.query(
+      "UPDATE candidates SET email=? WHERE organization_id=? AND uuid=?",
+      [admin.email, orgId, candidate.uuid],
+    );
+
+    await prepareOffer({
+      orgId,
+      actorUuid: adminUuid,
+      candidateUuid: candidate.uuid,
+      templateUuid: startOfferTemplateUuid,
+      conn: db,
+    });
+    await approveOffer({ orgId, actorUuid: approverUuid, candidateUuid: candidate.uuid, conn: db });
+    const sent = await sendPreparedOffer({
+      orgId,
+      actorUuid: adminUuid,
+      candidateUuid: candidate.uuid,
+      conn: db,
+    });
+
+    expect(sent.status).toBe("sent");
+    const stored = await getCandidate({ orgId, candidateUuid: candidate.uuid, conn: db });
+    expect(stored.email).toBe(admin.email);
+    expect(stored.offer_status).toBe("sent");
+  });
+
   it("opens an approval chain WITHOUT creating an employee", async () => {
     const { candidate } = await atOffered("PreHire Prepares Only");
 
